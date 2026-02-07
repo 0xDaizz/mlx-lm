@@ -260,16 +260,16 @@
 
 | | Task |
 |-|------|
-| [ ] | **P5.1** Merge all feature branches to develop (`--no-ff`) |
-| [ ] | **P5.2** Resolve merge conflicts |
-| [ ] | **P5.3** `pytest tests/ -v --tb=short` → ALL PASS on develop |
-| [ ] | **P5.4** **Final devil's advocate review** (cross-component, see below) |
+| [x] | **P5.1** Merge all feature branches to develop (`--no-ff`) | *(all work done on develop directly)* |
+| [x] | **P5.2** Resolve merge conflicts | *(n/a — no conflicts)* |
+| [x] | **P5.3** `pytest tests/ -v --tb=short` → ALL PASS on develop | ✅ 165 pass |
+| [~] | **P5.4** **Final devil's advocate review** (cross-component, see below) | ⏸️ agent stopped mid-run (commit 5ff5724) |
 | [ ] | **P5.5** Fix any final CRITICAL/HIGH findings |
 | [ ] | **P5.6** Run benchmarks on develop |
 | [ ] | **P5.7** Write `README.md` |
-| [ ] | **P5.8** Add `pyproject.toml` CLI entry point |
+| [~] | **P5.8** Add `pyproject.toml` CLI entry point | ⏸️ partial — setup.py updated (commit 5ff5724) |
 | [ ] | **P5.9** Document JACCL setup |
-| [ ] | **P5.10** Code review: docstrings, dead code |
+| [~] | **P5.10** Code review: docstrings, dead code | ⏸️ partial cleanup done (commit 5ff5724) |
 | [ ] | **P5.11** Tag `v0.1.0` + push tags |
 
 ### 5.1 Final Devil's Advocate: Cross-Component Review 🔴
