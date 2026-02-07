@@ -800,10 +800,13 @@ class TestBlockCacheBridge:
     def test_decompose_real_kv(self, scheduler_factory, model_and_tokenizer):
         """After generation, decompose cache, check block shapes."""
         model, tokenizer = model_and_tokenizer
-        sched = scheduler_factory(block_size=16)
+        sched = scheduler_factory(block_size=4)
 
-        # Generate tokens to populate the cache
-        prompt = "This is a test of the block cache bridge for decomposition."
+        # Generate tokens to populate the cache — long prompt to fill multiple blocks
+        prompt = (
+            "This is a test of the block cache bridge for decomposition. "
+            "We need enough tokens to fill at least one full block of size four."
+        )
         req = _make_request(tokenizer, prompt=prompt, max_tokens=10, request_id="decomp-1")
         sched.submit_request(req)
         events = _collect_result(sched, "decomp-1")
@@ -833,10 +836,14 @@ class TestBlockCacheBridge:
         from mlx_lm.models.cache import make_prompt_cache
 
         model, tokenizer = model_and_tokenizer
-        block_size = 16
+        block_size = 4  # Small block_size so even short prompts produce full blocks
 
-        # Create a prompt cache by running the model
-        prompt_tokens = tokenizer.encode("The quick brown fox jumps over the lazy dog.")
+        # Create a prompt cache by running the model — use long enough prompt for multiple blocks
+        prompt_tokens = tokenizer.encode(
+            "The quick brown fox jumps over the lazy dog. "
+            "This is a longer prompt to ensure we have enough tokens "
+            "to fill multiple blocks for the roundtrip decomposition test."
+        )
         cache = make_prompt_cache(model)
 
         # Run model to populate cache
