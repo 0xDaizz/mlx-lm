@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -20,6 +21,8 @@ from pydantic import BaseModel
 
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import InferenceRequest, TokenEvent
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +254,17 @@ def create_app(
 
         # Non-streaming: submit and collect all tokens
         sched.submit_request(inf_req)
-        events = await asyncio.get_event_loop().run_in_executor(
+        events = await asyncio.get_running_loop().run_in_executor(
             None, sched.get_result, request_id
         )
 
-        completion_text = "".join(e.token_text for e in events)
+        # Exclude EOS token text from output if present
+        filtered_events = events
+        if events and events[-1].finish_reason == "stop" and tok is not None:
+            eos_token = getattr(tok, "eos_token", None)
+            if eos_token is not None and events[-1].token_text == eos_token:
+                filtered_events = events[:-1]
+        completion_text = "".join(e.token_text for e in filtered_events)
         finish_reason = events[-1].finish_reason if events else "stop"
         completion_tokens = len(events)
 
@@ -310,11 +319,17 @@ def create_app(
             )
 
         sched.submit_request(inf_req)
-        events = await asyncio.get_event_loop().run_in_executor(
+        events = await asyncio.get_running_loop().run_in_executor(
             None, sched.get_result, request_id
         )
 
-        completion_text = "".join(e.token_text for e in events)
+        # Exclude EOS token text from output if present
+        filtered_events = events
+        if events and events[-1].finish_reason == "stop" and tok is not None:
+            eos_token = getattr(tok, "eos_token", None)
+            if eos_token is not None and events[-1].token_text == eos_token:
+                filtered_events = events[:-1]
+        completion_text = "".join(e.token_text for e in filtered_events)
         finish_reason = events[-1].finish_reason if events else "stop"
         completion_tokens = len(events)
 
@@ -377,8 +392,8 @@ def _format_chat_messages(messages: list[ChatMessage], tokenizer: Any) -> str:
             return tokenizer.apply_chat_template(
                 msg_dicts, tokenize=False, add_generation_prompt=True
             )
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("apply_chat_template failed: %s, using fallback format", e)
 
     # Fallback: simple formatting
     parts: list[str] = []
@@ -405,11 +420,11 @@ def _stream_chat_response(
         scheduler.submit_request(inf_req)
 
         completion_tokens = 0
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         while True:
             event: TokenEvent | None = await loop.run_in_executor(
-                None, lambda: token_queue.get(timeout=30)
+                None, lambda: token_queue.get(timeout=120)
             )
             if event is None:
                 break
@@ -454,11 +469,11 @@ def _stream_completion_response(
         token_queue = scheduler.register_stream(inf_req.request_id)
         scheduler.submit_request(inf_req)
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         while True:
             event: TokenEvent | None = await loop.run_in_executor(
-                None, lambda: token_queue.get(timeout=30)
+                None, lambda: token_queue.get(timeout=120)
             )
             if event is None:
                 break

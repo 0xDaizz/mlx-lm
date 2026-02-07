@@ -441,7 +441,7 @@ class Scheduler:
                 # Save prompt cache for sequence cache store and block decomposition
                 if r.prompt_cache is not None:
                     try:
-                        prompt_cache = r.prompt_cache()
+                        prompt_cache = r.prompt_cache
                         finished_caches[r.uid] = prompt_cache
                         # Also store on seq for block decomposition in cleanup (P7.2)
                         seq._prompt_cache = prompt_cache  # type: ignore[attr-defined]

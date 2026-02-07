@@ -68,17 +68,15 @@ class SequenceCacheStore:
             best_match_len = 0
 
             for cached_key in self._cache:
-                cached_len = len(cached_key)
-                query_len = len(token_tuple)
-
-                # How many tokens overlap from the start?
-                match_len = min(cached_len, query_len)
-                if match_len <= best_match_len:
-                    continue
-
-                if token_tuple[:match_len] == cached_key[:match_len]:
+                # Token-by-token prefix matching
+                common = 0
+                for a, b in zip(cached_key, token_tuple):
+                    if a != b:
+                        break
+                    common += 1
+                if common > best_match_len:
                     best_key = cached_key
-                    best_match_len = match_len
+                    best_match_len = common
 
             if best_key is None:
                 return None, list(tokens)
@@ -114,7 +112,18 @@ class SequenceCacheStore:
             prompt_cache: List[KVCache] from BatchGenerator.
         """
         token_tuple = tuple(tokens)
-        cache_copy = copy.deepcopy(prompt_cache)
+        # Shallow list copy for real KV cache objects (already independent
+        # after batch.extract_cache()), with deepcopy fallback for safety.
+        # A full deepcopy of large KV tensors is extremely expensive but
+        # needed for correctness when the stored objects are mutable dicts.
+        try:
+            # Check if this looks like a real KV cache list (has .state attr)
+            if prompt_cache and hasattr(prompt_cache[0], "state"):
+                cache_copy = list(prompt_cache)
+            else:
+                cache_copy = copy.deepcopy(prompt_cache)
+        except Exception:
+            cache_copy = copy.deepcopy(prompt_cache)
 
         with self._lock:
             if token_tuple in self._cache:

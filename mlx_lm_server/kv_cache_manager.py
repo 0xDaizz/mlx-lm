@@ -467,14 +467,15 @@ class TieredKVCache:
         self.ram = ram
         self.ssd = ssd
 
-    def lookup(self, block_hash: int) -> dict[str, mx.array] | None:
+    def lookup(self, block_hash: int) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Look up KV data for a block hash, checking RAM then SSD.
 
         Args:
             block_hash: The block hash to look up.
 
         Returns:
-            A dict with 'keys' and 'values' mx.arrays, or None on miss.
+            KV data (list[dict] from RAM/multi-layer SSD, or dict from legacy SSD),
+            or None on miss.
         """
         # Check RAM first
         with self.ram.lock:
@@ -584,6 +585,9 @@ def decompose_cache_to_blocks(
         # Extract KV data from each layer
         kv_data_per_layer = []
         for cache_layer in prompt_cache:
+            # Skip RotatingKVCache — positional slicing would be wrong
+            if hasattr(cache_layer, "offset") and hasattr(cache_layer, "max_size"):
+                return []
             state = cache_layer.state
             if state is None or len(state) < 2:
                 continue
