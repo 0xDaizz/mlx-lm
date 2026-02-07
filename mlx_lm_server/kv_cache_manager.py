@@ -5,6 +5,8 @@ Implements a vLLM-style block-level KV cache with:
 - Hash-based block identification for automatic prefix caching
 - Thread-safe ref_count management
 - LRU eviction for blocks with ref_count == 0
+- MLX KV cache adapter (extract/inject blocks from mlx-lm cache layers)
+- Tiered lookup (RAM -> SSD -> miss)
 
 Design references:
 - vLLM prefix caching: https://docs.vllm.ai/en/stable/design/prefix_caching/
@@ -17,9 +19,15 @@ import logging
 import threading
 import time
 from collections import deque
+from typing import TYPE_CHECKING
+
+import mlx.core as mx
 
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import KVCacheBlock
+
+if TYPE_CHECKING:
+    from mlx_lm_server.ssd_cache import SSDCache
 
 logger = logging.getLogger(__name__)
 
@@ -367,3 +375,149 @@ class KVCacheManager:
     def num_used_blocks(self) -> int:
         """Number of blocks currently allocated (not free)."""
         return self.pool.num_blocks - self.pool.num_free
+
+
+# ---------------------------------------------------------------------------
+# MLX KV Cache Adapter (P1.7 - P1.10)
+# ---------------------------------------------------------------------------
+
+
+def extract_block(
+    keys: mx.array,
+    values: mx.array,
+    start_pos: int,
+    block_size: int,
+) -> dict[str, mx.array]:
+    """Extract a block of K/V data from an mlx-lm cache layer's state.
+
+    The mlx-lm KVCache stores keys and values with shape
+    (B, n_kv_heads, seq_len, head_dim). This function slices out
+    a block_size window along the seq_len dimension.
+
+    Args:
+        keys: Key tensor from cache.state, shape (B, H, S, D).
+        values: Value tensor from cache.state, shape (B, H, S, Dv).
+        start_pos: Starting position along the seq_len axis.
+        block_size: Number of positions to extract.
+
+    Returns:
+        Dict with 'keys' and 'values', each of shape (B, H, block_size, D).
+    """
+    k_block = keys[:, :, start_pos : start_pos + block_size, :]
+    v_block = values[:, :, start_pos : start_pos + block_size, :]
+    return {"keys": k_block, "values": v_block}
+
+
+def inject_blocks(
+    blocks: list[dict[str, mx.array]],
+) -> dict[str, mx.array]:
+    """Reconstruct K/V tensors by concatenating blocks along the seq_len axis.
+
+    Takes a list of block dicts (each from extract_block) and concatenates
+    them to form the full K/V tensors.
+
+    Args:
+        blocks: List of dicts, each containing 'keys' and 'values' arrays
+            with shape (B, H, block_size, D).
+
+    Returns:
+        Dict with 'keys' and 'values', each of shape
+        (B, H, total_seq_len, D) where total_seq_len = sum of block sizes.
+    """
+    if not blocks:
+        raise ValueError("blocks list must not be empty")
+    all_keys = mx.concatenate([b["keys"] for b in blocks], axis=2)
+    all_values = mx.concatenate([b["values"] for b in blocks], axis=2)
+    return {"keys": all_keys, "values": all_values}
+
+
+# ---------------------------------------------------------------------------
+# Tiered KV Cache (P1.16 - P1.18)
+# ---------------------------------------------------------------------------
+
+
+class TieredKVCache:
+    """Two-tier KV cache: RAM (KVCacheManager) + SSD (SSDCache).
+
+    Lookup order: RAM hash_table -> SSD cache -> miss (None).
+    On RAM eviction, blocks are demoted to SSD before being freed.
+
+    Attributes:
+        ram: The in-memory KVCacheManager.
+        ssd: The SSD-backed cache (optional; None disables SSD tier).
+    """
+
+    def __init__(self, ram: KVCacheManager, ssd: SSDCache | None = None) -> None:
+        self.ram = ram
+        self.ssd = ssd
+
+    def lookup(self, block_hash: int) -> dict[str, mx.array] | None:
+        """Look up KV data for a block hash, checking RAM then SSD.
+
+        Args:
+            block_hash: The block hash to look up.
+
+        Returns:
+            A dict with 'keys' and 'values' mx.arrays, or None on miss.
+        """
+        # Check RAM first
+        with self.ram.lock:
+            if block_hash in self.ram.hash_table:
+                block_id = self.ram.hash_table[block_hash]
+                block = self.ram.pool.blocks[block_id]
+                if block.kv_data is not None:
+                    block.last_accessed = time.time()
+                    return block.kv_data
+                return None
+
+        # Check SSD
+        if self.ssd is not None:
+            kv_data = self.ssd.load_block(block_hash)
+            if kv_data is not None:
+                return kv_data
+
+        return None
+
+    def evict_to_ssd(self, num_blocks: int = 1) -> list[int]:
+        """Evict LRU blocks from RAM, saving them to SSD first.
+
+        For each block being evicted that has kv_data, the data is
+        persisted to SSD before the block is freed from RAM.
+
+        Args:
+            num_blocks: Number of blocks to evict.
+
+        Returns:
+            List of evicted block_ids.
+        """
+        with self.ram.lock:
+            # Find eviction candidates
+            candidates: list[KVCacheBlock] = []
+            for block_hash, block_id in self.ram.hash_table.items():
+                block = self.ram.pool.blocks[block_id]
+                if block.ref_count == 0:
+                    candidates.append(block)
+
+            candidates.sort(key=lambda b: b.last_accessed)
+
+            evicted_ids: list[int] = []
+            for block in candidates[:num_blocks]:
+                # Save to SSD before evicting
+                if (
+                    self.ssd is not None
+                    and block.kv_data is not None
+                    and block.block_hash is not None
+                ):
+                    self.ssd.save_block(block.block_hash, block.kv_data)
+
+                # Remove from hash table
+                if (
+                    block.block_hash is not None
+                    and block.block_hash in self.ram.hash_table
+                ):
+                    del self.ram.hash_table[block.block_hash]
+                # Return to free pool
+                self.ram.pool.return_block(block.block_id)
+                evicted_ids.append(block.block_id)
+
+        return evicted_ids

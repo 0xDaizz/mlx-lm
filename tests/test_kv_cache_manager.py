@@ -1,4 +1,4 @@
-"""Tests for the KV Cache Manager (P1.1 through P1.6).
+"""Tests for the KV Cache Manager (P1.1 through P1.18).
 
 Covers:
 - BlockPool pre-allocation and free queue (P1.1)
@@ -7,6 +7,9 @@ Covers:
 - allocate_blocks cache hit, fresh alloc, ref_count tracking (P1.4)
 - free_blocks ref_count decrement, block stays in hash table (P1.5)
 - evict_lru ordering and skipping in-use blocks (P1.6)
+- extract_block shapes and values (P1.7-P1.8)
+- inject_blocks roundtrip (P1.9-P1.10)
+- TieredKVCache RAM/SSD lookup, evict-to-SSD flow (P1.16-P1.18)
 """
 
 from __future__ import annotations
@@ -14,6 +17,7 @@ from __future__ import annotations
 import threading
 import time
 
+import mlx.core as mx
 import pytest
 
 from mlx_lm_server.config import ServerConfig
@@ -21,8 +25,12 @@ from mlx_lm_server.kv_cache_manager import (
     BlockPool,
     BlockPoolExhaustedError,
     KVCacheManager,
+    TieredKVCache,
     compute_block_hash,
+    extract_block,
+    inject_blocks,
 )
+from mlx_lm_server.ssd_cache import SSDCache
 from mlx_lm_server.types import KVCacheBlock
 
 
@@ -679,3 +687,294 @@ class TestKVCacheManagerIntegration:
         assert mgr.num_free_blocks == 7
         assert mgr.num_cached_blocks == 1
         assert mgr.num_used_blocks == 1
+
+
+# ---------------------------------------------------------------------------
+# P1.7-P1.10 — MLX KV Cache Adapter (extract_block / inject_blocks)
+# ---------------------------------------------------------------------------
+
+
+class TestExtractBlock:
+    """Tests for extract_block slicing K/V arrays."""
+
+    def test_extract_shapes(self):
+        """Extracted block has correct shape (B, H, block_size, D)."""
+        B, H, S, D = 1, 4, 32, 16
+        keys = mx.random.normal((B, H, S, D))
+        values = mx.random.normal((B, H, S, D))
+
+        block = extract_block(keys, values, start_pos=0, block_size=8)
+        assert block["keys"].shape == (B, H, 8, D)
+        assert block["values"].shape == (B, H, 8, D)
+
+    def test_extract_values(self):
+        """Extracted block contains the correct values from the source."""
+        B, H, S, D = 1, 2, 16, 4
+        keys = mx.arange(B * H * S * D).reshape(B, H, S, D).astype(mx.float32)
+        values = mx.arange(B * H * S * D).reshape(B, H, S, D).astype(mx.float32) + 1000
+
+        block = extract_block(keys, values, start_pos=4, block_size=4)
+        expected_k = keys[:, :, 4:8, :]
+        expected_v = values[:, :, 4:8, :]
+
+        assert mx.allclose(block["keys"], expected_k).item()
+        assert mx.allclose(block["values"], expected_v).item()
+
+    def test_extract_different_positions(self):
+        """Extract blocks from different positions yields different data."""
+        B, H, S, D = 1, 2, 16, 8
+        keys = mx.random.normal((B, H, S, D))
+        values = mx.random.normal((B, H, S, D))
+
+        block0 = extract_block(keys, values, start_pos=0, block_size=4)
+        block1 = extract_block(keys, values, start_pos=4, block_size=4)
+
+        # Different positions should have different data (overwhelmingly likely)
+        assert not mx.allclose(block0["keys"], block1["keys"]).item()
+
+
+class TestInjectBlocks:
+    """Tests for inject_blocks concatenation."""
+
+    def test_inject_roundtrip(self):
+        """Extract then inject recovers the original K/V tensors."""
+        B, H, S, D = 1, 4, 16, 8
+        block_size = 4
+        keys = mx.random.normal((B, H, S, D))
+        values = mx.random.normal((B, H, S, D))
+
+        # Extract 4 blocks of size 4 from seq_len=16
+        blocks = []
+        for i in range(S // block_size):
+            b = extract_block(keys, values, start_pos=i * block_size, block_size=block_size)
+            blocks.append(b)
+
+        reconstructed = inject_blocks(blocks)
+
+        assert reconstructed["keys"].shape == keys.shape
+        assert reconstructed["values"].shape == values.shape
+        assert mx.allclose(reconstructed["keys"], keys).item()
+        assert mx.allclose(reconstructed["values"], values).item()
+
+    def test_inject_single_block(self):
+        """inject_blocks works with a single block."""
+        B, H, D = 1, 2, 8
+        block = {
+            "keys": mx.random.normal((B, H, 4, D)),
+            "values": mx.random.normal((B, H, 4, D)),
+        }
+        result = inject_blocks([block])
+        assert mx.allclose(result["keys"], block["keys"]).item()
+        assert mx.allclose(result["values"], block["values"]).item()
+
+    def test_inject_empty_raises(self):
+        """inject_blocks raises ValueError on empty list."""
+        with pytest.raises(ValueError):
+            inject_blocks([])
+
+    def test_roundtrip_generation(self):
+        """Full roundtrip: create K/V -> extract blocks -> inject -> verify.
+
+        Simulates what would happen during cache save/restore: a sequence
+        is split into blocks, each block is stored separately, then all
+        blocks are reassembled.
+        """
+        B, H, D = 1, 8, 64
+        block_size = 16
+        num_blocks = 4
+        total_seq = block_size * num_blocks
+
+        keys = mx.random.normal((B, H, total_seq, D))
+        values = mx.random.normal((B, H, total_seq, D))
+
+        # Extract each block
+        extracted = []
+        for i in range(num_blocks):
+            b = extract_block(
+                keys, values, start_pos=i * block_size, block_size=block_size
+            )
+            extracted.append(b)
+
+        # Inject all blocks back
+        reconstructed = inject_blocks(extracted)
+
+        assert reconstructed["keys"].shape == (B, H, total_seq, D)
+        assert reconstructed["values"].shape == (B, H, total_seq, D)
+        assert mx.allclose(reconstructed["keys"], keys).item()
+        assert mx.allclose(reconstructed["values"], values).item()
+
+
+# ---------------------------------------------------------------------------
+# P1.16-P1.18 — TieredKVCache (RAM -> SSD -> miss)
+# ---------------------------------------------------------------------------
+
+
+class TestTieredLookup:
+    """Tests for TieredKVCache.lookup()."""
+
+    def _make_kv_data(self) -> dict[str, mx.array]:
+        return {
+            "keys": mx.random.normal((1, 2, 4, 8)),
+            "values": mx.random.normal((1, 2, 4, 8)),
+        }
+
+    def test_lookup_ram(self):
+        """lookup finds block in RAM hash table."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        tiered = TieredKVCache(ram=mgr, ssd=None)
+
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        block = mgr.pool.blocks[ids[0]]
+        kv_data = self._make_kv_data()
+        block.kv_data = kv_data
+
+        result = tiered.lookup(block.block_hash)
+        assert result is not None
+        assert mx.allclose(result["keys"], kv_data["keys"]).item()
+
+    def test_lookup_ssd(self, tmp_path):
+        """lookup falls through to SSD when not in RAM."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        kv_data = self._make_kv_data()
+        block_hash = 12345
+        ssd.save_block(block_hash, kv_data)
+
+        result = tiered.lookup(block_hash)
+        assert result is not None
+        assert mx.allclose(result["keys"], kv_data["keys"]).item()
+
+    def test_lookup_miss(self):
+        """lookup returns None when block is in neither RAM nor SSD."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        tiered = TieredKVCache(ram=mgr, ssd=None)
+
+        result = tiered.lookup(99999)
+        assert result is None
+
+    def test_lookup_miss_with_ssd(self, tmp_path):
+        """lookup returns None when SSD exists but block is not there."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        result = tiered.lookup(99999)
+        assert result is None
+
+
+class TestEvictToSSD:
+    """Tests for TieredKVCache.evict_to_ssd()."""
+
+    def _make_kv_data(self) -> dict[str, mx.array]:
+        return {
+            "keys": mx.random.normal((1, 2, 4, 8)),
+            "values": mx.random.normal((1, 2, 4, 8)),
+        }
+
+    def test_evict_saves_to_ssd(self, tmp_path):
+        """Evicting a block with kv_data saves it to SSD."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        block = mgr.pool.blocks[ids[0]]
+        kv_data = self._make_kv_data()
+        block.kv_data = kv_data
+        block_hash = block.block_hash
+
+        # Free the block so it's eligible for eviction
+        mgr.free_blocks(ids)
+
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) == 1
+
+        # Block should now be in SSD
+        assert block_hash in ssd.index
+
+        # Load from SSD and verify
+        loaded = ssd.load_block(block_hash)
+        assert loaded is not None
+        assert mx.allclose(loaded["keys"], kv_data["keys"]).item()
+
+    def test_evict_without_ssd(self):
+        """Eviction works even without SSD (just frees RAM)."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        tiered = TieredKVCache(ram=mgr, ssd=None)
+
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        mgr.free_blocks(ids)
+
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) == 1
+        assert mgr.num_free_blocks == 8
+
+
+class TestTieredFullFlow:
+    """Integration test: allocate -> evict to SSD -> lookup from SSD."""
+
+    def test_tiered_full_flow(self, tmp_path):
+        """Full tiered flow: allocate -> attach kv_data -> evict to SSD -> lookup."""
+        config = make_config(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        # 1. Allocate blocks
+        tokens = [10, 20, 30, 40, 50, 60, 70, 80]
+        ids = mgr.allocate_blocks(tokens)
+        assert len(ids) == 2
+
+        # 2. Attach KV data to blocks
+        kv_data_0 = {
+            "keys": mx.random.normal((1, 2, 4, 8)),
+            "values": mx.random.normal((1, 2, 4, 8)),
+        }
+        kv_data_1 = {
+            "keys": mx.random.normal((1, 2, 4, 8)),
+            "values": mx.random.normal((1, 2, 4, 8)),
+        }
+        block_0 = mgr.pool.blocks[ids[0]]
+        block_1 = mgr.pool.blocks[ids[1]]
+        block_0.kv_data = kv_data_0
+        block_1.kv_data = kv_data_1
+        hash_0 = block_0.block_hash
+        hash_1 = block_1.block_hash
+
+        # 3. Free blocks
+        mgr.free_blocks(ids)
+
+        # 4. Verify RAM lookup works
+        result = tiered.lookup(hash_0)
+        assert result is not None
+
+        # 5. Evict to SSD
+        evicted = tiered.evict_to_ssd(num_blocks=2)
+        assert len(evicted) == 2
+
+        # 6. RAM should no longer have them
+        assert hash_0 not in mgr.hash_table
+        assert hash_1 not in mgr.hash_table
+
+        # 7. SSD lookup should find them
+        result_0 = tiered.lookup(hash_0)
+        assert result_0 is not None
+        assert mx.allclose(result_0["keys"], kv_data_0["keys"]).item()
+
+        result_1 = tiered.lookup(hash_1)
+        assert result_1 is not None
+        assert mx.allclose(result_1["keys"], kv_data_1["keys"]).item()
+
+        # 8. Verify blocks were returned to free pool
+        assert mgr.num_free_blocks == 4
