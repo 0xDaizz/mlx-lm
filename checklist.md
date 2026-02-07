@@ -263,13 +263,13 @@
 | [x] | **P5.1** Merge all feature branches to develop (`--no-ff`) | *(all work done on develop directly)* |
 | [x] | **P5.2** Resolve merge conflicts | *(n/a — no conflicts)* |
 | [x] | **P5.3** `pytest tests/ -v --tb=short` → ALL PASS on develop | ✅ 165 pass |
-| [~] | **P5.4** **Final devil's advocate review** (cross-component, see below) | ⏸️ agent stopped mid-run (commit 5ff5724) |
-| [ ] | **P5.5** Fix any final CRITICAL/HIGH findings |
+| [x] | **P5.4** **Final devil's advocate review** (cross-component, see below) | ✅ 19 tests, 0 CRITICAL/HIGH (commit 844fcda) |
+| [x] | **P5.5** Fix any final CRITICAL/HIGH findings | ✅ None found — all DA-F tests pass |
 | [ ] | **P5.6** Run benchmarks on develop |
-| [ ] | **P5.7** Write `README.md` |
-| [~] | **P5.8** Add `pyproject.toml` CLI entry point | ⏸️ partial — setup.py updated (commit 5ff5724) |
-| [ ] | **P5.9** Document JACCL setup |
-| [~] | **P5.10** Code review: docstrings, dead code | ⏸️ partial cleanup done (commit 5ff5724) |
+| [x] | **P5.7** Write `README.md` | ✅ commit 844fcda |
+| [x] | **P5.8** Add `pyproject.toml` CLI entry point | ✅ real Scheduler in __main__.py (commit 844fcda) |
+| [x] | **P5.9** Document JACCL setup | ✅ JACCL section in README (commit 844fcda) |
+| [x] | **P5.10** Code review: docstrings, dead code | ✅ cleanup done (commit 844fcda) |
 | [ ] | **P5.11** Tag `v0.1.0` + push tags |
 
 ### 5.1 Final Devil's Advocate: Cross-Component Review 🔴
@@ -280,11 +280,11 @@ This review targets **interactions between components** that individual reviews 
 
 | | Finding ID | Attack Vector | Severity |
 |-|-----------|--------------|----------|
-| [ ] | **DA-F-1** | State leak between consecutive requests (dirty cache/seq state) | CRITICAL |
-| [ ] | **DA-F-2** | Scheduler frees blocks while SSD save is in-progress → corrupt | CRITICAL |
-| [ ] | **DA-F-3** | FastAPI async handler awaits scheduler → scheduler thread dies → hang | HIGH |
-| [ ] | **DA-F-4** | 20 requests, shared prefix, mixed stream/sync → all correct? | HIGH |
-| [ ] | **DA-F-5** | Server restart → SSD index loads → prefix hits resume correctly? | HIGH |
+| [x] | **DA-F-1** | State leak between consecutive requests (dirty cache/seq state) | NOT_A_BUG (5 tests pass) |
+| [x] | **DA-F-2** | Scheduler frees blocks while SSD save is in-progress → corrupt | NOT_A_BUG (3 tests pass) |
+| [x] | **DA-F-3** | FastAPI async handler awaits scheduler → scheduler thread dies → hang | NOT_A_BUG (4 tests pass) |
+| [x] | **DA-F-4** | 20 requests, shared prefix, mixed stream/sync → all correct? | NOT_A_BUG (2 tests pass) |
+| [x] | **DA-F-5** | Server restart → SSD index loads → prefix hits resume correctly? | NOT_A_BUG (5 tests pass) |
 
 ---
 
