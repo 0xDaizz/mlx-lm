@@ -33,11 +33,24 @@ from mlx_lm_server.types import (
     TokenEvent,
 )
 
+import copy
+
+from mlx_lm_server.kv_cache_manager import (
+    decompose_cache_to_blocks,
+    reconstruct_cache_from_blocks,
+)
+from mlx_lm_server.sequence_cache import SequenceCacheStore
+
 try:
-    from mlx_lm.generate import stream_generate
+    from mlx_lm.generate import BatchGenerator, stream_generate
+    from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache, can_trim_prompt_cache
     from mlx_lm.sample_utils import make_sampler
 except ImportError:
+    BatchGenerator = None
     stream_generate = None
+    make_prompt_cache = None
+    trim_prompt_cache = None
+    can_trim_prompt_cache = None
     make_sampler = None
 
 logger = logging.getLogger(__name__)
@@ -158,6 +171,48 @@ class Scheduler:
             [str, list[int], int], tuple[int, str, str | None]
         ] | None = None
 
+        # BatchGenerator state (real model path)
+        self._batch_generator: Any = None
+        self._uid_to_request_id: dict[int, str] = {}
+        self._request_id_to_uid: dict[str, int] = {}
+        self._sequence_cache: SequenceCacheStore | None = None
+
+        # Tiered cache (RAM + SSD) — set by __main__.py or tests
+        self._tiered_cache: Any = None
+
+        # SSD pruning counter (prune every N inference steps)
+        self._ssd_prune_interval: int = 1000
+        self._ssd_prune_counter: int = 0
+
+        # Initialize BatchGenerator if model is available
+        if self.model is not None and BatchGenerator is not None:
+            self._create_batch_generator()
+            self._sequence_cache = SequenceCacheStore(
+                max_entries=config.sequence_cache_size
+            )
+
+    def _create_batch_generator(self) -> None:
+        """Create or recreate the BatchGenerator instance."""
+        if self.model is None or BatchGenerator is None:
+            return
+
+        stop_tokens = set()
+        if self.tokenizer is not None:
+            eos_ids = getattr(self.tokenizer, "eos_token_ids", set())
+            if isinstance(eos_ids, (set, frozenset)):
+                stop_tokens = set(eos_ids)
+            elif isinstance(eos_ids, int):
+                stop_tokens = {eos_ids}
+
+        self._batch_generator = BatchGenerator(
+            self.model,
+            stop_tokens=stop_tokens,
+            completion_batch_size=self.config.completion_batch_size,
+            prefill_batch_size=self.config.prefill_batch_size,
+            prefill_step_size=self.config.prefill_step_size,
+            max_kv_size=self.config.max_kv_size,
+        )
+
     # --- Public API (called by server / tests) ---
 
     def submit_request(self, request: InferenceRequest) -> None:
@@ -254,57 +309,423 @@ class Scheduler:
         if self._inference_thread is not None:
             self._inference_thread.join(timeout=5.0)
             self._inference_thread = None
+        if self._batch_generator is not None:
+            try:
+                self._batch_generator.close()
+            except Exception:
+                pass
 
     def _inference_loop(self) -> None:
         """Main inference loop: schedule -> prefill -> decode -> emit tokens."""
         logger.info("Inference loop started")
         while self._running:
             try:
-                # Wait for new requests if nothing is active
-                with self._active_lock:
-                    has_active = len(self._active_sequences) > 0
-                if not has_active and self.request_queue.size == 0:
-                    self._new_request_event.wait(timeout=0.1)
-                    self._new_request_event.clear()
-                    if not self._running:
-                        break
-                    continue
-
-                # Run one schedule step
-                outputs = self.schedule_step()
-
-                # Run prefill for new sequences
-                if outputs.prefill_sequences:
-                    self._run_prefill(outputs.prefill_sequences)
-
-                # Run one decode step for active sequences
-                with self._active_lock:
-                    decode_seqs = [
-                        s for s in self._active_sequences.values()
-                        if not s.is_finished
-                    ]
-                if decode_seqs:
-                    token_events = self._run_decode_step(decode_seqs)
-                    self._emit_tokens(token_events)
-
-                # Clean up finished sequences
-                self._cleanup_finished()
-
+                if self._batch_generator is not None:
+                    self._batch_inference_step()
+                else:
+                    self._mock_inference_step()
             except Exception as e:
                 logger.error(
                     "Exception in inference loop iteration: %s", e, exc_info=True
                 )
-                # Mark all active sequences as failed to prevent infinite loops
-                # on persistent errors. The loop continues to serve new requests.
-                with self._active_lock:
-                    for seq in self._active_sequences.values():
-                        if not seq.is_finished:
-                            seq.is_finished = True
-                            seq.finish_reason = "error"
-                            self._signal_finish(seq.request_id, finish_reason="error")
-                self._cleanup_finished()
+                if self._batch_generator is not None:
+                    self._handle_batch_error(e)
+                else:
+                    self._handle_mock_error()
 
         logger.info("Inference loop stopped")
+
+    def _mock_inference_step(self) -> None:
+        """One iteration of the mock inference loop (model=None)."""
+        # Wait for new requests if nothing is active
+        with self._active_lock:
+            has_active = len(self._active_sequences) > 0
+        if not has_active and self.request_queue.size == 0:
+            self._new_request_event.wait(timeout=0.1)
+            self._new_request_event.clear()
+            if not self._running:
+                return
+            return
+
+        # Run one schedule step
+        outputs = self.schedule_step()
+
+        # Run prefill for new sequences
+        if outputs.prefill_sequences:
+            self._run_prefill(outputs.prefill_sequences)
+
+        # Run one decode step for active sequences
+        with self._active_lock:
+            decode_seqs = [
+                s for s in self._active_sequences.values()
+                if not s.is_finished
+            ]
+        if decode_seqs:
+            token_events = self._run_decode_step(decode_seqs)
+            self._emit_tokens(token_events)
+
+        # Clean up finished sequences
+        self._cleanup_finished()
+
+    def _batch_inference_step(self) -> None:
+        """One step of the batch inference loop using BatchGenerator."""
+        # Wait for work if idle
+        with self._active_lock:
+            has_active = bool(self._uid_to_request_id)
+        if not has_active and self.request_queue.size == 0:
+            self._new_request_event.wait(timeout=0.1)
+            self._new_request_event.clear()
+            if not self._running:
+                return
+            return
+
+        # 1. Process cancellations
+        self._process_cancellations_batch()
+
+        # 2. Insert new requests
+        self._insert_new_requests_batch()
+
+        # 3. Run one batch step if there are active sequences
+        with self._active_lock:
+            has_active = bool(self._uid_to_request_id)
+        if not has_active:
+            return
+
+        # Call next() to get responses for all active sequences
+        try:
+            responses = self._batch_generator.next()
+        except Exception as e:
+            logger.error("BatchGenerator.next() failed: %s", e, exc_info=True)
+            raise
+
+        # 4. Process responses
+        uids_to_remove: list[int] = []
+        events: list[TokenEvent] = []
+        finished_caches: dict[int, list] = {}
+
+        for r in responses:
+            request_id = self._uid_to_request_id.get(r.uid)
+            if request_id is None:
+                continue
+
+            with self._active_lock:
+                seq = self._active_sequences.get(request_id)
+            if seq is None:
+                continue
+
+            # Detokenize
+            detokenizer = getattr(seq, "_detokenizer", None)
+            if detokenizer is not None:
+                detokenizer.add_token(r.token)
+                token_text = detokenizer.last_segment
+            else:
+                token_text = str(r.token)
+
+            seq.output_tokens.append(r.token)
+            seq.token_ids.append(r.token)
+            seq.output_text += token_text
+
+            finish_reason = r.finish_reason
+
+            # Check our custom stop conditions if BatchGenerator hasn't stopped
+            if finish_reason is None:
+                request = getattr(seq, "_request", None)
+                if request is not None:
+                    finish_reason = self._check_stop_conditions(seq, request)
+                    if finish_reason is not None:
+                        uids_to_remove.append(r.uid)
+
+            if finish_reason is not None:
+                seq.is_finished = True
+                seq.finish_reason = finish_reason
+                # Save prompt cache for sequence cache store and block decomposition
+                if r.prompt_cache is not None:
+                    try:
+                        prompt_cache = r.prompt_cache()
+                        finished_caches[r.uid] = prompt_cache
+                        # Also store on seq for block decomposition in cleanup (P7.2)
+                        seq._prompt_cache = prompt_cache  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+
+            event = TokenEvent(
+                request_id=request_id,
+                token_id=r.token,
+                token_text=token_text,
+                finish_reason=finish_reason,
+            )
+            events.append(event)
+
+        # 5. Emit token events
+        self._emit_tokens(events)
+
+        # 6. Remove early-stopped UIDs from BatchGenerator
+        if uids_to_remove:
+            try:
+                caches = self._batch_generator.remove(
+                    uids_to_remove, return_prompt_caches=True
+                )
+                if caches:
+                    finished_caches.update(caches)
+            except Exception as e:
+                logger.warning("Failed to remove UIDs from BatchGenerator: %s", e)
+
+        # 7. Store finished caches in SequenceCacheStore and decompose to blocks
+        for uid, prompt_cache in finished_caches.items():
+            rid = self._uid_to_request_id.get(uid)
+            if rid is None:
+                continue
+            with self._active_lock:
+                seq = self._active_sequences.get(rid)
+            if seq is None:
+                continue
+
+            # Compute prompt tokens (token_ids minus output_tokens)
+            prompt_tokens = seq.token_ids[:len(seq.token_ids) - len(seq.output_tokens)]
+
+            # Store in sequence-level cache
+            if self._sequence_cache is not None:
+                self._sequence_cache.store(prompt_tokens, prompt_cache)
+
+            # Decompose into block-level cache for finer-grained sharing
+            if self.kv_cache_manager is not None:
+                try:
+                    block_dicts = decompose_cache_to_blocks(
+                        prompt_cache, prompt_tokens,
+                        self.kv_cache_manager.block_size,
+                    )
+                    for bd in block_dicts:
+                        bh = bd['block_hash']
+                        with self.kv_cache_manager.lock:
+                            if bh not in self.kv_cache_manager.hash_table:
+                                try:
+                                    block = self.kv_cache_manager.pool.get_free_block()
+                                except Exception:
+                                    if self._tiered_cache is not None:
+                                        self._tiered_cache.evict_to_ssd(num_blocks=1)
+                                    else:
+                                        self.kv_cache_manager._evict_lru_locked(num_blocks=1)
+                                    try:
+                                        block = self.kv_cache_manager.pool.get_free_block()
+                                    except Exception:
+                                        continue
+                                block.block_hash = bh
+                                block.token_ids = bd['token_ids']
+                                block.ref_count = 0
+                                block.last_accessed = time.time()
+                                block.kv_data = bd['kv_data_per_layer']
+                                self.kv_cache_manager.hash_table[bh] = block.block_id
+                except Exception as e:
+                    logger.debug("Failed to decompose cache to blocks: %s", e)
+
+        # 8. Periodic SSD pruning (P7.4)
+        self._ssd_prune_counter += 1
+        if self._ssd_prune_counter >= self._ssd_prune_interval:
+            self._ssd_prune_counter = 0
+            if self._tiered_cache is not None and self._tiered_cache.ssd is not None:
+                try:
+                    pruned = self._tiered_cache.ssd.prune_expired()
+                    if pruned > 0:
+                        logger.info("Pruned %d expired SSD blocks", pruned)
+                except Exception as e:
+                    logger.warning("SSD pruning failed: %s", e)
+
+        # 9. Clean up finished sequences
+        self._cleanup_finished_batch()
+
+    def _process_cancellations_batch(self) -> None:
+        """Remove cancelled requests from BatchGenerator."""
+        with self._cancelled_lock:
+            cancelled = set(self._cancelled)
+
+        uids_to_remove = []
+        for rid in cancelled:
+            uid = self._request_id_to_uid.get(rid)
+            if uid is not None:
+                uids_to_remove.append(uid)
+
+        if uids_to_remove:
+            try:
+                self._batch_generator.remove(uids_to_remove)
+            except Exception as e:
+                logger.warning("Failed to remove cancelled UIDs: %s", e)
+
+        # Clean up mappings and signal finish
+        for rid in cancelled:
+            uid = self._request_id_to_uid.pop(rid, None)
+            if uid is not None:
+                self._uid_to_request_id.pop(uid, None)
+            with self._active_lock:
+                seq = self._active_sequences.pop(rid, None)
+            if seq is not None:
+                seq.is_finished = True
+                seq.finish_reason = "cancelled"
+            self._signal_finish(rid, finish_reason="cancelled")
+            with self._cancelled_lock:
+                self._cancelled.discard(rid)
+
+    def _insert_new_requests_batch(self) -> None:
+        """Pop requests from queue and insert into BatchGenerator."""
+        with self._active_lock:
+            available = self.config.max_batch_size - len(self._active_sequences)
+        if available <= 0:
+            return
+
+        new_requests = self.request_queue.pop_batch(available)
+        if not new_requests:
+            return
+
+        for req in new_requests:
+            seq = self._init_sequence(req)
+
+            # Set up detokenizer
+            if self.tokenizer is not None:
+                detok = getattr(self.tokenizer, "detokenizer", None)
+                if detok is not None:
+                    seq._detokenizer = copy.copy(detok)
+                    seq._detokenizer.reset()
+
+            with self._active_lock:
+                self._active_sequences[req.request_id] = seq
+
+            # Look up caches: block-level first (finer granularity),
+            # then sequence-level (faster, no reconstruction overhead)
+            cache = None
+            remaining_tokens = seq.token_ids
+
+            # Block-level cache lookup via KVCacheManager
+            if cache is None and self.kv_cache_manager is not None and self.model is not None:
+                num_cached = self.kv_cache_manager.find_cached_prefix(seq.token_ids)
+                if num_cached > 0:
+                    # Allocate blocks to track the reference
+                    block_ids = self.kv_cache_manager.allocate_blocks(
+                        seq.token_ids[:num_cached]
+                    )
+                    seq.block_ids = block_ids
+                    # Try to reconstruct cache from blocks
+                    try:
+                        block_data = []
+                        block_size = self.kv_cache_manager.block_size
+                        for i in range(len(block_ids)):
+                            block = self.kv_cache_manager.pool.blocks[block_ids[i]]
+                            if block.kv_data is not None:
+                                block_data.append(block.kv_data)
+                        if block_data:
+                            cache = reconstruct_cache_from_blocks(
+                                [{'kv_data_per_layer': [d] if not isinstance(d, list) else d}
+                                 for d in block_data],
+                                self.model,
+                            )
+                            logger.debug(
+                                "Block cache hit for %s: %d tokens cached",
+                                req.request_id, num_cached,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to reconstruct cache from blocks for %s: %s",
+                            req.request_id, e,
+                        )
+                        cache = None
+
+            # Sequence-level cache lookup (fallback)
+            if cache is None and self._sequence_cache is not None:
+                cached, remaining = self._sequence_cache.find_longest_prefix(seq.token_ids)
+                if cached is not None:
+                    cache = cached
+                    remaining_tokens = remaining if remaining else seq.token_ids
+                    logger.debug(
+                        "Sequence cache hit for %s: %d tokens cached",
+                        req.request_id,
+                        len(seq.token_ids) - len(remaining),
+                    )
+
+            # Create sampler
+            sampler = None
+            if make_sampler is not None:
+                sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
+
+            # Handle max_tokens=0 gracefully
+            if req.max_tokens <= 0:
+                seq.is_finished = True
+                seq.finish_reason = "length"
+                self._signal_finish(req.request_id, finish_reason="length")
+                continue
+
+            # Insert into BatchGenerator
+            try:
+                insert_kwargs = {
+                    "prompts": [seq.token_ids],
+                    "max_tokens": [req.max_tokens],
+                }
+                if cache is not None:
+                    insert_kwargs["caches"] = [cache]
+                if sampler is not None:
+                    insert_kwargs["samplers"] = [sampler]
+
+                uids = self._batch_generator.insert(**insert_kwargs)
+                uid = uids[0]
+                self._uid_to_request_id[uid] = req.request_id
+                self._request_id_to_uid[req.request_id] = uid
+                seq._batch_uid = uid
+                logger.debug(
+                    "Inserted request %s as UID %d", req.request_id, uid
+                )
+            except Exception as e:
+                logger.error("Failed to insert request %s: %s", req.request_id, e)
+                seq.is_finished = True
+                seq.finish_reason = "error"
+                self._signal_finish(req.request_id, finish_reason="error")
+
+    def _cleanup_finished_batch(self) -> None:
+        """Clean up finished sequences from the batch path."""
+        with self._active_lock:
+            finished_ids = [
+                rid for rid, seq in self._active_sequences.items()
+                if seq.is_finished
+            ]
+            for rid in finished_ids:
+                seq = self._active_sequences.pop(rid)
+                # Clean up UID mappings
+                uid = self._request_id_to_uid.pop(rid, None)
+                if uid is not None:
+                    self._uid_to_request_id.pop(uid, None)
+                # Free KV cache blocks if manager is available
+                if self.kv_cache_manager is not None and seq.block_ids:
+                    self.kv_cache_manager.free_blocks(seq.block_ids)
+                logger.debug(
+                    "Cleaned up batch sequence %s (reason=%s)",
+                    rid,
+                    seq.finish_reason,
+                )
+
+    def _handle_batch_error(self, error: Exception) -> None:
+        """Handle error in batch inference path."""
+        with self._active_lock:
+            for seq in self._active_sequences.values():
+                if not seq.is_finished:
+                    seq.is_finished = True
+                    seq.finish_reason = "error"
+                    self._signal_finish(seq.request_id, finish_reason="error")
+        self._cleanup_finished_batch()
+
+        # Reset BatchGenerator
+        try:
+            self._batch_generator.close()
+        except Exception:
+            pass
+        self._create_batch_generator()
+        self._uid_to_request_id.clear()
+        self._request_id_to_uid.clear()
+
+    def _handle_mock_error(self) -> None:
+        """Handle error in mock inference path (existing behavior)."""
+        with self._active_lock:
+            for seq in self._active_sequences.values():
+                if not seq.is_finished:
+                    seq.is_finished = True
+                    seq.finish_reason = "error"
+                    self._signal_finish(seq.request_id, finish_reason="error")
+        self._cleanup_finished()
 
     # --- Scheduling ---
 
@@ -399,89 +820,23 @@ class Scheduler:
     def _run_prefill(self, sequences: list[SequenceState]) -> None:
         """Process uncached prompt tokens for the given sequences.
 
-        In mock mode (model=None), simply marks all prompt tokens as computed.
-        With a real model, creates a stream_generate generator per sequence,
-        advances it once to perform prefill and obtain the first token.
+        In mock mode (model=None), marks all prompt tokens as computed.
+        Real model prefill is handled by BatchGenerator in _batch_inference_step.
         """
         for seq in sequences:
-            request = getattr(seq, "_request", None)
-            if self.model is not None and stream_generate is not None and request is not None:
-                # Real model path: create generator and get first token via prefill
-                sampler = make_sampler(
-                    temp=request.temperature,
-                    top_p=request.top_p,
-                ) if make_sampler is not None else None
-                kwargs: dict[str, Any] = {"max_tokens": request.max_tokens}
-                if sampler is not None:
-                    kwargs["sampler"] = sampler
-                gen = stream_generate(
-                    self.model,
-                    self.tokenizer,
-                    seq.token_ids,
-                    **kwargs,
-                )
-                try:
-                    first_response = next(gen)
-                except (StopIteration, UnboundLocalError):
-                    # StopIteration: generator produced nothing
-                    # UnboundLocalError: upstream mlx-lm bug when max_tokens=0
-                    #   (stream_generate references unbound 'token' variable)
-                    seq.num_computed_tokens = len(seq.token_ids)
-                    seq.is_finished = True
-                    seq.finish_reason = "length" if request.max_tokens == 0 else "stop"
-                    self._signal_finish(seq.request_id, finish_reason=seq.finish_reason)
-                    logger.debug(
-                        "Prefill for %s yielded no tokens (max_tokens=%d)",
-                        seq.request_id, request.max_tokens,
-                    )
-                    continue
-
-                # Attach generator for subsequent decode steps
-                seq._generator = gen  # type: ignore[attr-defined]
-
-                # Process first token from prefill
-                token_id = first_response.token
-                token_text = first_response.text
-                finish_reason = first_response.finish_reason
-
-                seq.output_tokens.append(token_id)
-                seq.token_ids.append(token_id)
-                seq.output_text += token_text
-                seq.num_computed_tokens = len(seq.token_ids)
-
-                if finish_reason is not None:
-                    seq.is_finished = True
-                    seq.finish_reason = finish_reason
-
-                # Emit the first token event
-                event = TokenEvent(
-                    request_id=seq.request_id,
-                    token_id=token_id,
-                    token_text=token_text,
-                    finish_reason=finish_reason,
-                )
-                self._emit_tokens([event])
-
-                logger.debug(
-                    "Prefill complete for %s (%d prompt tokens, first generated token=%d)",
-                    seq.request_id,
-                    seq.num_computed_tokens - 1,
-                    token_id,
-                )
-            else:
-                # Mock mode: mark all prompt tokens as computed (prefill complete)
-                seq.num_computed_tokens = len(seq.token_ids)
-                logger.debug(
-                    "Prefill complete for %s (%d tokens)",
-                    seq.request_id,
-                    seq.num_computed_tokens,
-                )
+            # Mock mode: mark all prompt tokens as computed (prefill complete)
+            seq.num_computed_tokens = len(seq.token_ids)
+            logger.debug(
+                "Prefill complete for %s (%d tokens)",
+                seq.request_id,
+                seq.num_computed_tokens,
+            )
 
     def _run_decode_step(self, sequences: list[SequenceState]) -> list[TokenEvent]:
         """Run one decode iteration on active sequences.
 
         In mock mode, uses _mock_generate callback.
-        With a real model, would call BatchGenerator.next().
+        Real model decode is handled by BatchGenerator in _batch_inference_step.
 
         Returns a list of TokenEvents, one per sequence that produced a token.
         """
@@ -512,34 +867,9 @@ class Scheduler:
                 continue
 
             # Generate token
-            generator = getattr(seq, "_generator", None)
-            if generator is not None:
-                # Real model path: advance the stream_generate generator
-                try:
-                    response = next(generator)
-                    token_id = response.token
-                    token_text = response.text
-                    finish_reason = response.finish_reason
-                except StopIteration:
-                    # Generator exhausted — mark finished
-                    seq.is_finished = True
-                    seq.finish_reason = "stop"
-                    event = TokenEvent(
-                        request_id=seq.request_id,
-                        token_id=-1,
-                        token_text="",
-                        finish_reason="stop",
-                    )
-                    events.append(event)
-                    continue
-            elif self._mock_generate is not None:
+            if self._mock_generate is not None:
                 token_id, token_text, finish_reason = self._mock_generate(
                     seq.request_id, seq.token_ids, step
-                )
-            elif self.model is not None:
-                # Real model path without generator (fallback)
-                token_id, token_text, finish_reason = self._generate_with_model(
-                    seq, step
                 )
             else:
                 # No model and no mock: generate placeholder tokens
@@ -569,13 +899,6 @@ class Scheduler:
             events.append(event)
 
         return events
-
-    def _generate_with_model(self, seq: SequenceState, step: int) -> tuple[int, str, str | None]:
-        """Generate a token using the real model (placeholder for Phase 3 integration)."""
-        # This would use BatchGenerator. For now, a stub.
-        raise NotImplementedError(
-            "Real model generation requires BatchGenerator integration"
-        )
 
     def _check_stop_conditions(
         self, seq: SequenceState, request: InferenceRequest
@@ -660,10 +983,6 @@ class Scheduler:
             ]
             for rid in finished_ids:
                 seq = self._active_sequences.pop(rid)
-                # Close generator if present
-                generator = getattr(seq, "_generator", None)
-                if generator is not None:
-                    generator.close()
                 # Free KV cache blocks if manager is available
                 if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)

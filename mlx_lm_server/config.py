@@ -35,6 +35,11 @@ class ServerConfig:
     prefill_step_size: int = 2048  # Chunk size for prompt processing
     max_queue_size: int = 128  # Max pending requests
 
+    # Model generation
+    completion_batch_size: int = 32  # Max concurrent decode sequences in BatchGenerator
+    max_kv_size: int | None = None  # Max KV cache size (None = unlimited)
+    sequence_cache_size: int = 50  # Max cached sequence-level KV states
+
     # Generation defaults
     default_max_tokens: int = 512
     default_temperature: float = 1.0

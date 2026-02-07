@@ -515,6 +515,9 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--prefill-batch-size", type=int, default=4)
     parser.add_argument("--max-queue-size", type=int, default=128)
     parser.add_argument("--default-max-tokens", type=int, default=512)
+    parser.add_argument("--completion-batch-size", type=int, default=32)
+    parser.add_argument("--max-kv-size", type=int, default=None)
+    parser.add_argument("--sequence-cache-size", type=int, default=50)
 
     parsed = parser.parse_args(args)
 
@@ -532,11 +535,15 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "prefill_batch_size": parsed.prefill_batch_size,
         "max_queue_size": parsed.max_queue_size,
         "default_max_tokens": parsed.default_max_tokens,
+        "completion_batch_size": parsed.completion_batch_size,
+        "sequence_cache_size": parsed.sequence_cache_size,
     }
 
     if parsed.adapter_path is not None:
         kwargs["adapter_path"] = parsed.adapter_path
     if parsed.ssd_cache_dir is not None:
         kwargs["ssd_cache_dir"] = parsed.ssd_cache_dir
+    if parsed.max_kv_size is not None:
+        kwargs["max_kv_size"] = parsed.max_kv_size
 
     return ServerConfig(**kwargs)

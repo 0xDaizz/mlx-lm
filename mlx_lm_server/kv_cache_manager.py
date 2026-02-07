@@ -537,3 +537,120 @@ class TieredKVCache:
                 evicted_ids.append(block.block_id)
 
         return evicted_ids
+
+
+# ---------------------------------------------------------------------------
+# Cache Format Bridge (P7.1)
+# ---------------------------------------------------------------------------
+
+
+def decompose_cache_to_blocks(
+    prompt_cache: list,
+    token_ids: list[int],
+    block_size: int,
+) -> list[dict]:
+    """Extract block-level KV data from a sequence-level cache.
+
+    Takes a List[KVCache] (one per model layer) and a token sequence,
+    decomposes the KV data into block_size chunks aligned with token blocks.
+
+    For each block-sized chunk of token_ids, extracts the corresponding
+    K/V slices from each layer's cache using extract_block().
+
+    Args:
+        prompt_cache: List of KVCache objects (one per layer).
+        token_ids: The token sequence these caches correspond to.
+        block_size: Number of tokens per block.
+
+    Returns:
+        List of dicts, each containing:
+        - 'block_hash': int — hash for this block
+        - 'token_ids': list[int] — tokens in this block
+        - 'kv_data_per_layer': list[dict] — per-layer K/V data
+          Each dict has 'keys' and 'values' mx.arrays
+    """
+    num_tokens = len(token_ids)
+    num_full_blocks = num_tokens // block_size
+    blocks = []
+
+    for i in range(num_full_blocks):
+        start = i * block_size
+        end = start + block_size
+        prefix = token_ids[:start]
+        block_tokens = token_ids[start:end]
+
+        block_hash = compute_block_hash(prefix, block_tokens)
+
+        # Extract KV data from each layer
+        kv_data_per_layer = []
+        for cache_layer in prompt_cache:
+            state = cache_layer.state
+            if state is None or len(state) < 2:
+                continue
+            keys, values = state[0], state[1]
+            block_data = extract_block(keys, values, start, block_size)
+            kv_data_per_layer.append(block_data)
+
+        blocks.append({
+            'block_hash': block_hash,
+            'token_ids': list(block_tokens),
+            'kv_data_per_layer': kv_data_per_layer,
+        })
+
+    return blocks
+
+
+def reconstruct_cache_from_blocks(
+    blocks: list[dict],
+    model,
+) -> list:
+    """Reconstruct a List[KVCache] from block-level data.
+
+    Creates fresh KVCache objects per layer, injects the block data
+    by concatenating K/V tensors from all blocks for each layer.
+
+    Args:
+        blocks: List of dicts from decompose_cache_to_blocks().
+            Each dict has 'kv_data_per_layer' (list of per-layer K/V dicts).
+        model: The model, used to create fresh KVCache objects via
+            make_prompt_cache().
+
+    Returns:
+        List of KVCache objects ready for BatchGenerator.insert(caches=...).
+    """
+    if not blocks:
+        return []
+
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+    except ImportError:
+        raise ImportError("mlx_lm.models.cache.make_prompt_cache is required")
+
+    # Create fresh caches
+    cache = make_prompt_cache(model)
+    num_layers = len(cache)
+
+    # For each layer, collect K/V blocks and concatenate
+    for layer_idx in range(num_layers):
+        layer_blocks = []
+        for block in blocks:
+            if layer_idx < len(block['kv_data_per_layer']):
+                layer_blocks.append(block['kv_data_per_layer'][layer_idx])
+
+        if not layer_blocks:
+            continue
+
+        # Concatenate all blocks for this layer
+        reconstructed = inject_blocks(layer_blocks)
+
+        # Update the cache layer with reconstructed data
+        total_seq_len = reconstructed['keys'].shape[2]
+        cache_layer = cache[layer_idx]
+
+        # Set the cache state - KVCache.update() expects keys and values
+        # We directly update the internal state
+        cache_layer.keys = reconstructed['keys']
+        cache_layer.values = reconstructed['values']
+        cache_layer.offset = total_seq_len
+
+    return cache
