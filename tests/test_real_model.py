@@ -1046,3 +1046,317 @@ class TestAdversarialReal:
         assert len(results) == 3
         for rid, text in results.items():
             assert isinstance(text, str)
+
+
+# ===================================================================
+# G. Edge case tests (12)
+# ===================================================================
+
+
+class TestEdgeCasesReal:
+    """Edge case tests for input handling, lifecycle, and cache with real model."""
+
+    # --- Input edge cases (5) ---
+
+    def test_long_prompt(self, scheduler_factory, model_and_tokenizer):
+        """Prompt with 200+ tokens, verify completion works."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        # Repeat a sentence to build a long prompt (200+ tokens)
+        sentence = "The quick brown fox jumps over the lazy dog. "
+        long_prompt = sentence * 30  # ~270 tokens
+        tokens = tokenizer.encode(long_prompt)
+        assert len(tokens) >= 200, f"Expected 200+ tokens, got {len(tokens)}"
+
+        req = _make_request(
+            tokenizer, prompt=long_prompt, max_tokens=5, request_id="long-prompt"
+        )
+        sched.submit_request(req)
+        events = _collect_result(sched, "long-prompt", timeout=60.0)
+
+        assert len(events) > 0
+        assert len(events) <= 5
+        assert events[-1].finish_reason in {"stop", "length"}
+
+    def test_unicode_emoji_prompt(self, scheduler_factory, model_and_tokenizer):
+        """Prompt with emoji and CJK characters, verify tokens come back."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        prompt = "Translate: \u4f60\u597d\u4e16\u754c \U0001f30d means"
+        req = _make_request(
+            tokenizer, prompt=prompt, max_tokens=10, request_id="emoji-cjk"
+        )
+        sched.submit_request(req)
+        events = _collect_result(sched, "emoji-cjk")
+
+        assert len(events) > 0
+        assert len(events) <= 10
+        assert events[-1].finish_reason in {"stop", "length"}
+        for e in events:
+            assert isinstance(e.token_text, str)
+            assert isinstance(e.token_id, int)
+
+    def test_unicode_rtl_prompt(self, scheduler_factory, model_and_tokenizer):
+        """Prompt with Arabic RTL text, verify generation completes."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        prompt = "Translate: \u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645"
+        req = _make_request(
+            tokenizer, prompt=prompt, max_tokens=10, request_id="rtl-prompt"
+        )
+        sched.submit_request(req)
+        events = _collect_result(sched, "rtl-prompt")
+
+        assert len(events) > 0
+        assert len(events) <= 10
+        assert events[-1].finish_reason in {"stop", "length"}
+        for e in events:
+            assert isinstance(e.token_text, str)
+
+    def test_single_token_max(self, scheduler_factory, model_and_tokenizer):
+        """max_tokens=1, verify exactly 1 token returned."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        req = _make_request(
+            tokenizer, prompt="Hello", max_tokens=1, request_id="single-tok"
+        )
+        sched.submit_request(req)
+        events = _collect_result(sched, "single-tok")
+
+        assert len(events) == 1
+        assert events[0].finish_reason in {"stop", "length"}
+        assert isinstance(events[0].token_id, int)
+
+    def test_large_max_tokens(self, scheduler_factory, model_and_tokenizer):
+        """max_tokens=200, let model generate freely until EOS or length."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        req = _make_request(
+            tokenizer,
+            prompt="Say 'done'.",
+            max_tokens=200,
+            request_id="large-mt",
+        )
+        sched.submit_request(req)
+        events = _collect_result(sched, "large-mt", timeout=60.0)
+
+        assert len(events) > 0
+        assert len(events) <= 200
+        assert events[-1].finish_reason in {"stop", "length"}
+
+    # --- Lifecycle edge cases (4) ---
+
+    def test_rapid_cancel_resubmit(self, scheduler_factory, model_and_tokenizer):
+        """Submit request, cancel immediately, submit new request, verify second completes."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        req1 = _make_request(
+            tokenizer,
+            prompt="This will be cancelled",
+            max_tokens=50,
+            request_id="cancel-rapid-1",
+            stream=True,
+        )
+        stream_q = sched.register_stream("cancel-rapid-1")
+        sched.submit_request(req1)
+
+        # Cancel immediately
+        sched.cancel_request("cancel-rapid-1")
+
+        # Drain the stream (should get cancelled event or tokens + cancelled)
+        deadline = time.time() + 10.0
+        while time.time() < deadline:
+            try:
+                event = stream_q.get(timeout=1.0)
+                if event.finish_reason is not None:
+                    break
+            except queue.Empty:
+                break
+
+        # Submit a new request with DIFFERENT request_id
+        req2 = _make_request(
+            tokenizer,
+            prompt="This should complete",
+            max_tokens=5,
+            request_id="cancel-rapid-2",
+        )
+        sched.submit_request(req2)
+        ev2 = _collect_result(sched, "cancel-rapid-2")
+
+        assert len(ev2) > 0
+        assert ev2[-1].finish_reason in {"stop", "length"}
+
+    def test_scheduler_get_cache_stats(self, scheduler_factory, model_and_tokenizer):
+        """Call get_cache_stats() after some requests, verify dict with expected keys."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        # Run a request so some state exists
+        req = _make_request(
+            tokenizer, prompt="Stats test", max_tokens=3, request_id="stats-1"
+        )
+        sched.submit_request(req)
+        _collect_result(sched, "stats-1")
+
+        stats = sched.get_cache_stats()
+
+        assert isinstance(stats, dict)
+        assert "active_sequences" in stats
+        assert "queued_requests" in stats
+        assert "total_blocks" in stats
+        assert "used_blocks" in stats
+        assert "free_blocks" in stats
+        assert "cached_blocks" in stats
+
+        # After the request finishes, active sequences should be 0
+        assert stats["active_sequences"] == 0
+        assert stats["queued_requests"] == 0
+        # total_blocks should match config
+        assert stats["total_blocks"] == 256
+        assert isinstance(stats["free_blocks"], int)
+        assert stats["free_blocks"] >= 0
+        assert stats["free_blocks"] <= stats["total_blocks"]
+
+    @pytest.mark.anyio
+    async def test_models_endpoint(self, app_factory):
+        """GET /v1/models, verify response has list of models with expected structure."""
+        client = await app_factory()
+        resp = await client.get("/v1/models", timeout=10.0)
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert data["object"] == "list"
+        assert "data" in data
+        assert isinstance(data["data"], list)
+        assert len(data["data"]) >= 1
+
+        model_info = data["data"][0]
+        assert "id" in model_info
+        assert model_info["object"] == "model"
+        assert "owned_by" in model_info
+        assert model_info["owned_by"] == "mlx-lm-server"
+
+    def test_sequential_heavy_load(self, scheduler_factory, model_and_tokenizer):
+        """Submit 10 requests sequentially (max_tokens=3 each), verify all complete."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        for i in range(10):
+            req = _make_request(
+                tokenizer,
+                prompt=f"Heavy load request {i}",
+                max_tokens=3,
+                request_id=f"heavy-{i}",
+            )
+            sched.submit_request(req)
+            events = _collect_result(sched, f"heavy-{i}")
+            assert len(events) > 0
+            assert events[-1].finish_reason in {"stop", "length"}
+
+        # Scheduler should be healthy afterward
+        time.sleep(0.5)
+        assert sched.is_running
+        assert sched.num_active_sequences == 0
+        assert sched.num_queued_requests == 0
+
+    # --- Cache edge cases (3) ---
+
+    def test_kv_cache_manager_find_prefix(self, scheduler_factory, model_and_tokenizer):
+        """After a request completes, find_cached_prefix returns > 0 for same prompt."""
+        _, tokenizer = model_and_tokenizer
+        # Use small block_size so even moderate prompts produce full blocks
+        sched = scheduler_factory(block_size=8)
+
+        prompt = (
+            "This is a prompt to test prefix caching in the KV cache manager. "
+            "We need enough tokens to fill at least two full blocks of size eight."
+        )
+        prompt_tokens = tokenizer.encode(prompt)
+
+        req = _make_request(
+            tokenizer, prompt=prompt, max_tokens=5, request_id="prefix-lookup-1"
+        )
+        sched.submit_request(req)
+        _collect_result(sched, "prefix-lookup-1")
+
+        # Wait for block decomposition to run
+        time.sleep(1.5)
+
+        kv_mgr = sched.kv_cache_manager
+        cached = kv_mgr.find_cached_prefix(prompt_tokens)
+        # Should have cached at least one block worth of tokens
+        assert cached > 0, (
+            f"Expected find_cached_prefix > 0 after completing a request, "
+            f"got {cached}. hash_table has {len(kv_mgr.hash_table)} entries."
+        )
+        # cached should be a multiple of block_size
+        assert cached % kv_mgr.block_size == 0
+
+    def test_cache_exhaustion_graceful(self, scheduler_factory, model_and_tokenizer):
+        """Use very small num_blocks=16, submit many requests, verify no crash."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory(num_blocks=16, block_size=16)
+
+        completed = 0
+        errored = 0
+        for i in range(8):
+            prompt = f"Cache exhaustion test {i}: generate something short."
+            req = _make_request(
+                tokenizer, prompt=prompt, max_tokens=3, request_id=f"exhaust-{i}"
+            )
+            sched.submit_request(req)
+            try:
+                events = _collect_result(sched, f"exhaust-{i}", timeout=30.0)
+                if events and events[-1].finish_reason is not None:
+                    completed += 1
+                else:
+                    errored += 1
+            except Exception:
+                errored += 1
+            time.sleep(0.2)
+
+        # At least some requests should complete; scheduler should not crash
+        assert sched.is_running, "Scheduler crashed under cache exhaustion"
+        assert completed > 0, (
+            f"No requests completed under cache exhaustion "
+            f"(completed={completed}, errored={errored})"
+        )
+
+    def test_temperature_variation(self, scheduler_factory, model_and_tokenizer):
+        """Same prompt with temperature=0.0 vs temperature=1.5, both complete."""
+        _, tokenizer = model_and_tokenizer
+        sched = scheduler_factory()
+
+        prompt = "What color is the sky?"
+
+        # temperature=0.0 (greedy)
+        req_cold = _make_request(
+            tokenizer,
+            prompt=prompt,
+            max_tokens=10,
+            request_id="temp-cold",
+            temperature=0.0,
+        )
+        sched.submit_request(req_cold)
+        ev_cold = _collect_result(sched, "temp-cold")
+        assert len(ev_cold) > 0
+        assert ev_cold[-1].finish_reason in {"stop", "length"}
+
+        # temperature=1.5 (high randomness)
+        req_hot = _make_request(
+            tokenizer,
+            prompt=prompt,
+            max_tokens=10,
+            request_id="temp-hot",
+            temperature=1.5,
+        )
+        sched.submit_request(req_hot)
+        ev_hot = _collect_result(sched, "temp-hot")
+        assert len(ev_hot) > 0
+        assert ev_hot[-1].finish_reason in {"stop", "length"}
