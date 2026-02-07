@@ -270,7 +270,7 @@
 | [x] | **P5.8** Add `pyproject.toml` CLI entry point | ✅ real Scheduler in __main__.py (commit 844fcda) |
 | [x] | **P5.9** Document JACCL setup | ✅ JACCL section in README (commit 844fcda) |
 | [x] | **P5.10** Code review: docstrings, dead code | ✅ cleanup done (commit 844fcda) |
-| [ ] | **P5.11** Tag `v0.1.0` + push tags |
+| [x] | **P5.11** Tag `v0.1.0` + push tags | ✅ tagged + pushed to origin |
 
 ### 5.1 Final Devil's Advocate: Cross-Component Review 🔴
 
