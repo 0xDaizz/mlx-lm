@@ -422,14 +422,17 @@ class Scheduler:
                 )
                 try:
                     first_response = next(gen)
-                except StopIteration:
-                    # Generator produced nothing — mark finished immediately
+                except (StopIteration, UnboundLocalError):
+                    # StopIteration: generator produced nothing
+                    # UnboundLocalError: upstream mlx-lm bug when max_tokens=0
+                    #   (stream_generate references unbound 'token' variable)
                     seq.num_computed_tokens = len(seq.token_ids)
                     seq.is_finished = True
-                    seq.finish_reason = "stop"
-                    self._signal_finish(seq.request_id, finish_reason="stop")
+                    seq.finish_reason = "length" if request.max_tokens == 0 else "stop"
+                    self._signal_finish(seq.request_id, finish_reason=seq.finish_reason)
                     logger.debug(
-                        "Prefill for %s yielded no tokens", seq.request_id
+                        "Prefill for %s yielded no tokens (max_tokens=%d)",
+                        seq.request_id, request.max_tokens,
                     )
                     continue
 
