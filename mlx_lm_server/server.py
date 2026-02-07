@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import queue
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -35,7 +36,7 @@ class SchedulerProtocol(Protocol):
 
     def submit_request(self, request: InferenceRequest) -> None: ...
     def register_stream(self, request_id: str) -> Queue[TokenEvent | None]: ...
-    def get_result(self, request_id: str) -> list[TokenEvent]: ...
+    def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]: ...
     def get_cache_stats(self) -> dict[str, Any]: ...
     def shutdown(self) -> None: ...
 
@@ -255,8 +256,11 @@ def create_app(
         # Non-streaming: submit and collect all tokens
         sched.submit_request(inf_req)
         events = await asyncio.get_running_loop().run_in_executor(
-            None, sched.get_result, request_id
+            None, lambda: sched.get_result(request_id, timeout=300)
         )
+
+        if not events:
+            raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
 
         # Exclude EOS token text from output if present
         filtered_events = events
@@ -266,7 +270,7 @@ def create_app(
                 filtered_events = events[:-1]
         completion_text = "".join(e.token_text for e in filtered_events)
         finish_reason = events[-1].finish_reason if events else "stop"
-        completion_tokens = len(events)
+        completion_tokens = len(filtered_events)
 
         return ChatCompletionResponse(
             id=request_id,
@@ -320,8 +324,11 @@ def create_app(
 
         sched.submit_request(inf_req)
         events = await asyncio.get_running_loop().run_in_executor(
-            None, sched.get_result, request_id
+            None, lambda: sched.get_result(request_id, timeout=300)
         )
+
+        if not events:
+            raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
 
         # Exclude EOS token text from output if present
         filtered_events = events
@@ -331,7 +338,7 @@ def create_app(
                 filtered_events = events[:-1]
         completion_text = "".join(e.token_text for e in filtered_events)
         finish_reason = events[-1].finish_reason if events else "stop"
-        completion_tokens = len(events)
+        completion_tokens = len(filtered_events)
 
         return CompletionResponse(
             id=request_id,
@@ -423,9 +430,14 @@ def _stream_chat_response(
         loop = asyncio.get_running_loop()
 
         while True:
-            event: TokenEvent | None = await loop.run_in_executor(
-                None, lambda: token_queue.get(timeout=120)
-            )
+            try:
+                event: TokenEvent | None = await loop.run_in_executor(
+                    None, lambda: token_queue.get(timeout=120)
+                )
+            except queue.Empty:
+                error_data = {"error": {"message": "Stream timeout: no tokens received for 120 seconds", "type": "server_error"}}
+                yield f"data: {json.dumps(error_data)}\n\n"
+                break
             if event is None:
                 break
 
@@ -472,9 +484,14 @@ def _stream_completion_response(
         loop = asyncio.get_running_loop()
 
         while True:
-            event: TokenEvent | None = await loop.run_in_executor(
-                None, lambda: token_queue.get(timeout=120)
-            )
+            try:
+                event: TokenEvent | None = await loop.run_in_executor(
+                    None, lambda: token_queue.get(timeout=120)
+                )
+            except queue.Empty:
+                error_data = {"error": {"message": "Stream timeout: no tokens received for 120 seconds", "type": "server_error"}}
+                yield f"data: {json.dumps(error_data)}\n\n"
+                break
             if event is None:
                 break
 

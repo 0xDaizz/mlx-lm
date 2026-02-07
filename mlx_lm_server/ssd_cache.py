@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -178,7 +180,11 @@ class SSDCache:
         return len(to_prune)
 
     def save_index(self) -> None:
-        """Persist the index to a JSON file in the cache directory."""
+        """Persist the index to a JSON file in the cache directory.
+
+        Uses atomic write (write to temp file + os.replace) to prevent
+        index corruption if the process crashes mid-write.
+        """
         index_path = self.cache_dir / "index.json"
         serializable = {}
         for bh, meta in self.index.items():
@@ -188,7 +194,17 @@ class SSDCache:
                 "last_accessed": meta.last_accessed.isoformat(),
                 "num_tokens": meta.num_tokens,
             }
-        index_path.write_text(json.dumps(serializable, indent=2))
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.tmp')
+        try:
+            with os.fdopen(tmp_fd, 'w') as f:
+                json.dump(serializable, f, indent=2)
+            os.replace(tmp_path, str(index_path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def load_index(self) -> None:
         """Load the index from the JSON file in the cache directory."""

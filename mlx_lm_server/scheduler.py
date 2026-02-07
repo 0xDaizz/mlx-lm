@@ -219,13 +219,16 @@ class Scheduler:
         """Submit a new inference request to the scheduler.
 
         The request is added to the queue and the inference loop is notified.
+        Only creates _results/_results_ready entries for non-streaming requests
+        to prevent resource leaks (streaming requests use register_stream instead).
         """
         self.request_queue.add(request)
 
-        # Set up result storage for non-streaming requests
-        with self._results_lock:
-            self._results[request.request_id] = []
-            self._results_ready[request.request_id] = threading.Event()
+        # Set up result storage only for non-streaming requests
+        if not getattr(request, "stream", False):
+            with self._results_lock:
+                self._results[request.request_id] = []
+                self._results_ready[request.request_id] = threading.Event()
 
         self._new_request_event.set()
         logger.debug("Submitted request %s", request.request_id)

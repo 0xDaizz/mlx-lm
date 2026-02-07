@@ -141,7 +141,7 @@ class MockSchedulerForApp:
         self.streams[request_id] = q
         return q
 
-    def get_result(self, request_id: str) -> list[TokenEvent]:
+    def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
         events: list[TokenEvent] = []
         for i, tok_text in enumerate(self.response_tokens):
             is_last = i == len(self.response_tokens) - 1
