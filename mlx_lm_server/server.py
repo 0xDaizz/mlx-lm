@@ -37,6 +37,7 @@ class SchedulerProtocol(Protocol):
     def submit_request(self, request: InferenceRequest) -> None: ...
     def register_stream(self, request_id: str) -> Queue[TokenEvent | None]: ...
     def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]: ...
+    def cancel_request(self, request_id: str) -> bool: ...
     def get_cache_stats(self) -> dict[str, Any]: ...
     def shutdown(self) -> None: ...
 
@@ -250,7 +251,7 @@ def create_app(
 
         if body.stream:
             return _stream_chat_response(
-                sched, inf_req, app.state.model_name, request_id, len(prompt_tokens)
+                sched, inf_req, app.state.model_name, request_id, len(prompt_tokens), tok
             )
 
         # Non-streaming: submit and collect all tokens
@@ -260,6 +261,7 @@ def create_app(
         )
 
         if not events:
+            sched.cancel_request(request_id)
             raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
 
         # Exclude EOS token text from output if present
@@ -319,7 +321,7 @@ def create_app(
 
         if body.stream:
             return _stream_completion_response(
-                sched, inf_req, app.state.model_name, request_id, len(prompt_tokens)
+                sched, inf_req, app.state.model_name, request_id, len(prompt_tokens), tok
             )
 
         sched.submit_request(inf_req)
@@ -328,6 +330,7 @@ def create_app(
         )
 
         if not events:
+            sched.cancel_request(request_id)
             raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
 
         # Exclude EOS token text from output if present
@@ -421,6 +424,7 @@ def _stream_chat_response(
     model_name: str,
     request_id: str,
     prompt_tokens: int,
+    tokenizer: Any = None,
 ) -> StreamingResponse:
     async def event_generator() -> AsyncIterator[str]:
         token_queue = scheduler.register_stream(inf_req.request_id)
@@ -443,6 +447,13 @@ def _stream_chat_response(
 
             completion_tokens += 1
 
+            # Filter EOS token text in streaming
+            token_text = event.token_text
+            if event.finish_reason == "stop" and tokenizer is not None:
+                eos_token = getattr(tokenizer, "eos_token", None)
+                if eos_token is not None and token_text == eos_token:
+                    token_text = ""
+
             chunk = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
@@ -451,7 +462,7 @@ def _stream_chat_response(
                 "choices": [
                     {
                         "index": 0,
-                        "delta": {"content": event.token_text},
+                        "delta": {"content": token_text},
                         "finish_reason": event.finish_reason,
                     }
                 ],
@@ -476,6 +487,7 @@ def _stream_completion_response(
     model_name: str,
     request_id: str,
     prompt_tokens: int,
+    tokenizer: Any = None,
 ) -> StreamingResponse:
     async def event_generator() -> AsyncIterator[str]:
         token_queue = scheduler.register_stream(inf_req.request_id)
@@ -495,6 +507,13 @@ def _stream_completion_response(
             if event is None:
                 break
 
+            # Filter EOS token text in streaming
+            token_text = event.token_text
+            if event.finish_reason == "stop" and tokenizer is not None:
+                eos_token = getattr(tokenizer, "eos_token", None)
+                if eos_token is not None and token_text == eos_token:
+                    token_text = ""
+
             chunk = {
                 "id": request_id,
                 "object": "text_completion",
@@ -503,7 +522,7 @@ def _stream_completion_response(
                 "choices": [
                     {
                         "index": 0,
-                        "text": event.token_text,
+                        "text": token_text,
                         "finish_reason": event.finish_reason,
                     }
                 ],

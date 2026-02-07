@@ -240,7 +240,7 @@ class Scheduler:
         are generated. A TokenEvent with finish_reason != None signals
         the end of generation.
         """
-        q: queue.Queue[TokenEvent] = queue.Queue()
+        q: queue.Queue[TokenEvent] = queue.Queue(maxsize=256)
         with self._streams_lock:
             self._streams[request_id] = q
         return q
@@ -579,105 +579,115 @@ class Scheduler:
             return
 
         for req in new_requests:
-            seq = self._init_sequence(req)
-
-            # Set up detokenizer
-            if self.tokenizer is not None:
-                detok = getattr(self.tokenizer, "detokenizer", None)
-                if detok is not None:
-                    seq._detokenizer = copy.copy(detok)
-                    seq._detokenizer.reset()
-
-            with self._active_lock:
-                self._active_sequences[req.request_id] = seq
-
-            # Look up caches: block-level first (finer granularity),
-            # then sequence-level (faster, no reconstruction overhead)
-            cache = None
-            remaining_tokens = seq.token_ids
-
-            # Block-level cache lookup via KVCacheManager
-            if cache is None and self.kv_cache_manager is not None and self.model is not None:
-                num_cached = self.kv_cache_manager.find_cached_prefix(seq.token_ids)
-                if num_cached > 0:
-                    # Allocate blocks to track the reference
-                    block_ids = self.kv_cache_manager.allocate_blocks(
-                        seq.token_ids[:num_cached]
-                    )
-                    seq.block_ids = block_ids
-                    # Try to reconstruct cache from blocks
-                    try:
-                        block_data = []
-                        block_size = self.kv_cache_manager.block_size
-                        for i in range(len(block_ids)):
-                            block = self.kv_cache_manager.pool.blocks[block_ids[i]]
-                            if block.kv_data is not None:
-                                block_data.append(block.kv_data)
-                        if block_data:
-                            cache = reconstruct_cache_from_blocks(
-                                [{'kv_data_per_layer': [d] if not isinstance(d, list) else d}
-                                 for d in block_data],
-                                self.model,
-                            )
-                            logger.debug(
-                                "Block cache hit for %s: %d tokens cached",
-                                req.request_id, num_cached,
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "Failed to reconstruct cache from blocks for %s: %s",
-                            req.request_id, e,
-                        )
-                        cache = None
-
-            # Sequence-level cache lookup (fallback)
-            if cache is None and self._sequence_cache is not None:
-                cached, remaining = self._sequence_cache.find_longest_prefix(seq.token_ids)
-                if cached is not None:
-                    cache = cached
-                    remaining_tokens = remaining if remaining else seq.token_ids
-                    logger.debug(
-                        "Sequence cache hit for %s: %d tokens cached",
-                        req.request_id,
-                        len(seq.token_ids) - len(remaining),
-                    )
-
-            # Create sampler
-            sampler = None
-            if make_sampler is not None:
-                sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
-
-            # Handle max_tokens=0 gracefully
-            if req.max_tokens <= 0:
-                seq.is_finished = True
-                seq.finish_reason = "length"
-                self._signal_finish(req.request_id, finish_reason="length")
-                continue
-
-            # Insert into BatchGenerator
             try:
-                insert_kwargs = {
-                    "prompts": [seq.token_ids],
-                    "max_tokens": [req.max_tokens],
-                }
-                if cache is not None:
-                    insert_kwargs["caches"] = [cache]
-                if sampler is not None:
-                    insert_kwargs["samplers"] = [sampler]
+                seq = self._init_sequence(req)
 
-                uids = self._batch_generator.insert(**insert_kwargs)
-                uid = uids[0]
-                self._uid_to_request_id[uid] = req.request_id
-                self._request_id_to_uid[req.request_id] = uid
-                seq._batch_uid = uid
-                logger.debug(
-                    "Inserted request %s as UID %d", req.request_id, uid
-                )
+                # Set up detokenizer
+                if self.tokenizer is not None:
+                    detok = getattr(self.tokenizer, "detokenizer", None)
+                    if detok is not None:
+                        seq._detokenizer = copy.copy(detok)
+                        seq._detokenizer.reset()
+
+                with self._active_lock:
+                    self._active_sequences[req.request_id] = seq
+
+                # Look up caches: block-level first (finer granularity),
+                # then sequence-level (faster, no reconstruction overhead)
+                cache = None
+                remaining_tokens = seq.token_ids
+
+                # Block-level cache lookup via KVCacheManager
+                if cache is None and self.kv_cache_manager is not None and self.model is not None:
+                    num_cached = self.kv_cache_manager.find_cached_prefix(seq.token_ids)
+                    if num_cached > 0:
+                        # Allocate blocks to track the reference
+                        block_ids = self.kv_cache_manager.allocate_blocks(
+                            seq.token_ids[:num_cached]
+                        )
+                        seq.block_ids = block_ids
+                        # Try to reconstruct cache from blocks
+                        try:
+                            block_data = []
+                            block_size = self.kv_cache_manager.block_size
+                            for i in range(len(block_ids)):
+                                block = self.kv_cache_manager.pool.blocks[block_ids[i]]
+                                if block.kv_data is not None:
+                                    block_data.append(block.kv_data)
+                            if block_data:
+                                cache = reconstruct_cache_from_blocks(
+                                    [{'kv_data_per_layer': [d] if not isinstance(d, list) else d}
+                                     for d in block_data],
+                                    self.model,
+                                )
+                                logger.debug(
+                                    "Block cache hit for %s: %d tokens cached",
+                                    req.request_id, num_cached,
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "Failed to reconstruct cache from blocks for %s: %s",
+                                req.request_id, e,
+                            )
+                            cache = None
+
+                # Sequence-level cache lookup (fallback)
+                if cache is None and self._sequence_cache is not None:
+                    cached, remaining = self._sequence_cache.find_longest_prefix(seq.token_ids)
+                    if cached is not None:
+                        cache = cached
+                        remaining_tokens = remaining if remaining else seq.token_ids
+                        logger.debug(
+                            "Sequence cache hit for %s: %d tokens cached",
+                            req.request_id,
+                            len(seq.token_ids) - len(remaining),
+                        )
+
+                # Create sampler
+                sampler = None
+                if make_sampler is not None:
+                    sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
+
+                # Handle max_tokens=0 gracefully
+                if req.max_tokens <= 0:
+                    seq.is_finished = True
+                    seq.finish_reason = "length"
+                    self._signal_finish(req.request_id, finish_reason="length")
+                    continue
+
+                # Insert into BatchGenerator
+                try:
+                    insert_kwargs = {
+                        "prompts": [seq.token_ids],
+                        "max_tokens": [req.max_tokens],
+                    }
+                    if cache is not None:
+                        insert_kwargs["caches"] = [cache]
+                    if sampler is not None:
+                        insert_kwargs["samplers"] = [sampler]
+
+                    uids = self._batch_generator.insert(**insert_kwargs)
+                    uid = uids[0]
+                    self._uid_to_request_id[uid] = req.request_id
+                    self._request_id_to_uid[req.request_id] = uid
+                    seq._batch_uid = uid
+                    logger.debug(
+                        "Inserted request %s as UID %d", req.request_id, uid
+                    )
+                except Exception as e:
+                    logger.error("Failed to insert request %s: %s", req.request_id, e)
+                    seq.is_finished = True
+                    seq.finish_reason = "error"
+                    self._signal_finish(req.request_id, finish_reason="error")
             except Exception as e:
-                logger.error("Failed to insert request %s: %s", req.request_id, e)
-                seq.is_finished = True
-                seq.finish_reason = "error"
-                self._signal_finish(req.request_id, finish_reason="error")
+                # Request was popped from queue but failed during setup —
+                # signal error to caller so they don't hang forever
+                request_id = req.request_id
+                logger.error("Failed to insert request %s: %s", request_id, e)
+                self._signal_finish(request_id, finish_reason="error")
+                # Clean up if sequence was partially added to active set
+                with self._active_lock:
+                    self._active_sequences.pop(request_id, None)
 
     def _cleanup_finished_batch(self) -> None:
         """Clean up finished sequences from the batch path."""
@@ -787,7 +797,7 @@ class Scheduler:
             for seq in self._active_sequences.values():
                 if seq.is_finished:
                     continue
-                if seq not in prefill_sequences:
+                if seq not in prefill_sequences and seq not in decode_sequences:
                     decode_sequences.append(seq)
 
         return SchedulerOutputs(
@@ -931,6 +941,8 @@ class Scheduler:
         if request.stop_sequences and seq.output_text:
             for stop_seq in request.stop_sequences:
                 if stop_seq in seq.output_text:
+                    idx = seq.output_text.index(stop_seq)
+                    seq.output_text = seq.output_text[:idx]
                     return "stop"
 
         return None
@@ -946,7 +958,18 @@ class Scheduler:
             with self._streams_lock:
                 stream = self._streams.get(rid)
             if stream is not None:
-                stream.put(event)
+                try:
+                    stream.put_nowait(event)
+                except queue.Full:
+                    # Drop oldest token to make room (slow consumer)
+                    try:
+                        stream.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        stream.put_nowait(event)
+                    except queue.Full:
+                        logger.warning("Stream queue full for %s, dropping token", rid)
                 if event.finish_reason is not None:
                     with self._streams_lock:
                         self._streams.pop(rid, None)
@@ -972,7 +995,17 @@ class Scheduler:
         with self._streams_lock:
             stream = self._streams.pop(request_id, None)
         if stream is not None:
-            stream.put(event)
+            try:
+                stream.put_nowait(event)
+            except queue.Full:
+                try:
+                    stream.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    stream.put_nowait(event)
+                except queue.Full:
+                    logger.warning("Stream queue full for %s during finish signal", request_id)
 
         with self._results_lock:
             if request_id in self._results:
