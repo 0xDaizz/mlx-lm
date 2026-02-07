@@ -24,7 +24,7 @@
 - [x] **P0.7** Create `mlx_lm_server/__init__.py`
 - [x] **P0.8** Install deps: `pip install -e ".[dev]" fastapi uvicorn pytest httpx` *(Python 3.12 venv at .venv/)*
 - [x] **P0.9** Verify test model + BatchGenerator *(local Qwen3-4B-4bit loads and generates OK)*
-- [~] **P0.10** Commit + push: `[P0] chore: project setup`
+- [x] **P0.10** Commit + push: `[P0] chore: project setup` *(commit 686140b)*
 
 ---
 
