@@ -33,6 +33,13 @@ from mlx_lm_server.types import (
     TokenEvent,
 )
 
+try:
+    from mlx_lm.generate import stream_generate
+    from mlx_lm.sample_utils import make_sampler
+except ImportError:
+    stream_generate = None
+    make_sampler = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -393,16 +400,79 @@ class Scheduler:
         """Process uncached prompt tokens for the given sequences.
 
         In mock mode (model=None), simply marks all prompt tokens as computed.
-        With a real model, would run the model forward pass on uncached tokens.
+        With a real model, creates a stream_generate generator per sequence,
+        advances it once to perform prefill and obtain the first token.
         """
         for seq in sequences:
-            # Mark all prompt tokens as computed (prefill complete)
-            seq.num_computed_tokens = len(seq.token_ids)
-            logger.debug(
-                "Prefill complete for %s (%d tokens)",
-                seq.request_id,
-                seq.num_computed_tokens,
-            )
+            request = getattr(seq, "_request", None)
+            if self.model is not None and stream_generate is not None and request is not None:
+                # Real model path: create generator and get first token via prefill
+                sampler = make_sampler(
+                    temp=request.temperature,
+                    top_p=request.top_p,
+                ) if make_sampler is not None else None
+                kwargs: dict[str, Any] = {"max_tokens": request.max_tokens}
+                if sampler is not None:
+                    kwargs["sampler"] = sampler
+                gen = stream_generate(
+                    self.model,
+                    self.tokenizer,
+                    seq.token_ids,
+                    **kwargs,
+                )
+                try:
+                    first_response = next(gen)
+                except StopIteration:
+                    # Generator produced nothing — mark finished immediately
+                    seq.num_computed_tokens = len(seq.token_ids)
+                    seq.is_finished = True
+                    seq.finish_reason = "stop"
+                    self._signal_finish(seq.request_id, finish_reason="stop")
+                    logger.debug(
+                        "Prefill for %s yielded no tokens", seq.request_id
+                    )
+                    continue
+
+                # Attach generator for subsequent decode steps
+                seq._generator = gen  # type: ignore[attr-defined]
+
+                # Process first token from prefill
+                token_id = first_response.token
+                token_text = first_response.text
+                finish_reason = first_response.finish_reason
+
+                seq.output_tokens.append(token_id)
+                seq.token_ids.append(token_id)
+                seq.output_text += token_text
+                seq.num_computed_tokens = len(seq.token_ids)
+
+                if finish_reason is not None:
+                    seq.is_finished = True
+                    seq.finish_reason = finish_reason
+
+                # Emit the first token event
+                event = TokenEvent(
+                    request_id=seq.request_id,
+                    token_id=token_id,
+                    token_text=token_text,
+                    finish_reason=finish_reason,
+                )
+                self._emit_tokens([event])
+
+                logger.debug(
+                    "Prefill complete for %s (%d prompt tokens, first generated token=%d)",
+                    seq.request_id,
+                    seq.num_computed_tokens - 1,
+                    token_id,
+                )
+            else:
+                # Mock mode: mark all prompt tokens as computed (prefill complete)
+                seq.num_computed_tokens = len(seq.token_ids)
+                logger.debug(
+                    "Prefill complete for %s (%d tokens)",
+                    seq.request_id,
+                    seq.num_computed_tokens,
+                )
 
     def _run_decode_step(self, sequences: list[SequenceState]) -> list[TokenEvent]:
         """Run one decode iteration on active sequences.
@@ -439,12 +509,32 @@ class Scheduler:
                 continue
 
             # Generate token
-            if self._mock_generate is not None:
+            generator = getattr(seq, "_generator", None)
+            if generator is not None:
+                # Real model path: advance the stream_generate generator
+                try:
+                    response = next(generator)
+                    token_id = response.token
+                    token_text = response.text
+                    finish_reason = response.finish_reason
+                except StopIteration:
+                    # Generator exhausted — mark finished
+                    seq.is_finished = True
+                    seq.finish_reason = "stop"
+                    event = TokenEvent(
+                        request_id=seq.request_id,
+                        token_id=-1,
+                        token_text="",
+                        finish_reason="stop",
+                    )
+                    events.append(event)
+                    continue
+            elif self._mock_generate is not None:
                 token_id, token_text, finish_reason = self._mock_generate(
                     seq.request_id, seq.token_ids, step
                 )
             elif self.model is not None:
-                # Real model path (to be integrated with BatchGenerator)
+                # Real model path without generator (fallback)
                 token_id, token_text, finish_reason = self._generate_with_model(
                     seq, step
                 )
@@ -567,6 +657,10 @@ class Scheduler:
             ]
             for rid in finished_ids:
                 seq = self._active_sequences.pop(rid)
+                # Close generator if present
+                generator = getattr(seq, "_generator", None)
+                if generator is not None:
+                    generator.close()
                 # Free KV cache blocks if manager is available
                 if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)
