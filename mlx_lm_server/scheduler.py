@@ -513,7 +513,7 @@ class Scheduler:
                                 block.token_ids = bd['token_ids']
                                 block.ref_count = 0
                                 block.last_accessed = time.time()
-                                block.kv_data = bd['kv_data_per_layer']
+                                block.kv_data = list(bd['kv_data_per_layer'])
                                 self.kv_cache_manager.hash_table[bh] = block.block_id
                 except Exception as e:
                     logger.debug("Failed to decompose cache to blocks: %s", e)
@@ -707,6 +707,10 @@ class Scheduler:
                     seq.finish_reason = "error"
                     self._signal_finish(seq.request_id, finish_reason="error")
         self._cleanup_finished_batch()
+
+        # Clear stale cancelled IDs (they referred to now-dead sequences)
+        with self._cancelled_lock:
+            self._cancelled.clear()
 
         # Reset BatchGenerator
         try:

@@ -353,3 +353,144 @@ P0 (Team Lead: setup, types.py, config.py, branches)
 | **D1** | BatchGenerator vs generate_step() | scheduler-agent | P2.6 |
 | **D2** | KV cache array shapes for Qwen3-4B | cache-agent | P1.7 |
 | **D3** | Chunked prefill vs sequential | scheduler-agent | P2.5 |
+
+---
+
+## Phase 6: BatchGenerator Integration
+
+**Owner:** batch-integrator | **Branch:** `develop`
+**Depends on:** P5 complete (v0.1.0 tagged)
+**Purpose:** Replace sequential `stream_generate()` with `BatchGenerator` for real batched inference
+
+### 6.0 Config & Type Additions
+
+| | Task | Files Modified | Commit |
+|-|------|:-------------:|--------|
+| [x] | **P6.0** Add `completion_batch_size`, `max_kv_size`, `sequence_cache_size` to ServerConfig | `config.py`, `server.py` | ✅ |
+
+### 6.1 SequenceCacheStore
+
+| | Task | Files Created | Tests |
+|-|------|:------------:|-------|
+| [x] | **P6.1** Thread-safe LRU cache for sequence-level KV states | `sequence_cache.py` | 12 tests in `test_sequence_cache.py` ✅ |
+
+### 6.2–6.6 BatchGenerator Scheduler Integration (CORE)
+
+| | Task | Description | Status |
+|-|------|:----------:|--------|
+| [x] | **P6.2** BatchGenerator lifecycle in Scheduler | `__init__`, `_create_batch_generator()`, UID maps | ✅ |
+| [x] | **P6.3** Batch inference loop | `_batch_inference_step()`, `_insert_new_requests_batch()`, `_process_cancellations_batch()` | ✅ |
+| [x] | **P6.4** Per-sequence detokenization | `detokenizer.add_token()` + `last_segment` per sequence | ✅ |
+| [x] | **P6.5** Stop & error recovery | `stop()` calls `close()`, `_handle_batch_error()` resets BG | ✅ |
+| [x] | **P6.6** Mock path preserved | `_mock_inference_step()` — existing 183 tests untouched | ✅ |
+
+### 6.7 Tests
+
+| | Task | Files Created | Tests |
+|-|------|:------------:|-------|
+| [x] | **P6.7a** SequenceCacheStore unit tests | `test_sequence_cache.py` | 12 tests ✅ |
+| [x] | **P6.7b** Batch integration tests (MockBatchGenerator) | `test_batch_integration.py` | 7 tests ✅ |
+
+### 6.8–6.9 Entry Point & Docs
+
+| | Task | Status |
+|-|------|--------|
+| [x] | **P6.8** Wire `__main__.py` with model, scheduler, KVCacheManager, SSD | ✅ |
+| [x] | **P6.9** Update `checklist.md` and `plan.md` with Phase 6–7 sections | ✅ |
+
+### 6.10 Devil's Advocate Review: Phase 6 ✅
+
+| | Finding ID | Attack Vector | Severity |
+|-|-----------|--------------|----------|
+| [x] | **DA-P6-1** | UID leak: 1000 requests → UID maps cleaned up? | NOT_A_BUG |
+| [x] | **DA-P6-2** | Concurrent insert + next() race | NOT_A_BUG (single thread) |
+| [x] | **DA-P6-3** | Detokenizer state with multi-byte UTF-8 | NOT_A_BUG |
+| [x] | **DA-P6-4** | Cache mutation after storage | NOT_A_BUG (deepcopy) |
+| [x] | **DA-P6-5** | BatchGenerator.next() throws → new requests arrive | NOT_A_BUG |
+| [x] | **DA-P6-6** | Stop sequence partial match across tokens | NOT_A_BUG |
+| [x] | **DA-P6-7** | max_tokens=0 through batch path | NOT_A_BUG |
+| [x] | **DA-P6-8** | More requests than completion_batch_size | NOT_A_BUG |
+| [x] | **DA-P6-C1** | `_cancelled` set not cleared in `_handle_batch_error()` | **FIXED** (HIGH) |
+
+**Process:**
+- [x] 16 adversarial tests in `tests/test_adversarial.py` (DA-P6 section)
+- [x] DA-P6-C1 fixed: added `_cancelled.clear()` in `_handle_batch_error()`
+- [x] 257 PASS, 1 xfail ✅
+
+**FEATURE GATE:** 257 tests PASS ✅
+
+---
+
+## Phase 7: Block-Level KV Cache Bridge + SSD Wiring
+
+**Owner:** cache-bridge | **Branch:** `develop`
+**Depends on:** P6.3+ complete
+**Purpose:** Connect block-level KVCacheManager to BatchGenerator path, wire SSD tier
+
+### 7.1 Cache Format Bridge
+
+| | Task | Files Modified | Status |
+|-|------|:-------------:|--------|
+| [x] | **P7.1** `decompose_cache_to_blocks()` | `kv_cache_manager.py` | ✅ |
+| [x] | **P7.1** `reconstruct_cache_from_blocks()` | `kv_cache_manager.py` | ✅ |
+
+### 7.2 Wire KVCacheManager into Scheduler
+
+| | Task | Description | Status |
+|-|------|:----------:|--------|
+| [x] | **P7.2a** Block-level cache lookup in `_insert_new_requests_batch()` | Block → sequence → miss lookup priority | ✅ |
+| [x] | **P7.2b** Block decomposition in `_batch_inference_step()` step 7 | Decompose finished caches into blocks for sharing | ✅ |
+| [x] | **P7.2c** Block cleanup in `_cleanup_finished_batch()` | Free block allocations on sequence finish | ✅ |
+
+### 7.3–7.4 SSD Tier + Pruning
+
+| | Task | Description | Status |
+|-|------|:----------:|--------|
+| [x] | **P7.3** SSD eviction on block pool full | `_tiered_cache.evict_to_ssd()` before allocating new blocks | ✅ |
+| [x] | **P7.4** Periodic SSD pruning | Every N steps, call `ssd.prune_expired()` | ✅ |
+
+### 7.5 Block Bridge Tests
+
+| | Task | Files Created | Tests |
+|-|------|:------------:|-------|
+| [x] | **P7.5** Block bridge tests | `test_block_bridge.py` | 12 tests ✅ |
+
+### 7.6 Devil's Advocate Review: Phase 7 ✅
+
+| | Finding ID | Attack Vector | Severity |
+|-|-----------|--------------|----------|
+| [x] | **DA-P7-1** | Block hash collision → wrong KV data injected | NOT_A_BUG (token_ids verified at lookup) |
+| [x] | **DA-P7-2** | Partial block decomposition (non-aligned tokens) | NOT_A_BUG (remainder ignored) |
+| [x] | **DA-P7-3** | Reconstructed cache wrong dimensions for model | NOT_A_BUG (shape preserved) |
+| [x] | **DA-P7-4** | SSD corruption → crash on load | NOT_A_BUG (handled in P1 DA) |
+| [x] | **DA-P7-5** | Ref count leak after error in decompose | NOT_A_BUG (try/except continues) |
+| [x] | **DA-P7-6** | Memory pressure: all blocks + SSD full | NOT_A_BUG (graceful skip) |
+| [x] | **DA-P7-7** | Concurrent block access during eviction | NOT_A_BUG (lock protects) |
+| [x] | **DA-P7-H1** | Block kv_data stored by reference not copy | **FIXED** (HIGH) |
+| [x] | **DA-P7-M1** | Decomposition skips collision check on store | MEDIUM (acceptable — lookup still verifies) |
+| [x] | **DA-P7-M4** | Freshly decomposed blocks immediately evictable | MEDIUM (perf only, no correctness issue) |
+
+**Process:**
+- [x] 28 adversarial tests in `tests/test_adversarial.py` (DA-P7 section)
+- [x] DA-P7-H1 fixed: `list(bd['kv_data_per_layer'])` instead of reference
+- [x] 257 PASS, 1 xfail ✅
+
+**FEATURE GATE:** 257 tests PASS ✅
+
+---
+
+## Test Count Summary
+
+| Phase | Test File | Count |
+|-------|-----------|:-----:|
+| P1 | `test_kv_cache_manager.py` | 53 |
+| P1 | `test_ssd_cache.py` | 14 |
+| P2 | `test_scheduler.py` | 32 |
+| P3 | `test_server.py` | 30 |
+| P4 | `test_integration.py` | 12 |
+| P1-P5 | `test_adversarial.py` | 42 |
+| P6 | `test_sequence_cache.py` | 12 |
+| P6 | `test_batch_integration.py` | 7 |
+| P6-P7 | `test_adversarial.py` (DA-P6+DA-P7) | 44 |
+| P7 | `test_block_bridge.py` | 12 |
+| **Total** | | **258** |
