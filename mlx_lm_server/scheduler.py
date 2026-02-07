@@ -23,8 +23,7 @@ import queue
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
-
+from collections.abc import Callable
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import (
     InferenceRequest,
@@ -147,10 +146,9 @@ class Scheduler:
 
         # Mock generation callback for testing (when model is None).
         # Signature: (request_id, prompt_tokens, step) -> (token_id, token_text, finish_reason|None)
-        self._mock_generate: (
-            None
-            | callable  # noqa: E501
-        ) = None
+        self._mock_generate: Callable[
+            [str, list[int], int], tuple[int, str, str | None]
+        ] | None = None
 
     # --- Public API (called by server / tests) ---
 
@@ -478,7 +476,7 @@ class Scheduler:
 
         return events
 
-    def _generate_with_model(self, seq: SequenceState, step: int):
+    def _generate_with_model(self, seq: SequenceState, step: int) -> tuple[int, str, str | None]:
         """Generate a token using the real model (placeholder for Phase 3 integration)."""
         # This would use BatchGenerator. For now, a stub.
         raise NotImplementedError(

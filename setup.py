@@ -39,6 +39,7 @@ setup(
         "mlx_lm.tuner",
         "mlx_lm.tool_parsers",
         "mlx_lm.chat_templates",
+        "mlx_lm_server",
     ],
     python_requires=">=3.8",
     extras_require={
@@ -68,6 +69,7 @@ setup(
             "mlx_lm.server = mlx_lm.server:main",
             "mlx_lm.manage = mlx_lm.manage:main",
             "mlx_lm.upload = mlx_lm.upload:main",
+            "mlx_lm_server = mlx_lm_server.__main__:main",
         ]
     },
 )

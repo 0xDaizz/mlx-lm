@@ -8,16 +8,15 @@ from __future__ import annotations
 
 import asyncio
 import json
-import signal
 import time
 import uuid
 from contextlib import asynccontextmanager
-from queue import Empty, Queue
+from queue import Queue
 from typing import Any, AsyncIterator, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import InferenceRequest, TokenEvent
