@@ -265,7 +265,7 @@
 | [x] | **P5.3** `pytest tests/ -v --tb=short` → ALL PASS on develop | ✅ 165 pass |
 | [x] | **P5.4** **Final devil's advocate review** (cross-component, see below) | ✅ 19 tests, 0 CRITICAL/HIGH (commit 844fcda) |
 | [x] | **P5.5** Fix any final CRITICAL/HIGH findings | ✅ None found — all DA-F tests pass |
-| [ ] | **P5.6** Run benchmarks on develop |
+| [x] | **P5.6** Run benchmarks on develop | ✅ 50 req, 4 concurrent: 734 req/s, 7341 tok/s, TTFT p50=0.63ms |
 | [x] | **P5.7** Write `README.md` | ✅ commit 844fcda |
 | [x] | **P5.8** Add `pyproject.toml` CLI entry point | ✅ real Scheduler in __main__.py (commit 844fcda) |
 | [x] | **P5.9** Document JACCL setup | ✅ JACCL section in README (commit 844fcda) |
