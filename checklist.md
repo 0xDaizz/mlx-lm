@@ -86,21 +86,22 @@
 
 | | Finding ID | Attack Vector | Severity |
 |-|-----------|--------------|----------|
-| [ ] | **DA-P1-1** | Concurrent `free_blocks()` — race on ref_count | CRITICAL |
-| [ ] | **DA-P1-2** | Hash collision → wrong KV data served silently | CRITICAL |
-| [ ] | **DA-P1-3** | Sequence error mid-generation → blocks never freed | HIGH |
-| [ ] | **DA-P1-4** | Corrupted safetensors file on SSD → crash on load? | HIGH |
-| [ ] | **DA-P1-5** | All blocks allocated → new request → behavior? | HIGH |
-| [ ] | **DA-P1-6** | TTL boundary edge case (prune at TTL - 1 second) | MEDIUM |
-| [ ] | **DA-P1-7** | Crash between save_block and save_index → stale index | MEDIUM |
+| [x] | **DA-P1-1** | Concurrent `free_blocks()` — race on ref_count | NOT_A_BUG (Lock protects) |
+| [x] | **DA-P1-2** | Hash collision → wrong KV data served silently | NOT_A_BUG (token_ids verified) |
+| [x] | **DA-P1-3** | Sequence error mid-generation → blocks never freed | MEDIUM (design-level, scheduler cleans up) |
+| [x] | **DA-P1-4** | Corrupted safetensors file on SSD → crash on load? | **FIXED** (commit 3e2b354) |
+| [x] | **DA-P1-5** | All blocks allocated → new request → behavior? | **FIXED** rollback (commit 3e2b354) |
+| [x] | **DA-P1-6** | TTL boundary edge case (prune at TTL - 1 second) | NOT_A_BUG (strict < correct) |
+| [x] | **DA-P1-7** | Crash between save_block and save_index → stale index | MEDIUM (WONTFIX — orphan files harmless) |
+| [x] | **DA-P1-L1** | evict_lru log shows hash=None after return_block | **FIXED** (commit 3e2b354) |
 
 **Process:**
-- [ ] Subagent: write adversarial tests in `tests/test_adversarial.py` (DA-P1 section)
-- [ ] Run: `pytest tests/test_adversarial.py -v -k "da_p1"` → identify failures
-- [ ] File findings report (see CLAUDE.md for format)
-- [ ] cache-agent: fix CRITICAL + HIGH findings (via subagent)
-- [ ] Re-run: `pytest tests/ -v --tb=short` → ALL PASS (including adversarial)
-- [ ] → Notify Team Lead: "Phase 1 hardened, ready for merge"
+- [x] Subagent: write adversarial tests in `tests/test_adversarial.py` (DA-P1 section) — 19 tests
+- [x] Run: `pytest tests/test_adversarial.py -v -k "da_p1"` → ALL PASS
+- [x] File findings report
+- [x] cache-agent: fix CRITICAL + HIGH findings (ssd_cache.py, kv_cache_manager.py)
+- [x] Re-run: `pytest tests/ -v --tb=short` → 165 PASS
+- [x] → Phase 1 hardened ✅ (commit 3e2b354)
 
 ---
 
@@ -147,20 +148,21 @@
 
 | | Finding ID | Attack Vector | Severity |
 |-|-----------|--------------|----------|
-| [ ] | **DA-P2-1** | schedule_step() reentrancy — called before previous completes | CRITICAL |
-| [ ] | **DA-P2-2** | Deadlock: queue lock held + awaiting inference | CRITICAL |
-| [ ] | **DA-P2-3** | Long-running seq starves all new requests | HIGH |
-| [ ] | **DA-P2-4** | 100 queued requests → memory of tokenized waiting seqs | HIGH |
-| [ ] | **DA-P2-5** | Model exception mid-decode → scheduler state corrupt | HIGH |
-| [ ] | **DA-P2-6** | Client disconnects → orphaned stream queue → leak | MEDIUM |
-| [ ] | **DA-P2-7** | max_tokens=0, empty prompt, prompt > context window | MEDIUM |
+| [x] | **DA-P2-1** | schedule_step() reentrancy — called before previous completes | NOT_A_BUG (_active_lock protects) |
+| [x] | **DA-P2-2** | Deadlock: queue lock held + awaiting inference | NOT_A_BUG (no conflicting lock order) |
+| [x] | **DA-P2-3** | Long-running seq starves all new requests | NOT_A_BUG (correct behavior) |
+| [x] | **DA-P2-4** | 100 queued requests → memory of tokenized waiting seqs | NOT_A_BUG (max_queue_size enforced) |
+| [x] | **DA-P2-5** | Model exception mid-decode → scheduler state corrupt | **FIXED** (commit 3e2b354) |
+| [x] | **DA-P2-6** | Client disconnects → orphaned stream queue → leak | NOT_A_BUG (_emit_tokens cleans up) |
+| [x] | **DA-P2-7** | max_tokens=0, empty prompt, prompt > context window | NOT_A_BUG (handled correctly) |
 
 **Process:**
-- [ ] Subagent: write adversarial tests `tests/test_adversarial.py` (DA-P2 section)
-- [ ] Run, identify failures, file findings
-- [ ] scheduler-agent: fix CRITICAL + HIGH
-- [ ] Re-run: ALL PASS
-- [ ] → Notify Team Lead: "Phase 2 hardened, ready for merge"
+- [x] Subagent: write adversarial tests `tests/test_adversarial.py` (DA-P2 section) — 12 tests
+- [x] Run: `pytest tests/test_adversarial.py -v -k "da_p2"` → ALL PASS
+- [x] File findings report
+- [x] scheduler-agent: fix HIGH (inference loop exception handling in scheduler.py)
+- [x] Re-run: 165 PASS
+- [x] → Phase 2 hardened ✅ (commit 3e2b354)
 
 ---
 
@@ -205,17 +207,18 @@
 
 | | Finding ID | Attack Vector | Severity |
 |-|-----------|--------------|----------|
-| [ ] | **DA-P3-1** | Missing OpenAI response fields → client SDK crash | CRITICAL |
-| [ ] | **DA-P3-2** | Malformed JSON / missing `messages` / negative `max_tokens` | HIGH |
-| [ ] | **DA-P3-3** | SSE format errors (missing `data:` prefix, `[DONE]`) | HIGH |
-| [ ] | **DA-P3-4** | 50 simultaneous requests → hang or crash | HIGH |
-| [ ] | **DA-P3-5** | Request in-flight during shutdown → partial response | MEDIUM |
-| [ ] | **DA-P3-6** | Never-consumed streaming response → buffer growth | MEDIUM |
-| [ ] | **DA-P3-7** | 1M token prompt → OOM or timeout handling | MEDIUM |
+| [x] | **DA-P3-1** | Missing OpenAI response fields → client SDK crash | NOT_A_BUG (all fields present) |
+| [x] | **DA-P3-2** | Malformed JSON / missing `messages` / negative `max_tokens` | NOT_A_BUG (Pydantic validates) |
+| [x] | **DA-P3-3** | SSE format errors (missing `data:` prefix, `[DONE]`) | NOT_A_BUG (format correct) |
+| [x] | **DA-P3-4** | 50 simultaneous requests → hang or crash | NOT_A_BUG (all complete 200) |
+| [ ] | **DA-P3-5** | Request in-flight during shutdown → partial response | MEDIUM (deferred) |
+| [ ] | **DA-P3-6** | Never-consumed streaming response → buffer growth | MEDIUM (deferred) |
+| [ ] | **DA-P3-7** | 1M token prompt → OOM or timeout handling | MEDIUM (deferred) |
 
 **Process:**
-- [ ] Subagent: adversarial tests → findings → fixes → re-pass
-- [ ] → Notify Team Lead: "Phase 3 hardened, ready for merge"
+- [x] Subagent: adversarial tests — 12 tests for P3
+- [x] All CRITICAL/HIGH verified as NOT_A_BUG
+- [x] → Phase 3 hardened ✅ (commit 3e2b354)
 
 ---
 
@@ -228,25 +231,25 @@
 
 | | Task | Commit Message |
 |-|------|---------------|
-| [ ] | **P4.1** `conftest.py` (mock model, test config, temp dirs) | `[P4.1] test: shared fixtures` |
+| [x] | **P4.1** `conftest.py` (mock model, test config, temp dirs) | ✅ commit 75ab855 |
 
 ### 4.2 Integration Tests
 
 | | Task | Test Name | Commit Message |
 |-|------|-----------|---------------|
-| [ ] | **P4.2** E2E basic | `test_e2e_basic` | `[P4.2] test(e2e): basic` |
-| [ ] | **P4.3** E2E prefix cache | `test_e2e_prefix` | `[P4.3] test(e2e): prefix` |
-| [ ] | **P4.4** E2E SSD tier | `test_e2e_ssd` | `[P4.4] test(e2e): SSD` |
-| [ ] | **P4.5** E2E concurrent | `test_e2e_concurrent` | `[P4.5] test(e2e): concurrent` |
+| [x] | **P4.2** E2E basic (3 tests) | `test_e2e_basic`, `test_e2e_basic_max_tokens`, `test_e2e_basic_streaming` | ✅ commit 75ab855 |
+| [x] | **P4.3** E2E prefix cache (3 tests) | `test_e2e_prefix_cache_hit`, `test_e2e_prefix_no_shared`, `test_e2e_prefix_with_scheduler` | ✅ commit 75ab855 |
+| [x] | **P4.4** E2E SSD tier (3 tests) | `test_e2e_ssd_full_flow`, `test_e2e_ssd_miss`, `test_e2e_ssd_evict_without_kv_data` | ✅ commit 75ab855 |
+| [x] | **P4.5** E2E concurrent (3 tests) | `test_e2e_concurrent_4`, `test_e2e_concurrent_varied_lengths`, `test_e2e_concurrent_with_threads` | ✅ commit 75ab855 |
 
 ### 4.3 Benchmarks
 
 | | Task | Commit Message |
 |-|------|---------------|
-| [ ] | **P4.6** `scripts/benchmark.py` | `[P4.6] feat(bench): benchmark script` |
-| [ ] | **P4.7** Run benchmarks, `BENCHMARKS.md` | `[P4.7] docs: benchmark results` |
+| [x] | **P4.6** `scripts/benchmark.py` | ✅ commit 75ab855 |
+| [ ] | **P4.7** Run benchmarks, `BENCHMARKS.md` | *(deferred — needs running server)* |
 
-**FEATURE GATE:** `pytest tests/ -v --tb=short` → ALL PASS
+**FEATURE GATE:** `pytest tests/ -v --tb=short` → 165 PASS ✅
 
 ---
 
