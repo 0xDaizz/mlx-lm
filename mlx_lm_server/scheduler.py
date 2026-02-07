@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from typing import Any
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import (
     InferenceRequest,
@@ -587,6 +588,23 @@ class Scheduler:
     def num_queued_requests(self) -> int:
         """Number of requests waiting in the queue."""
         return self.request_queue.size
+
+    def get_cache_stats(self) -> dict[str, Any]:
+        """Return cache statistics for the /health endpoint."""
+        stats: dict[str, Any] = {
+            "active_sequences": self.num_active_sequences,
+            "queued_requests": self.num_queued_requests,
+        }
+        if self.kv_cache_manager is not None:
+            stats["total_blocks"] = self.kv_cache_manager.pool.num_blocks
+            stats["used_blocks"] = self.kv_cache_manager.num_used_blocks
+            stats["free_blocks"] = self.kv_cache_manager.num_free_blocks
+            stats["cached_blocks"] = self.kv_cache_manager.num_cached_blocks
+        return stats
+
+    def shutdown(self) -> None:
+        """Graceful shutdown — stops the inference loop."""
+        self.stop()
 
     @property
     def is_running(self) -> bool:

@@ -16,11 +16,11 @@ def main() -> None:
 
     model, tokenizer = load(config.model, adapter_path=config.adapter_path)
 
-    # --- Create a real scheduler (placeholder until Phase 2 is done) ---
-    # For now, we use a stub that can be replaced once scheduler-agent delivers.
-    from mlx_lm_server._stub_scheduler import StubScheduler
+    # --- Create scheduler ---
+    from mlx_lm_server.scheduler import Scheduler
 
-    scheduler = StubScheduler(model=model, tokenizer=tokenizer, config=config)
+    scheduler = Scheduler(config=config, model=model, tokenizer=tokenizer)
+    scheduler.run_inference_loop()
 
     # --- Build and run ---
     app = create_app(config=config, scheduler=scheduler, tokenizer=tokenizer)

@@ -1,283 +1,240 @@
-## MLX LM 
+# mlx-lm-server
 
-MLX LM is a Python package for generating text and fine-tuning large language
-models on Apple silicon with MLX.
+Production-grade LLM serving for Apple Silicon, built on [mlx-lm](https://github.com/ml-explore/mlx-lm).
 
-Some key features include:
+## Overview
 
-* Integration with the Hugging Face Hub to easily use thousands of LLMs with a
-  single command. 
-* Support for quantizing and uploading models to the Hugging Face Hub.
-* [Low-rank and full model
-  fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
-  with support for quantized models.
-* Distributed inference and fine-tuning with `mx.distributed`
+mlx-lm-server is a fork of Apple's mlx-lm that adds vLLM-level serving capabilities to the MLX ecosystem. It provides continuous batching, hash-based automatic prefix caching, a tiered KV cache (RAM + SSD), and an OpenAI-compatible API -- all optimized for Apple Silicon.
 
-The easiest way to get started is to install the `mlx-lm` package:
+The serving layer lives in a cleanly separable `mlx_lm_server/` package. The original mlx-lm code is untouched.
 
-**With `pip`**:
+## Features
 
-```sh
-pip install mlx-lm
-```
+- **Continuous Batching** -- Iteration-level scheduling; finished requests are replaced immediately without waiting for the full batch to complete.
+- **Hash-based Automatic Prefix Caching** -- KV cache blocks are identified by `hash(prefix_tokens + block_tokens)`. Matching prefixes are reused across requests automatically.
+- **Tiered KV Cache (RAM + SSD)** -- Evicted blocks are persisted to SSD as safetensors files. SSD reads (~7.4 GB/s on M3 Ultra) are far faster than re-computing prefill.
+- **INT8 KV Cache Quantization** -- ~50% memory savings with negligible quality loss. Default: `--kv-bits 8 --kv-group-size 64`.
+- **OpenAI-compatible API** -- Drop-in replacement for OpenAI endpoints. Supports `/v1/chat/completions`, `/v1/completions`, and streaming via SSE.
+- **Tensor-Parallel Ready** -- Architecture supports distributed inference across multiple Mac nodes via JACCL RDMA over Thunderbolt 5 (Phase 6, not yet implemented).
 
-**With `conda`**:
+## Quick Start
 
-```sh
-conda install -c conda-forge mlx-lm
-```
-
-### Quick Start
-
-To generate text with an LLM use:
+### Install
 
 ```bash
-mlx_lm.generate --prompt "How tall is Mt Everest?"
+git clone https://github.com/<your-username>/mlx-lm.git mlx-lm-server
+cd mlx-lm-server
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+pip install fastapi uvicorn
 ```
 
-To chat with an LLM use:
+### Run the Server
 
 ```bash
-mlx_lm.chat
+python -m mlx_lm_server --model mlx-community/Qwen3-4B-4bit --port 8000
 ```
 
-This will give you a chat REPL that you can use to interact with the LLM. The
-chat context is preserved during the lifetime of the REPL.
-
-Commands in `mlx-lm` typically take command line options which let you specify
-the model, sampling parameters, and more. Use `-h` to see a list of available
-options for a command, e.g.:
+### Make a Request
 
 ```bash
-mlx_lm.generate -h
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-4B-4bit",
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "max_tokens": 128
+  }'
 ```
 
-The default model for generation and chat is
-`mlx-community/Llama-3.2-3B-Instruct-4bit`.  You can specify any MLX-compatible
-model with the `--model` flag. Thousands are available in the
-[MLX Community](https://huggingface.co/mlx-community) Hugging Face
-organization.
-
-### Python API
-
-You can use `mlx-lm` as a module:
-
-```python
-from mlx_lm import load, generate
-
-model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
-
-prompt = "Write a story about Einstein"
-
-messages = [{"role": "user", "content": prompt}]
-prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True,
-)
-
-text = generate(model, tokenizer, prompt=prompt, verbose=True)
-```
-
-To see a description of all the arguments you can do:
-
-```
->>> help(generate)
-```
-
-Check out the [generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
-to see how to use the API in more detail. Check out the [batch generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
-to see how to efficiently generate continuations for a batch of prompts.
-
-The `mlx-lm` package also comes with functionality to quantize and optionally
-upload models to the Hugging Face Hub.
-
-You can convert models using the Python API:
-
-```python
-from mlx_lm import convert
-
-repo = "mistralai/Mistral-7B-Instruct-v0.3"
-upload_repo = "mlx-community/My-Mistral-7B-Instruct-v0.3-4bit"
-
-convert(repo, quantize=True, upload_repo=upload_repo)
-```
-
-This will generate a 4-bit quantized Mistral 7B and upload it to the repo
-`mlx-community/My-Mistral-7B-Instruct-v0.3-4bit`. It will also save the
-converted model in the path `mlx_model` by default.
-
-To see a description of all the arguments you can do:
-
-```
->>> help(convert)
-```
-
-#### Streaming
-
-For streaming generation, use the `stream_generate` function. This yields
-a generation response object.
-
-For example,
-
-```python
-from mlx_lm import load, stream_generate
-
-repo = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
-model, tokenizer = load(repo)
-
-prompt = "Write a story about Einstein"
-
-messages = [{"role": "user", "content": prompt}]
-prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True,
-)
-
-for response in stream_generate(model, tokenizer, prompt, max_tokens=512):
-    print(response.text, end="", flush=True)
-print()
-```
-
-#### Sampling
-
-The `generate` and `stream_generate` functions accept `sampler` and
-`logits_processors` keyword arguments. A sampler is any callable which accepts
-a possibly batched logits array and returns an array of sampled tokens.  The
-`logits_processors` must be a list of callables which take the token history
-and current logits as input and return the processed logits. The logits
-processors are applied in order.
-
-Some standard sampling functions and logits processors are provided in
-`mlx_lm.sample_utils`.
-
-### Command Line
-
-You can also use `mlx-lm` from the command line with:
-
-```
-mlx_lm.generate --model mistralai/Mistral-7B-Instruct-v0.3 --prompt "hello"
-```
-
-This will download a Mistral 7B model from the Hugging Face Hub and generate
-text using the given prompt.
-
-For a full list of options run:
-
-```
-mlx_lm.generate --help
-```
-
-To quantize a model from the command line run:
-
-```
-mlx_lm.convert --model mistralai/Mistral-7B-Instruct-v0.3 -q
-```
-
-For more options run:
-
-```
-mlx_lm.convert --help
-```
-
-You can upload new models to Hugging Face by specifying `--upload-repo` to
-`convert`. For example, to upload a quantized Mistral-7B model to the
-[MLX Hugging Face community](https://huggingface.co/mlx-community) you can do:
-
-```
-mlx_lm.convert \
-    --model mistralai/Mistral-7B-Instruct-v0.3 \
-    -q \
-    --upload-repo mlx-community/my-4bit-mistral
-```
-
-Models can also be converted and quantized directly in the
-[mlx-my-repo](https://huggingface.co/spaces/mlx-community/mlx-my-repo) Hugging
-Face Space.
-
-### Long Prompts and Generations 
-
-`mlx-lm` has some tools to scale efficiently to long prompts and generations:
-
-- A rotating fixed-size key-value cache.
-- Prompt caching
-
-To use the rotating key-value cache pass the argument `--max-kv-size n` where
-`n` can be any integer. Smaller values like `512` will use very little RAM but
-result in worse quality. Larger values like `4096` or higher will use more RAM
-but have better quality.
-
-Caching prompts can substantially speedup reusing the same long context with
-different queries. To cache a prompt use `mlx_lm.cache_prompt`. For example:
+### Streaming
 
 ```bash
-cat prompt.txt | mlx_lm.cache_prompt \
-  --model mistralai/Mistral-7B-Instruct-v0.3 \
-  --prompt - \
-  --prompt-cache-file mistral_prompt.safetensors
-``` 
-
-Then use the cached prompt with `mlx_lm.generate`:
-
-```
-mlx_lm.generate \
-    --prompt-cache-file mistral_prompt.safetensors \
-    --prompt "\nSummarize the above text."
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-community/Qwen3-4B-4bit",
+    "messages": [{"role": "user", "content": "Tell me a joke"}],
+    "max_tokens": 256,
+    "stream": true
+  }'
 ```
 
-The cached prompt is treated as a prefix to the supplied prompt. Also notice
-when using a cached prompt, the model to use is read from the cache and need
-not be supplied explicitly.
+## CLI Usage
 
-Prompt caching can also be used in the Python API in order to avoid
-recomputing the prompt. This is useful in multi-turn dialogues or across
-requests that use the same context. See the
-[example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
-for more usage details.
-
-### Supported Models
-
-`mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
-model you want to run is not supported, file an
-[issue](https://github.com/ml-explore/mlx-lm/issues/new) or better yet, submit
-a pull request. Many supported models are available in various quantization
-formats in the [MLX Community](https://huggingface.co/mlx-community) Hugging
-Face organization.
-
-For some models the tokenizer may require you to enable the `trust_remote_code`
-option. You can do this by passing `--trust-remote-code` in the command line.
-If you don't specify the flag explicitly, you will be prompted to trust remote
-code in the terminal when running the model. 
-
-Tokenizer options can also be set in the Python API. For example:
-
-```python
-model, tokenizer = load(
-    "qwen/Qwen-7B",
-    tokenizer_config={"eos_token": "<|endoftext|>", "trust_remote_code": True},
-)
+```
+python -m mlx_lm_server [OPTIONS]
 ```
 
-### Large Models
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | `mlx-community/Qwen3-4B-4bit` | HuggingFace model ID or local path |
+| `--adapter-path` | `None` | Path to LoRA adapter weights |
+| `--host` | `0.0.0.0` | Bind address |
+| `--port` | `8000` | Bind port |
+| `--block-size` | `16` | Tokens per KV cache block |
+| `--num-blocks` | `2048` | Total blocks in the KV cache pool |
+| `--kv-bits` | `8` | KV cache quantization bits (8 = INT8) |
+| `--kv-group-size` | `64` | Elements per quantization scale factor |
+| `--ssd-cache-dir` | `~/.cache/mlx-lm-server/kv-cache` | SSD cache directory |
+| `--ssd-ttl-days` | `7` | Days before unused SSD blocks are pruned |
+| `--no-ssd` | `false` | Disable SSD cache tier |
+| `--max-batch-size` | `8` | Max concurrent decode sequences |
+| `--prefill-batch-size` | `4` | Max concurrent prefill sequences |
+| `--max-queue-size` | `128` | Max pending requests in queue |
+| `--default-max-tokens` | `512` | Default max tokens if not specified in request |
 
-> [!NOTE]
-    This requires macOS 15.0 or higher to work.
+## API Endpoints
 
-Models which are large relative to the total RAM available on the machine can
-be slow. `mlx-lm` will attempt to make them faster by wiring the memory
-occupied by the model and cache. This requires macOS 15 or higher to
-work.
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/v1/chat/completions` | Chat completion (OpenAI-compatible). Supports streaming via `"stream": true`. |
+| `POST` | `/v1/completions` | Text completion (OpenAI-compatible). Supports streaming via `"stream": true`. |
+| `GET` | `/v1/models` | List available models. |
+| `GET` | `/health` | Health check with cache statistics. |
 
-If you see the following warning message:
+All endpoints return OpenAI-compatible JSON. Errors follow the OpenAI error format:
 
-> [WARNING] Generating with a model that requires ...
+```json
+{
+  "error": {
+    "message": "...",
+    "type": "invalid_request_error",
+    "code": "400"
+  }
+}
+```
 
-then the model will likely be slow on the given machine. If the model fits in
-RAM then it can often be sped up by increasing the system wired memory limit.
-To increase the limit, set the following `sysctl`:
+## Architecture
+
+```
++---------------------------------------------------+
+|            FastAPI Server (OpenAI API)             |
+|         /v1/chat/completions, /v1/completions      |
++---------------------------------------------------+
+|                  Scheduler                         |
+|    Continuous Batching + Request Queue Manager     |
++---------------------------------------------------+
+|          KV Cache Manager (Hash-based)             |
+|   Automatic Prefix Caching (vLLM-style)            |
+|   Block Pool + LRU Eviction + SSD Tier             |
++---------------------------------------------------+
+|              mlx-lm Engine                         |
+|   BatchGenerator + KV Cache (INT8 quantized)       |
+|   mx.distributed (JACCL RDMA tensor parallel)      |
++---------------------------------------------------+
+|           MLX / Metal (Apple Silicon)              |
++---------------------------------------------------+
+```
+
+### How Prefix Caching Works
+
+1. Each KV cache block holds a fixed number of tokens (default: 16).
+2. A block's identity is `hash(all_preceding_tokens + block_tokens)`.
+3. When a new request arrives, the scheduler walks the prompt token-by-token in block-sized chunks, checking the hash table for hits.
+4. Cached blocks are reused (ref_count incremented); only uncached suffix tokens need prefill.
+5. When memory pressure occurs, LRU eviction frees blocks with `ref_count == 0`. If SSD is enabled, evicted blocks are persisted to disk first.
+
+## Configuration
+
+Key configuration options in `ServerConfig`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `block_size` | `16` | Tokens per KV block. Larger blocks = fewer hash lookups, coarser caching. |
+| `num_blocks` | `2048` | Total pool size. Memory usage = `num_blocks * block_size * kv_size_per_token`. |
+| `kv_bits` | `8` | Quantization precision. 8 = INT8 (~50% memory savings). |
+| `kv_group_size` | `64` | Elements per quantization scale. Lower = more precise, slightly more memory. |
+| `ssd_ttl_days` | `7` | SSD blocks unused for this many days are auto-pruned. |
+| `max_batch_size` | `8` | Maximum concurrent decode sequences in a batch. |
+| `prefill_batch_size` | `4` | Maximum sequences being prefilled concurrently. |
+| `max_queue_size` | `128` | Requests beyond this limit are rejected with an error. |
+
+## Development
+
+### Project Structure
+
+```
+mlx_lm_server/          # Serving layer (new code)
+  __init__.py
+  types.py               # Shared data types
+  config.py              # ServerConfig dataclass
+  kv_cache_manager.py    # Hash-based block manager + prefix caching
+  ssd_cache.py           # SSD tier (safetensors persistence)
+  scheduler.py           # Continuous batching scheduler
+  server.py              # FastAPI server + OpenAI API
+  __main__.py            # Entry point
+mlx_lm/                  # Original mlx-lm (unmodified)
+tests/
+  test_kv_cache_manager.py
+  test_ssd_cache.py
+  test_scheduler.py
+  test_server.py
+  test_integration.py
+  test_adversarial.py
+scripts/
+  benchmark.py
+```
+
+### Running Tests
 
 ```bash
-sudo sysctl iogpu.wired_limit_mb=N
+# Full test suite
+pytest tests/ -v --tb=short
+
+# Individual component
+pytest tests/test_kv_cache_manager.py -v
+pytest tests/test_scheduler.py -v
+pytest tests/test_server.py -v
+
+# Integration tests
+pytest tests/test_integration.py -v
 ```
 
-The value `N` should be larger than the size of the model in megabytes but
-smaller than the memory size of the machine.
+### Target Hardware
+
+- **Development:** MacBook with Apple Silicon (M-series)
+- **Production:** Mac Studio M3 Ultra 512GB (single or multi-node)
+
+## Distributed Inference (JACCL)
+
+> **Status: Phase 6 -- not yet implemented.** The architecture supports it; the code paths are ready to be wired up.
+
+### What is JACCL?
+
+JACCL is Apple's distributed machine learning backend for MLX. It provides RDMA (Remote Direct Memory Access) communication over Thunderbolt 5, enabling tensor-parallel inference across multiple Mac nodes with minimal latency.
+
+### Hardware Requirements
+
+- 2+ Mac Studio with M3 Ultra (or similar Apple Silicon with high unified memory)
+- Thunderbolt 5 direct connection between nodes (for RDMA)
+- Sufficient unified memory across nodes for the target model (e.g., 2x 512GB for Kimi K2.5 4-bit at ~120GB)
+
+### How It Works
+
+Tensor parallelism splits model weights across nodes. Each node computes its shard of every layer, then nodes exchange intermediate results via RDMA:
+
+- **Rank 0** runs the full serving stack (FastAPI, scheduler, KV cache manager).
+- **All ranks** participate in the model forward pass via `mx.distributed`.
+- The server starts within an `mlx.launch` distributed context, so the serving layer is transparent to the distributed engine.
+
+### Future Usage (when implemented)
+
+```bash
+# Launch across 2 nodes
+mlx.launch --n 2 python -m mlx_lm_server \
+  --model kimi-k2.5-4bit \
+  --port 8000
+```
+
+Only rank 0 exposes the HTTP server. Inference requests are automatically distributed.
+
+## Acknowledgments
+
+- [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple -- the foundation this project builds on.
+- [vLLM](https://github.com/vllm-project/vllm) -- inspiration for prefix caching, continuous batching, and paged KV cache design.
+- [MLX](https://github.com/ml-explore/mlx) -- Apple's machine learning framework for Apple Silicon.
+
+## License
+
+MIT -- see the upstream [mlx-lm license](https://github.com/ml-explore/mlx-lm/blob/main/LICENSE).
