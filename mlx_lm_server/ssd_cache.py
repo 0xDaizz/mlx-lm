@@ -89,7 +89,20 @@ class SSDCache:
             self.save_index()
             return None
 
-        arrays = mx.load(str(filepath))
+        try:
+            arrays = mx.load(str(filepath))
+        except Exception as e:
+            # Corrupted, truncated, or unreadable file — remove stale entry
+            logger.warning(
+                "Failed to load block %d from %s: %s. Removing stale index entry.",
+                block_hash,
+                filepath,
+                e,
+            )
+            del self.index[block_hash]
+            self.save_index()
+            return None
+
         # mx.load returns a dict-like object; ensure we have standard dict
         kv_data = dict(arrays)
 

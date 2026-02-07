@@ -253,35 +253,50 @@ class Scheduler:
         """Main inference loop: schedule -> prefill -> decode -> emit tokens."""
         logger.info("Inference loop started")
         while self._running:
-            # Wait for new requests if nothing is active
-            with self._active_lock:
-                has_active = len(self._active_sequences) > 0
-            if not has_active and self.request_queue.size == 0:
-                self._new_request_event.wait(timeout=0.1)
-                self._new_request_event.clear()
-                if not self._running:
-                    break
-                continue
+            try:
+                # Wait for new requests if nothing is active
+                with self._active_lock:
+                    has_active = len(self._active_sequences) > 0
+                if not has_active and self.request_queue.size == 0:
+                    self._new_request_event.wait(timeout=0.1)
+                    self._new_request_event.clear()
+                    if not self._running:
+                        break
+                    continue
 
-            # Run one schedule step
-            outputs = self.schedule_step()
+                # Run one schedule step
+                outputs = self.schedule_step()
 
-            # Run prefill for new sequences
-            if outputs.prefill_sequences:
-                self._run_prefill(outputs.prefill_sequences)
+                # Run prefill for new sequences
+                if outputs.prefill_sequences:
+                    self._run_prefill(outputs.prefill_sequences)
 
-            # Run one decode step for active sequences
-            with self._active_lock:
-                decode_seqs = [
-                    s for s in self._active_sequences.values()
-                    if not s.is_finished
-                ]
-            if decode_seqs:
-                token_events = self._run_decode_step(decode_seqs)
-                self._emit_tokens(token_events)
+                # Run one decode step for active sequences
+                with self._active_lock:
+                    decode_seqs = [
+                        s for s in self._active_sequences.values()
+                        if not s.is_finished
+                    ]
+                if decode_seqs:
+                    token_events = self._run_decode_step(decode_seqs)
+                    self._emit_tokens(token_events)
 
-            # Clean up finished sequences
-            self._cleanup_finished()
+                # Clean up finished sequences
+                self._cleanup_finished()
+
+            except Exception as e:
+                logger.error(
+                    "Exception in inference loop iteration: %s", e, exc_info=True
+                )
+                # Mark all active sequences as failed to prevent infinite loops
+                # on persistent errors. The loop continues to serve new requests.
+                with self._active_lock:
+                    for seq in self._active_sequences.values():
+                        if not seq.is_finished:
+                            seq.is_finished = True
+                            seq.finish_reason = "error"
+                            self._signal_finish(seq.request_id, finish_reason="error")
+                self._cleanup_finished()
 
         logger.info("Inference loop stopped")
 

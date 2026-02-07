@@ -219,6 +219,9 @@ class KVCacheManager:
         num_tokens = len(token_ids)
         num_full_blocks = num_tokens // self.block_size
         allocated_block_ids: list[int] = []
+        # Track which blocks were freshly allocated (vs cache hits)
+        # so we can properly rollback on failure
+        freshly_allocated: list[int] = []
 
         with self.lock:
             for i in range(num_existing_blocks, num_full_blocks):
@@ -262,10 +265,20 @@ class KVCacheManager:
                     # same lock)
                     evicted = self._evict_lru_locked(num_blocks=1)
                     if not evicted:
-                        # Roll back allocations made in this call
+                        # Roll back allocations made in this call:
+                        # - For cache hits: just decrement ref_count
+                        # - For freshly allocated: remove from hash_table
+                        #   and return to free pool
                         for bid in allocated_block_ids:
                             b = self.pool.blocks[bid]
-                            b.ref_count -= 1
+                            if bid in freshly_allocated:
+                                # Fully undo the fresh allocation
+                                if b.block_hash is not None and b.block_hash in self.hash_table:
+                                    del self.hash_table[b.block_hash]
+                                self.pool.return_block(bid)
+                            else:
+                                # Cache hit — just decrement ref_count
+                                b.ref_count -= 1
                         raise BlockPoolExhaustedError(
                             "Block pool exhausted and no blocks eligible for eviction"
                         )
@@ -277,6 +290,7 @@ class KVCacheManager:
                 block.last_accessed = time.time()
                 self.hash_table[block_hash] = block.block_id
                 allocated_block_ids.append(block.block_id)
+                freshly_allocated.append(block.block_id)
                 logger.debug(
                     "Allocated new block %d (hash=%d)",
                     block.block_id,
@@ -349,13 +363,15 @@ class KVCacheManager:
 
         evicted_ids: list[int] = []
         for block in candidates[:num_blocks]:
+            # Save hash before return_block clears it
+            saved_hash = block.block_hash
             # Remove from hash table
-            if block.block_hash is not None and block.block_hash in self.hash_table:
-                del self.hash_table[block.block_hash]
+            if saved_hash is not None and saved_hash in self.hash_table:
+                del self.hash_table[saved_hash]
             # Return to free pool (clears block metadata)
             self.pool.return_block(block.block_id)
             evicted_ids.append(block.block_id)
-            logger.debug("Evicted block %d (hash=%d)", block.block_id, block.block_hash)
+            logger.debug("Evicted block %d (hash=%s)", block.block_id, saved_hash)
 
         return evicted_ids
 
