@@ -1228,11 +1228,14 @@ class TestF08_DeadlockTwoPhaseEviction:
 
         # Create a mock SSD cache that accepts save_block calls
         class _MockSSD:
-            def save_block(self, block_hash, kv_data):
+            def save_block(self, block_hash, kv_data, num_tokens=None):
                 pass
 
             def load_block(self, block_hash):
                 return None
+
+            def has_block(self, block_hash):
+                return False
 
         tiered = TieredKVCache(ram=mgr, ssd=_MockSSD())
 
@@ -1284,11 +1287,14 @@ class TestF08_DeadlockTwoPhaseEviction:
         ssd_saved = {}
 
         class _RecordingSSD:
-            def save_block(self, block_hash, kv_data):
+            def save_block(self, block_hash, kv_data, num_tokens=None):
                 ssd_saved[block_hash] = kv_data
 
             def load_block(self, block_hash):
                 return ssd_saved.get(block_hash)
+
+            def has_block(self, block_hash):
+                return block_hash in ssd_saved
 
         tiered = TieredKVCache(ram=mgr, ssd=_RecordingSSD())
 

@@ -28,6 +28,12 @@ class ServerConfig:
     ssd_cache_dir: Path = field(default_factory=lambda: Path.home() / ".cache" / "mlx-lm-server" / "kv-cache")
     ssd_ttl_days: int = 7  # Days before SSD blocks are pruned
     ssd_enabled: bool = True
+    ssd_policy: str = "evict_only"  # "evict_only" | "write_through"
+    ssd_durability: str = "best_effort"  # "best_effort" | "persistent"
+    ssd_async_writes: bool = True
+    ssd_writer_queue_size: int = 512
+    ssd_flush_interval_s: float = 1.0
+    ssd_persistent_max_retries: int = 3
 
     # Scheduler
     max_batch_size: int = 8  # Max concurrent decode sequences

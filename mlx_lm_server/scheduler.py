@@ -180,10 +180,13 @@ class Scheduler:
 
         # Tiered cache (RAM + SSD) — injected via constructor or tests
         self._tiered_cache: Any = tiered_cache
+        self._ssd_writer = None  # Set externally when write-through is enabled
 
         # SSD pruning counter (prune every N inference steps)
         self._ssd_prune_interval: int = 1000
         self._ssd_prune_counter: int = 0
+        self._ssd_last_prune_time: float = time.time()
+        self._ssd_prune_time_interval: float = 3600.0  # Prune at most every 1 hour
 
         # Track UIDs inserted without cache for early prefill save (G2)
         # After the first decode step, prefill KV data may be available in
@@ -206,6 +209,26 @@ class Scheduler:
             "total_requests": 0,
         }
         self._stats_lock = threading.Lock()
+
+        # Shutdown health fields
+        self._shutdown_clean: bool = True
+        self._shutdown_partial_flush: bool = False
+
+        # Crash recovery: validate SSD index on startup
+        if (self._tiered_cache is not None
+            and hasattr(self._tiered_cache, 'ssd')
+            and self._tiered_cache.ssd is not None
+            and hasattr(self._tiered_cache.ssd, 'validate_index')):
+            try:
+                validation = self._tiered_cache.ssd.validate_index()
+                if validation.get("orphans_cleaned", 0) > 0 or validation.get("missing_cleaned", 0) > 0:
+                    logger.info(
+                        "SSD cache validation: %d orphans cleaned, %d missing entries removed",
+                        validation.get("orphans_cleaned", 0),
+                        validation.get("missing_cleaned", 0),
+                    )
+            except Exception as e:
+                logger.warning("SSD cache validation failed on startup: %s", e)
 
         # Initialize BatchGenerator if model is available
         if self.model is not None and BatchGenerator is not None:
@@ -360,9 +383,9 @@ class Scheduler:
             self._inference_thread.start()
 
     def stop(self) -> None:
-        """Stop the inference loop."""
+        """Stop the inference loop and gracefully shut down all subsystems."""
         self._running = False
-        self._new_request_event.set()  # Wake up the loop
+        self._new_request_event.set()
         if self._inference_thread is not None:
             self._inference_thread.join(timeout=5.0)
             if self._inference_thread.is_alive():
@@ -371,16 +394,32 @@ class Scheduler:
                 )
             else:
                 self._inference_thread = None
+
+        # Stop async writer thread (must happen BEFORE ssd.flush)
+        if self._ssd_writer is not None:
+            writer_ok = self._ssd_writer.stop(drain_timeout=5.0)
+            if not writer_ok:
+                self._shutdown_clean = False
+                logger.critical(
+                    "SSD writer did not stop cleanly. Partial durability state."
+                )
+
         if self._batch_generator is not None:
             try:
                 self._batch_generator.close()
             except Exception:
                 pass
 
-        # Flush SSD cache index so dirty metadata (last_accessed) is persisted
+        # Flush SSD cache index
         if self._tiered_cache and hasattr(self._tiered_cache, 'ssd') and self._tiered_cache.ssd is not None:
             try:
                 self._tiered_cache.ssd.flush()
+                if not self._shutdown_clean:
+                    self._shutdown_partial_flush = True
+                    logger.error(
+                        "Partial SSD flush after incomplete writer shutdown. "
+                        "validate_index() will reconcile on next startup."
+                    )
             except Exception:
                 logger.warning("Failed to flush SSD cache index on shutdown")
 
@@ -615,10 +654,16 @@ class Scheduler:
                     logger.debug("Failed to decompose cache to blocks: %s", e)
 
     def _prune_ssd_if_needed(self) -> None:
-        """Periodically prune expired SSD cache blocks."""
+        """Periodically prune expired SSD cache blocks (step-based or time-based)."""
         self._ssd_prune_counter += 1
-        if self._ssd_prune_counter >= self._ssd_prune_interval:
+        now = time.time()
+        should_prune = (
+            self._ssd_prune_counter >= self._ssd_prune_interval
+            or (now - self._ssd_last_prune_time) >= self._ssd_prune_time_interval
+        )
+        if should_prune:
             self._ssd_prune_counter = 0
+            self._ssd_last_prune_time = now
             if self._tiered_cache is not None and self._tiered_cache.ssd is not None:
                 try:
                     pruned = self._tiered_cache.ssd.prune_expired()
@@ -1302,12 +1347,32 @@ class Scheduler:
             hits = self._stats["cache_hits_block"] + self._stats["cache_hits_sequence"]
             cached = self._stats["total_cached_tokens"]
             prefill = self._stats["total_prefill_tokens"]
+
+        # Merge KV cache manager stats (kv_ prefix)
+        if self.kv_cache_manager is not None and hasattr(self.kv_cache_manager, 'get_stats'):
+            stats.update(self.kv_cache_manager.get_stats())
+
+        # Merge SSD cache stats (ssd_ prefix)
+        if (self._tiered_cache is not None
+                and hasattr(self._tiered_cache, 'ssd')
+                and self._tiered_cache.ssd is not None
+                and hasattr(self._tiered_cache.ssd, 'get_stats')):
+            stats.update(self._tiered_cache.ssd.get_stats())
+
+        # Merge async writer stats (writer_ prefix)
+        if (self._tiered_cache is not None
+                and hasattr(self._tiered_cache, 'get_writer_stats')):
+            stats.update(self._tiered_cache.get_writer_stats())
+
         stats["cache_hit_rate"] = (
             hits / total_lookups if total_lookups > 0 else 0.0
         )
         stats["cache_effectiveness"] = (
             cached / (cached + prefill) if (cached + prefill) > 0 else 0.0
         )
+        # Shutdown health fields
+        stats["shutdown_clean"] = self._shutdown_clean
+        stats["shutdown_partial_flush"] = self._shutdown_partial_flush
         return stats
 
     def shutdown(self) -> None:

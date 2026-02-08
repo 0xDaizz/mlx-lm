@@ -15,6 +15,8 @@ import json
 import logging
 import os
 import tempfile
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -30,20 +32,18 @@ CURRENT_HASH_VERSION = 1
 class SSDCache:
     """SSD-backed KV cache for persisting evicted blocks.
 
+    Thread-safe: all public methods are protected by threading.Lock.
+
     Attributes:
         cache_dir: Directory where safetensors files are stored.
         ttl_days: Time-to-live in days; blocks older than this are pruned.
         index: Maps block_hash (str) -> SSDBlockMeta.
-
-    Note: This class is NOT thread-safe. All methods (save_block, load_block,
-    prune_expired) must be called from a single thread (the inference thread).
-    If concurrent access is needed (e.g., for Phase 8 tensor-parallel), add
-    threading.Lock protection around index mutations.
     """
 
     def __init__(self, cache_dir: Path, ttl_days: int = 7) -> None:
         self.cache_dir = Path(cache_dir)
         self.ttl_days = ttl_days
+        self._lock = threading.Lock()
         self.index: dict[str, SSDBlockMeta] = {}
 
         # Batch flush state: defer save_index() until flush interval
@@ -57,7 +57,19 @@ class SSDCache:
         # Load existing index if available
         self.load_index()
 
-    def save_block(self, block_hash: str, kv_data: list[dict[str, mx.array]] | dict[str, mx.array]) -> None:
+        # Stats counters (thread-safe reads via get_stats snapshot)
+        self._stats: dict[str, int] = {
+            "ssd_save_success": 0,
+            "ssd_save_fail": 0,
+            "ssd_save_dedup_skip": 0,
+            "ssd_stale_index_cleaned": 0,
+            "ssd_hash_collision_detected": 0,
+        }
+
+        # Non-cacheable collision isolation set: block_hash -> expiry timestamp
+        self._noncacheable: dict[str, float] = {}
+
+    def save_block(self, block_hash: str, kv_data: list[dict[str, mx.array]] | dict[str, mx.array], num_tokens: int | None = None) -> str:
         """Save K/V tensors for a block to disk as a safetensors file.
 
         Args:
@@ -66,46 +78,103 @@ class SSDCache:
                 and 'values') or a flat dict with 'keys'/'values' mx.arrays.
                 The list[dict] format is flattened to
                 ``{"layer_0_keys": ..., "layer_0_values": ..., ...}`` for storage.
+            num_tokens: Optional token count for collision verification. If None,
+                computed from kv_data shape.
+
+        Returns:
+            One of: ``"saved"``, ``"dedup"``, ``"collision"``, ``"error"``.
         """
-        filename = f"block_{block_hash}.safetensors"
-        filepath = self.cache_dir / filename
+        with self._lock:
+            # Non-cacheable check (collision isolation)
+            if block_hash in self._noncacheable:
+                if time.time() < self._noncacheable[block_hash]:
+                    return "collision"
+                else:
+                    del self._noncacheable[block_hash]
 
-        # Flatten list[dict] format to a single dict for safetensors
-        if isinstance(kv_data, list):
-            flat: dict[str, mx.array] = {}
-            num_tokens = 0
-            for i, layer_dict in enumerate(kv_data):
-                for key, val in layer_dict.items():
-                    flat[f"layer_{i}_{key}"] = val
-                if num_tokens == 0 and "keys" in layer_dict:
-                    num_tokens = layer_dict["keys"].shape[2]
-        else:
-            flat = kv_data
-            num_tokens = kv_data["keys"].shape[2] if "keys" in kv_data else 0
+            # Compute num_tokens from kv_data if not provided
+            computed_num_tokens: int
+            if isinstance(kv_data, list):
+                computed_num_tokens = 0
+                for layer_dict in kv_data:
+                    if computed_num_tokens == 0 and "keys" in layer_dict:
+                        computed_num_tokens = layer_dict["keys"].shape[2]
+                        break
+            else:
+                computed_num_tokens = kv_data["keys"].shape[2] if "keys" in kv_data else 0
 
-        # Atomic write: save to temp file, then rename
-        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
-        try:
-            os.close(tmp_fd)
-            os.unlink(tmp_path)  # mx.save_safetensors needs to create the file itself
-            mx.save_safetensors(tmp_path, flat)
-            os.replace(tmp_path, str(filepath))
-        except Exception:
+            if num_tokens is None:
+                num_tokens = computed_num_tokens
+
+            # Dedup guard: check if already saved
+            if block_hash in self.index:
+                entry = self.index[block_hash]
+                filepath = Path(entry.filepath) if not isinstance(entry.filepath, Path) else entry.filepath
+
+                if not filepath.exists():
+                    # Stale index entry — clean up, fall through to re-save
+                    del self.index[block_hash]
+                    self._stats["ssd_stale_index_cleaned"] += 1
+                    logger.warning("Stale index entry cleaned: %s", block_hash)
+                else:
+                    # Collision verification via num_tokens
+                    stored_num = entry.num_tokens
+                    if stored_num is not None and num_tokens is not None and stored_num != num_tokens:
+                        logger.warning(
+                            "HASH COLLISION: hash=%s stored=%d new=%d — non-cacheable",
+                            block_hash, stored_num, num_tokens,
+                        )
+                        self._noncacheable[block_hash] = time.time() + 3600
+                        self._stats["ssd_hash_collision_detected"] += 1
+                        return "collision"
+
+                    # Normal dedup — touch last_accessed
+                    entry.last_accessed = datetime.now()
+                    self._mark_dirty()
+                    self._stats["ssd_save_dedup_skip"] += 1
+                    return "dedup"
+
+            filename = f"block_{block_hash}.safetensors"
+            filepath = self.cache_dir / filename
+
+            # Flatten list[dict] format to a single dict for safetensors
+            if isinstance(kv_data, list):
+                flat: dict[str, mx.array] = {}
+                for i, layer_dict in enumerate(kv_data):
+                    for key, val in layer_dict.items():
+                        flat[f"layer_{i}_{key}"] = val
+            else:
+                flat = kv_data
+
+            # Atomic write: save to temp file, then rename
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-            raise
+                os.close(tmp_fd)
+                os.unlink(tmp_path)  # mx.save_safetensors needs to create the file itself
+                mx.save_safetensors(tmp_path, flat)
+                os.replace(tmp_path, str(filepath))
+            except Exception as e:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                self._stats["ssd_save_fail"] += 1
+                logger.error("Failed to save block %s to SSD: %s", block_hash, e)
+                return "error"
 
-        self.index[block_hash] = SSDBlockMeta(
-            block_hash=block_hash,
-            filepath=filepath,
-            last_accessed=datetime.now(),
-            num_tokens=num_tokens,
-        )
-        self.save_index()  # Immediate flush: new block must be indexed for durability
+            # last_accessed is set at save time (not enqueue time for async writes).
+            # TTL granularity is days, so seconds of async delay are negligible.
+            self.index[block_hash] = SSDBlockMeta(
+                block_hash=block_hash,
+                filepath=filepath,
+                last_accessed=datetime.now(),
+                num_tokens=num_tokens,
+            )
+            self.save_index()  # Immediate flush: new block must be indexed for durability
+            self._stats["ssd_save_success"] += 1
 
-        logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
+            logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
+            return "saved"
 
     def load_block(self, block_hash: str) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Load K/V tensors for a block from disk.
@@ -124,61 +193,64 @@ class SSDCache:
             was saved, a plain dict when the legacy format was saved, or None
             if not found.
         """
-        if block_hash not in self.index:
-            return None
+        with self._lock:
+            if block_hash not in self.index:
+                return None
 
-        meta = self.index[block_hash]
-        filepath = meta.filepath
+            meta = self.index[block_hash]
+            filepath = meta.filepath
 
-        if not filepath.exists():
-            # Stale index entry — file was removed externally
-            del self.index[block_hash]
-            self.save_index()
-            return None
+            if not filepath.exists():
+                # Stale index entry — file was removed externally
+                del self.index[block_hash]
+                self.save_index()
+                self._stats["ssd_stale_index_cleaned"] += 1
+                return None
 
-        try:
-            arrays = mx.load(str(filepath))
-        except Exception as e:
-            # Corrupted, truncated, or unreadable file — remove stale entry
-            logger.warning(
-                "Failed to load block %s from %s: %s. Removing stale index entry.",
-                block_hash,
-                filepath,
-                e,
-            )
-            del self.index[block_hash]
-            self.save_index()
-            return None
+            try:
+                arrays = mx.load(str(filepath))
+            except Exception as e:
+                # Corrupted, truncated, or unreadable file — remove stale entry
+                logger.warning(
+                    "Failed to load block %s from %s: %s. Removing stale index entry.",
+                    block_hash,
+                    filepath,
+                    e,
+                )
+                del self.index[block_hash]
+                self.save_index()
+                self._stats["ssd_stale_index_cleaned"] += 1
+                return None
 
-        # mx.load returns a dict-like object; ensure we have standard dict
-        raw = dict(arrays)
+            # mx.load returns a dict-like object; ensure we have standard dict
+            raw = dict(arrays)
 
-        # Detect format: "layer_N_key" keys indicate multi-layer format
-        layer_keys = [k for k in raw if k.startswith("layer_")]
-        if layer_keys:
-            # Unflatten back to list[dict]
-            layer_keys_sorted = sorted(
-                layer_keys, key=lambda k: (int(k.split("_")[1]), k)
-            )
-            layer_indices = sorted({int(k.split("_")[1]) for k in layer_keys_sorted})
-            kv_data_list: list[dict[str, mx.array]] = []
-            for li in layer_indices:
-                prefix = f"layer_{li}_"
-                layer_dict = {
-                    k[len(prefix):]: v for k, v in raw.items() if k.startswith(prefix)
-                }
-                kv_data_list.append(layer_dict)
-            result: list[dict[str, mx.array]] | dict[str, mx.array] = kv_data_list
-        else:
-            # Legacy flat format — return as-is (dict)
-            result = raw
+            # Detect format: "layer_N_key" keys indicate multi-layer format
+            layer_keys = [k for k in raw if k.startswith("layer_")]
+            if layer_keys:
+                # Unflatten back to list[dict]
+                layer_keys_sorted = sorted(
+                    layer_keys, key=lambda k: (int(k.split("_")[1]), k)
+                )
+                layer_indices = sorted({int(k.split("_")[1]) for k in layer_keys_sorted})
+                kv_data_list: list[dict[str, mx.array]] = []
+                for li in layer_indices:
+                    prefix = f"layer_{li}_"
+                    layer_dict = {
+                        k[len(prefix):]: v for k, v in raw.items() if k.startswith(prefix)
+                    }
+                    kv_data_list.append(layer_dict)
+                result: list[dict[str, mx.array]] | dict[str, mx.array] = kv_data_list
+            else:
+                # Legacy flat format — return as-is (dict)
+                result = raw
 
-        # Update access time
-        meta.last_accessed = datetime.now()
-        self._mark_dirty()
+            # Update access time
+            meta.last_accessed = datetime.now()
+            self._mark_dirty()
 
-        logger.debug("Loaded block %s from SSD: %s", block_hash, filepath)
-        return result
+            logger.debug("Loaded block %s from SSD: %s", block_hash, filepath)
+            return result
 
     def prune_expired(self) -> int:
         """Delete blocks that have exceeded their TTL.
@@ -186,25 +258,26 @@ class SSDCache:
         Returns:
             Number of blocks pruned.
         """
-        cutoff = datetime.now() - timedelta(days=self.ttl_days)
-        to_prune = [
-            bh for bh, meta in self.index.items() if meta.last_accessed < cutoff
-        ]
+        with self._lock:
+            cutoff = datetime.now() - timedelta(days=self.ttl_days)
+            to_prune = [
+                bh for bh, meta in self.index.items() if meta.last_accessed < cutoff
+            ]
 
-        for block_hash in to_prune:
-            meta = self.index[block_hash]
-            try:
-                if meta.filepath.exists():
-                    meta.filepath.unlink()
-                    logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
-            except OSError as e:
-                logger.warning("Failed to delete expired block file %s: %s", meta.filepath, e)
-            del self.index[block_hash]
+            for block_hash in to_prune:
+                meta = self.index[block_hash]
+                try:
+                    if meta.filepath.exists():
+                        meta.filepath.unlink()
+                        logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
+                except OSError as e:
+                    logger.warning("Failed to delete expired block file %s: %s", meta.filepath, e)
+                del self.index[block_hash]
 
-        if to_prune:
-            self.save_index()
+            if to_prune:
+                self.save_index()
 
-        return len(to_prune)
+            return len(to_prune)
 
     def _mark_dirty(self) -> None:
         """Mark index as dirty; flush to disk after _flush_interval mutations."""
@@ -218,10 +291,11 @@ class SSDCache:
 
     def flush(self) -> None:
         """Flush pending index changes to disk. Call during shutdown."""
-        if self._index_dirty:
-            self.save_index()
-            self._mutation_count = 0
-            self._index_dirty = False
+        with self._lock:
+            if self._index_dirty:
+                self.save_index()
+                self._mutation_count = 0
+                self._index_dirty = False
 
     def save_index(self) -> None:
         """Persist the index to a JSON file in the cache directory.
@@ -315,9 +389,53 @@ class SSDCache:
         Returns:
             True if the block is in the SSD index, False otherwise.
         """
-        return block_hash in self.index
+        with self._lock:
+            return block_hash in self.index
 
     @property
     def num_blocks(self) -> int:
         """Number of blocks stored on SSD."""
         return len(self.index)
+
+    def get_stats(self) -> dict[str, int]:
+        """Return a snapshot of SSD cache statistics."""
+        with self._lock:
+            return dict(self._stats)
+
+    def validate_index(self) -> dict[str, int]:
+        """Startup crash recovery: clean orphan files + remove missing entries.
+
+        Returns:
+            Dict with "orphans_cleaned" and "missing_cleaned" counts.
+        """
+        with self._lock:
+            result = {"orphans_cleaned": 0, "missing_cleaned": 0}
+
+            # 1. Find orphan files (on disk but not in index)
+            indexed_files = {str(meta.filepath) for meta in self.index.values()}
+            for f in self.cache_dir.glob("block_*.safetensors"):
+                if str(f) not in indexed_files:
+                    try:
+                        f.unlink()
+                        result["orphans_cleaned"] += 1
+                        logger.info("Cleaned orphan SSD file: %s", f)
+                    except OSError as e:
+                        logger.warning("Failed to clean orphan file %s: %s", f, e)
+
+            # 2. Find missing entries (in index but file doesn't exist)
+            missing = []
+            for bh, meta in self.index.items():
+                filepath = meta.filepath if isinstance(meta.filepath, Path) else Path(meta.filepath)
+                if not filepath.exists():
+                    missing.append(bh)
+
+            for bh in missing:
+                del self.index[bh]
+                result["missing_cleaned"] += 1
+                self._stats["ssd_stale_index_cleaned"] += 1
+                logger.info("Cleaned missing index entry: %s", bh)
+
+            if missing:
+                self.save_index()
+
+            return result

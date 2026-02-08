@@ -31,6 +31,7 @@ from mlx_lm_server.types import KVCacheBlock
 
 if TYPE_CHECKING:
     from mlx_lm_server.ssd_cache import SSDCache
+    from mlx_lm_server.ssd_writer import SSDWriterThread
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,13 @@ class KVCacheManager:
         self._eviction_heap: list[tuple[float, int]] = []  # (last_accessed, block_id)
         self._heap_pushes: int = 0  # Total pushes since last rebuild
         self.ssd = ssd  # Optional SSD tier for fallback lookups and promote
+        # SSD-related stats counters
+        self._stats: dict[str, int] = {
+            "kv_promote_hits": 0,
+            "kv_promote_fail": 0,
+            "kv_lookup_hits": 0,
+            "kv_lookup_miss": 0,
+        }
 
     def _rebuild_eviction_heap(self) -> None:
         """Rebuild eviction heap, removing stale entries. Must hold self.lock."""
@@ -347,6 +355,7 @@ class KVCacheManager:
                         block.ref_count += 1
                         block.last_accessed = time.time()
                         allocated_block_ids.append(block_id)
+                        self._stats["kv_lookup_hits"] += 1
                         logger.debug(
                             "Cache hit for block %d (hash=%s, ref_count=%d)",
                             block_id,
@@ -377,6 +386,7 @@ class KVCacheManager:
                         except BlockPoolExhaustedError:
                             evicted = self._evict_lru_locked(num_blocks=1)
                             if not evicted:
+                                self._stats["kv_promote_fail"] += 1
                                 for bid in allocated_block_ids:
                                     b = self.pool.blocks[bid]
                                     if bid in freshly_allocated:
@@ -398,6 +408,7 @@ class KVCacheManager:
                         allocated_block_ids.append(block.block_id)
                         freshly_allocated.append(block.block_id)
                         prev_hash = block_hash
+                        self._stats["kv_promote_hits"] += 1
                         logger.debug(
                             "SSD promote for block %d (hash=%s)",
                             block.block_id,
@@ -438,6 +449,7 @@ class KVCacheManager:
                 block.last_accessed = time.time()
                 allocated_block_ids.append(block.block_id)
                 freshly_allocated.append(block.block_id)  # ALL new allocations
+                self._stats["kv_lookup_miss"] += 1
 
                 if is_collision:
                     # Don't register in hash_table — would overwrite the
@@ -591,6 +603,7 @@ class KVCacheManager:
         kv_data: list,
         tiered_cache=None,
         exclude_ids: set[int] | None = None,
+        ssd_policy: str = "evict_only",
     ) -> int | None:
         """Atomically cache a block: allocate or reuse, with eviction fallback.
 
@@ -598,20 +611,33 @@ class KVCacheManager:
         (the block is already cached). Otherwise, allocates a free block,
         populates it, and registers it in the hash table.
 
+        Uses a 2-phase pattern:
+        - Phase 1 (inside lock): RAM allocation and hash_table registration.
+        - Phase 2 (outside lock): If ssd_policy == "write_through", persist
+          block to SSD via tiered_cache.write_through().
+
         Args:
             block_hash: Hash identifying this block.
             token_ids: Token IDs stored in this block (for collision verification).
             kv_data: Per-layer KV data for this block.
-            tiered_cache: Optional TieredKVCache for SSD eviction fallback.
+            tiered_cache: Optional TieredKVCache for SSD eviction fallback
+                and write-through.
             exclude_ids: Block IDs to exclude from eviction.
+            ssd_policy: "evict_only" (default) or "write_through". When
+                "write_through", the block is also persisted to SSD after
+                RAM allocation completes.
 
         Returns:
             The block_id of the cached block, or None if caching failed.
         """
+        result_id = None
+        need_two_phase_eviction = False
+
+        # --- Phase 1: RAM alloc under lock ---
         with self.lock:
             # Already cached — nothing to do
             if block_hash in self.hash_table:
-                return None  # Already cached — caller should not free
+                return None  # Already cached — no SSD write needed
 
             # Try to allocate a free block
             try:
@@ -622,7 +648,7 @@ class KVCacheManager:
                     # evict_to_ssd(), which acquires self.ram.lock (same
                     # object). Python's threading.Lock is NOT reentrant,
                     # so holding it here would deadlock.
-                    pass  # fall through to two-phase eviction below
+                    need_two_phase_eviction = True
                 else:
                     self._evict_lru_locked(num_blocks=1, exclude_ids=exclude_ids)
                     try:
@@ -636,7 +662,7 @@ class KVCacheManager:
                     block.last_accessed = time.time()
                     block.kv_data = list(kv_data)
                     self.hash_table[block_hash] = block.block_id
-                    return block.block_id
+                    result_id = block.block_id
             else:
                 # Successfully allocated on first try (no eviction needed)
                 block.block_hash = block_hash
@@ -645,30 +671,40 @@ class KVCacheManager:
                 block.last_accessed = time.time()
                 block.kv_data = list(kv_data)
                 self.hash_table[block_hash] = block.block_id
-                return block.block_id
+                result_id = block.block_id
 
         # --- Two-phase eviction (tiered_cache path) ---
-        # Lock has been released. evict_to_ssd() will acquire it internally.
-        tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=exclude_ids)
+        if need_two_phase_eviction:
+            # Lock has been released. evict_to_ssd() will acquire it internally.
+            tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=exclude_ids)
 
-        # Re-acquire lock and retry allocation
-        with self.lock:
-            # Another thread may have cached this block while we released the lock
-            if block_hash in self.hash_table:
-                return None  # Another thread beat us — no-op
+            # Re-acquire lock and retry allocation
+            with self.lock:
+                # Another thread may have cached this block while we released the lock
+                if block_hash in self.hash_table:
+                    return None  # Another thread beat us — no-op
 
+                try:
+                    block = self.pool.get_free_block()
+                except BlockPoolExhaustedError:
+                    return None
+
+                block.block_hash = block_hash
+                block.token_ids = list(token_ids)
+                block.ref_count = 1
+                block.last_accessed = time.time()
+                block.kv_data = list(kv_data)
+                self.hash_table[block_hash] = block.block_id
+                result_id = block.block_id
+
+        # --- Phase 2: SSD write-through (outside lock) ---
+        if result_id is not None and ssd_policy == "write_through" and tiered_cache is not None:
             try:
-                block = self.pool.get_free_block()
-            except BlockPoolExhaustedError:
-                return None
+                tiered_cache.write_through(block_hash, kv_data, len(token_ids))
+            except Exception as e:
+                logger.warning("SSD write-through failed for %s: %s", block_hash, e)
 
-            block.block_hash = block_hash
-            block.token_ids = list(token_ids)
-            block.ref_count = 1
-            block.last_accessed = time.time()
-            block.kv_data = list(kv_data)
-            self.hash_table[block_hash] = block.block_id
-            return block.block_id
+        return result_id
 
     # --- Convenience / introspection methods ---
 
@@ -686,6 +722,11 @@ class KVCacheManager:
     def num_used_blocks(self) -> int:
         """Number of blocks currently allocated (not free)."""
         return self.pool.num_blocks - self.pool.num_free
+
+    def get_stats(self) -> dict[str, int]:
+        """Return a snapshot of KV cache manager statistics."""
+        with self.lock:
+            return dict(self._stats)
 
 
 # ---------------------------------------------------------------------------
@@ -768,9 +809,15 @@ class TieredKVCache:
         ssd: The SSD-backed cache (optional; None disables SSD tier).
     """
 
-    def __init__(self, ram: KVCacheManager, ssd: SSDCache | None = None) -> None:
+    def __init__(
+        self,
+        ram: KVCacheManager,
+        ssd: SSDCache | None = None,
+        writer: SSDWriterThread | None = None,
+    ) -> None:
         self.ram = ram
         self.ssd = ssd
+        self._writer = writer  # Optional SSDWriterThread for async writes
 
     def lookup(self, block_hash: str) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Look up KV data for a block hash, checking RAM then SSD.
@@ -799,6 +846,29 @@ class TieredKVCache:
                 return kv_data
 
         return None
+
+    def write_through(self, block_hash: str, kv_data, num_tokens: int | None = None) -> None:
+        """Write block to SSD tier (async if writer available, else sync).
+
+        When an SSDWriterThread is attached, the write is enqueued for
+        background processing. Otherwise, falls back to synchronous
+        SSDCache.save_block().
+
+        Args:
+            block_hash: Hash identifying the block.
+            kv_data: Per-layer KV data to persist.
+            num_tokens: Number of tokens in the block (optional, for SSD metadata).
+        """
+        if self._writer is not None:
+            self._writer.enqueue(block_hash, kv_data, num_tokens)
+        elif self.ssd is not None:
+            self.ssd.save_block(block_hash, kv_data, num_tokens)
+
+    def get_writer_stats(self) -> dict[str, int]:
+        """Return async writer stats (empty dict if no writer)."""
+        if self._writer is not None:
+            return self._writer.get_stats()
+        return {}
 
     def evict_to_ssd(self, num_blocks: int = 1, exclude_ids: set[int] | None = None) -> list[int]:
         """Evict LRU blocks from RAM, saving them to SSD first.
@@ -831,14 +901,19 @@ class TieredKVCache:
                     and block.kv_data is not None
                     and block.block_hash is not None
                 ):
-                    try:
-                        self.ssd.save_block(block.block_hash, block.kv_data)
-                    except Exception as e:
-                        logger.warning(
-                            "SSD save failed for block %d, skipping eviction: %s",
-                            block.block_id, e,
-                        )
-                        continue  # Skip eviction — keep block in RAM
+                    # Skip save if block already on SSD
+                    if self.ssd.has_block(block.block_hash):
+                        # Already persisted — just evict from RAM
+                        pass  # fall through to the eviction logic below
+                    else:
+                        try:
+                            self.ssd.save_block(block.block_hash, block.kv_data)
+                        except Exception as e:
+                            logger.warning(
+                                "SSD save failed for block %d, skipping eviction: %s",
+                                block.block_id, e,
+                            )
+                            continue  # Skip eviction — keep block in RAM
 
                 # Remove from hash table
                 if (
