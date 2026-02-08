@@ -145,18 +145,24 @@ def compute_block_hash(prefix_tokens: list[int], block_tokens: list[int]) -> str
 
 
 def compute_model_fingerprint(
-    model_name: str, model, kv_bits: int, kv_group_size: int
+    model_name: str,
+    model,
+    kv_bits: int,
+    kv_group_size: int,
+    adapter_path: str | None = None,
 ) -> str:
-    """Compute a fingerprint for a model+quantization combination.
+    """Compute a fingerprint for a model+quantization+adapter combination.
 
-    Used to namespace SSD cache directories so that different models
-    or quantization settings do not share cached KV blocks.
+    Used to namespace SSD cache directories so that different models,
+    quantization settings, or LoRA adapters do not share cached KV blocks.
 
     Args:
         model_name: Model identifier string (e.g. "mlx-community/Qwen3-4B-4bit").
         model: The loaded model object (used to extract config dimensions).
         kv_bits: KV cache quantization bit-width.
         kv_group_size: KV cache quantization group size.
+        adapter_path: Optional path to a LoRA adapter. Different adapters
+            produce different KV activations and must not share cache.
 
     Returns:
         Hex digest string (32 chars) uniquely identifying this configuration.
@@ -164,6 +170,7 @@ def compute_model_fingerprint(
     h = hashlib.blake2b(digest_size=16)
     h.update(model_name.encode("utf-8"))
     h.update(struct.pack("<ii", kv_bits, kv_group_size))
+    h.update((adapter_path or "").encode("utf-8"))
     if hasattr(model, "config"):
         cfg = model.config
         h.update(struct.pack(

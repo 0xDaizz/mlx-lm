@@ -30,6 +30,7 @@ def main() -> None:
         if config.ssd_enabled:
             fingerprint = compute_model_fingerprint(
                 config.model, model, config.kv_bits, config.kv_group_size,
+                adapter_path=config.adapter_path,
             )
             ssd_dir = config.ssd_cache_dir / fingerprint
             ssd_cache = SSDCache(ssd_dir, config.ssd_ttl_days)

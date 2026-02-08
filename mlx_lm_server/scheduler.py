@@ -377,6 +377,13 @@ class Scheduler:
             except Exception:
                 pass
 
+        # Flush SSD cache index so dirty metadata (last_accessed) is persisted
+        if self._tiered_cache and hasattr(self._tiered_cache, 'ssd') and self._tiered_cache.ssd is not None:
+            try:
+                self._tiered_cache.ssd.flush()
+            except Exception:
+                logger.warning("Failed to flush SSD cache index on shutdown")
+
     def _inference_loop(self) -> None:
         """Main inference loop: schedule -> prefill -> decode -> emit tokens."""
         logger.info("Inference loop started")

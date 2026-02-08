@@ -28,6 +28,7 @@ from mlx_lm_server.kv_cache_manager import (
     TieredKVCache,
     _compute_chain_hash,
     compute_block_hash,
+    compute_model_fingerprint,
     extract_block,
     inject_blocks,
 )
@@ -1414,3 +1415,60 @@ class TestChainHash:
         block1 = mgr.pool.blocks[ids[1]]
         expected_h1 = compute_block_hash(tokens[:4], tokens[4:8])
         assert block1.block_hash == expected_h1
+
+
+# ---------------------------------------------------------------------------
+# compute_model_fingerprint — adapter_path inclusion
+# ---------------------------------------------------------------------------
+
+
+class TestComputeModelFingerprint:
+    """Tests for compute_model_fingerprint with adapter_path support."""
+
+    class _FakeModel:
+        """Minimal model stub with a config attribute."""
+
+        class config:
+            num_hidden_layers = 24
+            num_key_value_heads = 8
+            hidden_size = 2048
+
+    def test_different_adapters_produce_different_fingerprints(self):
+        """Different adapter_path values must produce different fingerprints."""
+        model = self._FakeModel()
+        fp_a = compute_model_fingerprint(
+            "model-x", model, 8, 64, adapter_path="/adapters/lora-A"
+        )
+        fp_b = compute_model_fingerprint(
+            "model-x", model, 8, 64, adapter_path="/adapters/lora-B"
+        )
+        assert fp_a != fp_b
+
+    def test_none_adapter_matches_no_adapter_arg(self):
+        """adapter_path=None produces the same fingerprint as omitting it (backwards compat)."""
+        model = self._FakeModel()
+        fp_default = compute_model_fingerprint("model-x", model, 8, 64)
+        fp_none = compute_model_fingerprint(
+            "model-x", model, 8, 64, adapter_path=None
+        )
+        assert fp_default == fp_none
+
+    def test_adapter_vs_no_adapter_differ(self):
+        """Providing an adapter_path must differ from no adapter."""
+        model = self._FakeModel()
+        fp_no_adapter = compute_model_fingerprint("model-x", model, 8, 64)
+        fp_with_adapter = compute_model_fingerprint(
+            "model-x", model, 8, 64, adapter_path="/adapters/lora-A"
+        )
+        assert fp_no_adapter != fp_with_adapter
+
+    def test_fingerprint_determinism(self):
+        """Same inputs always produce the same fingerprint."""
+        model = self._FakeModel()
+        fp1 = compute_model_fingerprint(
+            "model-x", model, 8, 64, adapter_path="/adapters/lora-A"
+        )
+        fp2 = compute_model_fingerprint(
+            "model-x", model, 8, 64, adapter_path="/adapters/lora-A"
+        )
+        assert fp1 == fp2

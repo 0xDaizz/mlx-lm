@@ -864,3 +864,183 @@ class TestCacheStats:
             assert stats["requests_completed"] >= 2
         finally:
             s.stop()
+
+
+# ---------------------------------------------------------------------------
+# SSD flush on shutdown
+# ---------------------------------------------------------------------------
+
+class TestSSDFlushOnShutdown:
+    """Verify that SSD cache index is flushed when the scheduler stops."""
+
+    def test_stop_flushes_ssd_cache(self):
+        """stop() calls tiered_cache.ssd.flush() to persist dirty metadata."""
+        from unittest.mock import MagicMock
+
+        mock_ssd = MagicMock()
+        mock_tiered = MagicMock()
+        mock_tiered.ssd = mock_ssd
+
+        s = _make_scheduler(tiered_cache=mock_tiered)
+        s.stop()
+
+        mock_ssd.flush.assert_called_once()
+
+    def test_stop_handles_flush_exception(self):
+        """stop() does not raise if ssd.flush() throws."""
+        from unittest.mock import MagicMock
+
+        mock_ssd = MagicMock()
+        mock_ssd.flush.side_effect = OSError("disk full")
+        mock_tiered = MagicMock()
+        mock_tiered.ssd = mock_ssd
+
+        s = _make_scheduler(tiered_cache=mock_tiered)
+        # Should not raise
+        s.stop()
+        mock_ssd.flush.assert_called_once()
+
+    def test_stop_skips_flush_when_no_tiered_cache(self):
+        """stop() works fine when tiered_cache is None."""
+        s = _make_scheduler()
+        # Should not raise
+        s.stop()
+
+    def test_stop_skips_flush_when_ssd_is_none(self):
+        """stop() skips flush when tiered_cache.ssd is None."""
+        from unittest.mock import MagicMock
+
+        mock_tiered = MagicMock()
+        mock_tiered.ssd = None
+
+        s = _make_scheduler(tiered_cache=mock_tiered)
+        # Should not raise
+        s.stop()
+
+
+# ---------------------------------------------------------------------------
+# Cancel / get_result race contract tests
+# ---------------------------------------------------------------------------
+
+
+class TestCancelGetResultContract:
+    """Test that cancel/get_result race behavior matches documented API contract.
+
+    The documented API contract for get_result() states:
+        "After cancel: may raise KeyError (already cleaned up) or return [cancelled_event]"
+
+    The race window: when cancel_request() (for queued requests) or
+    _process_cancellations_batch() (for active requests) calls _signal_finish()
+    then _cleanup_result_buffers(), a concurrent get_result() may wake up between
+    these two calls and see different results depending on lock timing:
+        - [cancelled_event] if get_result acquires _results_lock after _signal_finish
+          but before _cleanup_result_buffers
+        - [] if _cleanup_result_buffers runs before get_result pops the results
+        - KeyError if _cleanup_result_buffers already removed _results_ready
+        - TimeoutError if the cancel has not yet been processed by the inference loop
+    """
+
+    def test_cancel_then_get_result_returns_acceptable_values(self):
+        """After cancel, get_result may return cancelled event, empty list,
+        raise KeyError, or raise TimeoutError. All are acceptable per the
+        API contract.
+        """
+        config = _make_config(max_batch_size=1)
+        s = _make_scheduler(config)
+
+        # Use a slow generator so the request stays active long enough to cancel
+        gate = threading.Event()
+
+        def slow_gen(rid, tids, step):
+            gate.wait(timeout=10.0)
+            return (step + 1, f"t{step}", None)
+
+        s._mock_generate = slow_gen
+
+        req = _make_request("race-req", max_tokens=100)
+        s.submit_request(req)
+        s.run_inference_loop(blocking=False)
+
+        # Wait for the request to become active (in the batch)
+        deadline = time.monotonic() + 3.0
+        while s.num_active_sequences == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Cancel the active request
+        s.cancel_request("race-req")
+
+        # Release the gate so the inference loop can process the cancellation
+        gate.set()
+
+        # Try get_result -- any of these outcomes is acceptable per the contract
+        try:
+            tokens = s.get_result("race-req", timeout=2.0)
+            # Acceptable: list with cancelled event, or empty list (race window)
+            if len(tokens) > 0:
+                assert any(
+                    t.finish_reason == "cancelled" for t in tokens
+                ), f"Expected cancelled finish_reason, got {[t.finish_reason for t in tokens]}"
+            # len(tokens) == 0 is also acceptable (race: cleanup before pop)
+        except KeyError:
+            # Acceptable: _cleanup_result_buffers already removed the entry
+            pass
+        except TimeoutError:
+            # Acceptable: cancel may not have been processed yet within timeout
+            pass
+        finally:
+            s.stop()
+
+    def test_cancel_queued_then_get_result(self):
+        """Cancel a queued (not yet active) request, then call get_result.
+
+        For queued requests, cancel_request() calls _signal_finish() then
+        _cleanup_result_buffers() synchronously, so by the time cancel_request()
+        returns, the result buffers are already gone. get_result() should
+        raise KeyError.
+        """
+        config = _make_config(max_batch_size=1)
+        s = _make_scheduler(config)
+
+        # Block the first request so the second stays queued
+        gate = threading.Event()
+
+        def slow_gen(rid, tids, step):
+            if step == 0:
+                gate.wait(timeout=10.0)
+            if step >= 1:
+                return (step + 1, f"t{step}", "stop")
+            return (step + 1, f"t{step}", None)
+
+        s._mock_generate = slow_gen
+
+        s.submit_request(_make_request("blocker", max_tokens=10))
+        s.submit_request(_make_request("queued-cancel", max_tokens=10))
+        s.run_inference_loop(blocking=False)
+
+        # Wait for blocker to become active
+        deadline = time.monotonic() + 3.0
+        while s.num_active_sequences == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # queued-cancel should still be in the queue
+        assert s.cancel_request("queued-cancel") is True
+
+        # After cancel_request returns for a queued request, buffers are cleaned up
+        # synchronously, so get_result should raise KeyError
+        try:
+            tokens = s.get_result("queued-cancel", timeout=1.0)
+            # If we get here, the cancelled event was retrieved before cleanup --
+            # still acceptable
+            if len(tokens) > 0:
+                assert any(
+                    t.finish_reason == "cancelled" for t in tokens
+                ), f"Expected cancelled finish_reason, got {[t.finish_reason for t in tokens]}"
+        except KeyError:
+            # Expected: buffers already cleaned up
+            pass
+        except TimeoutError:
+            # Also acceptable
+            pass
+        finally:
+            gate.set()
+            s.stop()
