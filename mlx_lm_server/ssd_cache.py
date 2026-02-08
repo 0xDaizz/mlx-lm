@@ -32,6 +32,11 @@ class SSDCache:
         cache_dir: Directory where safetensors files are stored.
         ttl_days: Time-to-live in days; blocks older than this are pruned.
         index: Maps block_hash (str) -> SSDBlockMeta.
+
+    Note: This class is NOT thread-safe. All methods (save_block, load_block,
+    prune_expired) must be called from a single thread (the inference thread).
+    If concurrent access is needed (e.g., for Phase 8 tensor-parallel), add
+    threading.Lock protection around index mutations.
     """
 
     def __init__(self, cache_dir: Path, ttl_days: int = 7) -> None:

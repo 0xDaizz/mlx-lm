@@ -639,8 +639,9 @@ class Scheduler:
                         seq._detokenizer = copy.copy(detok)
                         seq._detokenizer.reset()
 
-                with self._active_lock:
-                    self._active_sequences[req.request_id] = seq
+                # NOTE: Do NOT add to _active_sequences here. It must happen
+                # AFTER insert() succeeds, so a failed insert() doesn't leave
+                # a stuck sequence with no UID (Bug 3 / Issue 4 fix).
 
                 # Look up caches: block-level first (finer granularity),
                 # then sequence-level (faster, no reconstruction overhead)
@@ -742,6 +743,10 @@ class Scheduler:
                     self._uid_to_request_id[uid] = req.request_id
                     self._request_id_to_uid[req.request_id] = uid
                     seq._batch_uid = uid
+                    # Register in _active_sequences AFTER insert() succeeds
+                    # and UID is assigned (Bug 3 / Issue 4 fix).
+                    with self._active_lock:
+                        self._active_sequences[req.request_id] = seq
                     logger.debug(
                         "Inserted request %s as UID %d", req.request_id, uid
                     )
@@ -749,6 +754,10 @@ class Scheduler:
                     logger.error("Failed to insert request %s: %s", req.request_id, e)
                     seq.is_finished = True
                     seq.finish_reason = "error"
+                    # Free KV cache blocks allocated during cache lookup
+                    if self.kv_cache_manager is not None and seq.block_ids:
+                        self.kv_cache_manager.free_blocks(seq.block_ids)
+                        seq.block_ids = []
                     self._signal_finish(req.request_id, finish_reason="error")
             except Exception as e:
                 # Request was popped from queue but failed during setup —
@@ -1061,14 +1070,36 @@ class Scheduler:
             try:
                 stream.put_nowait(event)
             except queue.Full:
+                # Backpressure overflow: client is consuming tokens too slowly.
+                # Instead of silently dropping tokens (which causes data corruption),
+                # signal an error and cancel the request (Bug 4 / Issue 6 fix).
+                logger.warning(
+                    "Stream backpressure overflow for %s: client consuming tokens too slowly, "
+                    "cancelling request",
+                    request_id,
+                )
+                # Add to cancelled set so scheduler stops generating for this request
+                with self._cancelled_lock:
+                    self._cancelled.add(request_id)
+                # Drain the queue to make room for the finish event
+                while not stream.empty():
+                    try:
+                        stream.get_nowait()
+                    except queue.Empty:
+                        break
+                # Deliver the error finish event to the client
+                error_event = TokenEvent(
+                    request_id=request_id,
+                    token_id=-1,
+                    token_text="",
+                    finish_reason="error",
+                )
                 try:
-                    stream.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    stream.put_nowait(event)
+                    stream.put_nowait(error_event)
                 except queue.Full:
-                    logger.warning("Stream queue full for %s, dropping token", request_id)
+                    logger.error(
+                        "Failed to deliver backpressure error event for %s", request_id
+                    )
 
     def _emit_tokens(self, events: list[TokenEvent]) -> None:
         """Deliver token events to streams and result buffers."""

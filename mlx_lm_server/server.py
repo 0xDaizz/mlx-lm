@@ -151,6 +151,67 @@ def _make_completion_id() -> str:
     return f"cmpl-{uuid.uuid4().hex[:12]}"
 
 
+class ValidatedParams:
+    """Holds validated and clamped request parameters."""
+
+    __slots__ = ("temperature", "top_p", "max_tokens", "stop_sequences")
+
+    def __init__(self, temperature: float, top_p: float, max_tokens: int, stop_sequences: list[str]):
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_tokens = max_tokens
+        self.stop_sequences = stop_sequences
+
+
+def _validate_and_prepare_request(
+    body: ChatCompletionRequest | CompletionRequest,
+    config: ServerConfig,
+    prompt_tokens: list[int],
+    shutting_down: bool,
+    model_name: str,
+) -> ValidatedParams:
+    """Validate common request fields and return clamped parameters.
+
+    Raises HTTPException on validation failure.
+    """
+    # 1. Server shutting down
+    if shutting_down:
+        raise HTTPException(status_code=503, detail="Server is shutting down")
+
+    # 2. Model mismatch (skip if client didn't specify a model)
+    if body.model and body.model != model_name:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model mismatch: requested '{body.model}' but server loaded '{model_name}'",
+        )
+
+    # 3. Empty prompt
+    if len(prompt_tokens) == 0:
+        raise HTTPException(status_code=400, detail="Prompt must not be empty")
+
+    # 4. Prompt length
+    if len(prompt_tokens) > config.max_prompt_tokens:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt too long: {len(prompt_tokens)} tokens exceeds maximum of {config.max_prompt_tokens}",
+        )
+
+    # 5-7. Clamp generation parameters
+    temperature = max(0.0, min(2.0, body.temperature))
+    top_p = max(0.0, min(1.0, body.top_p))
+    max_tokens = max(1, body.max_tokens)
+
+    # 8. Normalize stop sequences
+    stop_sequences = _normalize_stop(body.stop)
+
+    return ValidatedParams(
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+        stop_sequences=stop_sequences,
+    )
+
+
 # ---------------------------------------------------------------------------
 # App factory
 # ---------------------------------------------------------------------------
@@ -209,6 +270,7 @@ def create_app(
 
     @app.exception_handler(Exception)
     async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+        logger.exception("Unhandled error on %s %s", request.method, request.url.path)
         return JSONResponse(
             status_code=500,
             content=ErrorResponse(
@@ -260,6 +322,17 @@ def create_app(
                 filtered_events = events[:-1]
         completion_text = "".join(e.token_text for e in filtered_events)
         finish_reason = events[-1].finish_reason if events else "stop"
+
+        # Truncate stop-sequence text from output (the scheduler truncates
+        # seq.output_text, but individual TokenEvent.token_text values still
+        # carry the raw text, so the joined string may contain the stop sequence).
+        if finish_reason == "stop" and inf_req.stop_sequences:
+            for stop_seq in inf_req.stop_sequences:
+                idx = completion_text.find(stop_seq)
+                if idx != -1:
+                    completion_text = completion_text[:idx]
+                    break
+
         completion_tokens = len(filtered_events)
 
         return format_response(
@@ -280,28 +353,19 @@ def create_app(
         prompt_text = _format_chat_messages(body.messages, tok)
         prompt_tokens: list[int] = tok.encode(prompt_text)
         request_id = _make_request_id()
-        stop_seqs = _normalize_stop(body.stop)
 
-        # Validate prompt length
-        cfg = app.state.config
-        if len(prompt_tokens) > cfg.max_prompt_tokens:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Prompt too long: {len(prompt_tokens)} tokens exceeds maximum of {cfg.max_prompt_tokens}",
-            )
-
-        # Clamp generation parameters
-        temperature = max(0.0, min(2.0, body.temperature))
-        top_p = max(0.0, min(1.0, body.top_p))
-        max_tokens = max(1, body.max_tokens)
+        params = _validate_and_prepare_request(
+            body, app.state.config, prompt_tokens,
+            app.state.shutting_down, app.state.model_name,
+        )
 
         inf_req = InferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop_sequences=stop_seqs,
+            max_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_p=params.top_p,
+            stop_sequences=params.stop_sequences,
             stream=body.stream,
         )
 
@@ -310,7 +374,7 @@ def create_app(
                 app.state.scheduler, inf_req, app.state.model_name,
                 request_id, len(prompt_tokens), tok,
                 format_chunk=_format_chat_chunk,
-                request_timeout_s=cfg.request_timeout_s,
+                request_timeout_s=app.state.config.request_timeout_s,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_chat_response)
@@ -327,28 +391,19 @@ def create_app(
 
         prompt_tokens: list[int] = tok.encode(body.prompt)
         request_id = _make_completion_id()
-        stop_seqs = _normalize_stop(body.stop)
 
-        # Validate prompt length
-        cfg = app.state.config
-        if len(prompt_tokens) > cfg.max_prompt_tokens:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Prompt too long: {len(prompt_tokens)} tokens exceeds maximum of {cfg.max_prompt_tokens}",
-            )
-
-        # Clamp generation parameters
-        temperature = max(0.0, min(2.0, body.temperature))
-        top_p = max(0.0, min(1.0, body.top_p))
-        max_tokens = max(1, body.max_tokens)
+        params = _validate_and_prepare_request(
+            body, app.state.config, prompt_tokens,
+            app.state.shutting_down, app.state.model_name,
+        )
 
         inf_req = InferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stop_sequences=stop_seqs,
+            max_tokens=params.max_tokens,
+            temperature=params.temperature,
+            top_p=params.top_p,
+            stop_sequences=params.stop_sequences,
             stream=body.stream,
         )
 
@@ -357,7 +412,7 @@ def create_app(
                 app.state.scheduler, inf_req, app.state.model_name,
                 request_id, len(prompt_tokens), tok,
                 format_chunk=_format_completion_chunk,
-                request_timeout_s=cfg.request_timeout_s,
+                request_timeout_s=app.state.config.request_timeout_s,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_completion_response)

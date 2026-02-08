@@ -6,13 +6,24 @@ import tempfile
 import types
 import unittest
 
-from transformers import AutoTokenizer
+import pytest
 
-from mlx_lm.tuner import datasets
+try:
+    import datasets as _datasets_lib
+
+    HAS_DATASETS = True
+except ImportError:
+    HAS_DATASETS = False
+
+if HAS_DATASETS:
+    from transformers import AutoTokenizer
+
+    from mlx_lm.tuner import datasets
 
 HF_MODEL_PATH = "mlx-community/Qwen1.5-0.5B-Chat-4bit"
 
 
+@pytest.mark.skipif(not HAS_DATASETS, reason="requires datasets package")
 class TestDatasets(unittest.TestCase):
 
     @classmethod

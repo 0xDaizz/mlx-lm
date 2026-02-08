@@ -1085,7 +1085,7 @@ class TestDA_P3_InputValidation:
         resp = await adv_client.post(
             "/v1/chat/completions",
             json={
-                "model": "test",
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "unknown_field": "should be ignored",
                 "another_field": 42,
@@ -1106,7 +1106,7 @@ class TestDA_P3_SSEFormat:
         resp = await adv_client.post(
             "/v1/chat/completions",
             json={
-                "model": "test",
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             },
@@ -1124,7 +1124,7 @@ class TestDA_P3_SSEFormat:
         resp = await adv_client.post(
             "/v1/chat/completions",
             json={
-                "model": "test",
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             },
@@ -1139,7 +1139,7 @@ class TestDA_P3_SSEFormat:
         resp = await adv_client.post(
             "/v1/chat/completions",
             json={
-                "model": "test",
+                "model": "test-model",
                 "messages": [{"role": "user", "content": "Hi"}],
                 "stream": True,
             },
@@ -1162,7 +1162,7 @@ class TestDA_P3_SSEFormat:
         resp = await adv_client.post(
             "/v1/completions",
             json={
-                "model": "test",
+                "model": "test-model",
                 "prompt": "Hello",
                 "stream": True,
             },
@@ -1194,7 +1194,7 @@ class TestDA_P3_Concurrency:
                 adv_client.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "test-model",
                         "messages": [{"role": "user", "content": f"Request {i}"}],
                         "max_tokens": 10,
                     },
@@ -1217,7 +1217,7 @@ class TestDA_P3_Concurrency:
                 adv_client.post(
                     "/v1/chat/completions",
                     json={
-                        "model": "test",
+                        "model": "test-model",
                         "messages": [{"role": "user", "content": f"Request {i}"}],
                         "stream": i % 2 == 0,
                     },

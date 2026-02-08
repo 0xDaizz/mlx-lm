@@ -363,8 +363,19 @@ class KVCacheManager:
                     continue
                 block.ref_count -= 1
                 if block.ref_count == 0:
-                    heapq.heappush(self._eviction_heap, (block.last_accessed, block_id))
-                    self._heap_pushes += 1
+                    if block.block_hash is None:
+                        # Collision blocks have no cache value (not in hash_table),
+                        # so return them directly to the free pool instead of
+                        # pushing to the eviction heap where they'd be stuck forever
+                        # (_evict_lru_locked skips block_hash=None entries).
+                        self.pool.return_block(block_id)
+                        logger.debug(
+                            "Returned collision block %d directly to free pool",
+                            block_id,
+                        )
+                    else:
+                        heapq.heappush(self._eviction_heap, (block.last_accessed, block_id))
+                        self._heap_pushes += 1
                 logger.debug(
                     "Freed block %d (ref_count now %d)", block_id, block.ref_count
                 )
@@ -486,15 +497,50 @@ class KVCacheManager:
             try:
                 block = self.pool.get_free_block()
             except BlockPoolExhaustedError:
-                # Try eviction before giving up
                 if tiered_cache is not None:
-                    tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=exclude_ids)
+                    # Two-phase eviction: release lock before calling
+                    # evict_to_ssd(), which acquires self.ram.lock (same
+                    # object). Python's threading.Lock is NOT reentrant,
+                    # so holding it here would deadlock.
+                    pass  # fall through to two-phase eviction below
                 else:
                     self._evict_lru_locked(num_blocks=1, exclude_ids=exclude_ids)
-                try:
-                    block = self.pool.get_free_block()
-                except BlockPoolExhaustedError:
-                    return None
+                    try:
+                        block = self.pool.get_free_block()
+                    except BlockPoolExhaustedError:
+                        return None
+                    # Successfully allocated after RAM-only eviction
+                    block.block_hash = block_hash
+                    block.token_ids = list(token_ids)
+                    block.ref_count = 1
+                    block.last_accessed = time.time()
+                    block.kv_data = list(kv_data)
+                    self.hash_table[block_hash] = block.block_id
+                    return block.block_id
+            else:
+                # Successfully allocated on first try (no eviction needed)
+                block.block_hash = block_hash
+                block.token_ids = list(token_ids)
+                block.ref_count = 1
+                block.last_accessed = time.time()
+                block.kv_data = list(kv_data)
+                self.hash_table[block_hash] = block.block_id
+                return block.block_id
+
+        # --- Two-phase eviction (tiered_cache path) ---
+        # Lock has been released. evict_to_ssd() will acquire it internally.
+        tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=exclude_ids)
+
+        # Re-acquire lock and retry allocation
+        with self.lock:
+            # Another thread may have cached this block while we released the lock
+            if block_hash in self.hash_table:
+                return None  # Another thread beat us — no-op
+
+            try:
+                block = self.pool.get_free_block()
+            except BlockPoolExhaustedError:
+                return None
 
             block.block_hash = block_hash
             block.token_ids = list(token_ids)

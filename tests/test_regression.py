@@ -258,7 +258,12 @@ class TestHNEW6BoundedStreamQueue:
         )
 
     def test_emit_to_full_queue_does_not_crash(self):
-        """Emitting tokens to a full stream queue drops oldest, doesn't crash."""
+        """Emitting tokens to a full stream queue signals error + cancel, doesn't crash.
+
+        Bug 4 / Issue 6 fix: instead of silently dropping tokens (which causes
+        data corruption), the scheduler drains the queue, puts an error finish
+        event, and cancels the request.
+        """
         config = ServerConfig(max_batch_size=4)
         sched = Scheduler(config=config, model=None, tokenizer=None)
 
@@ -276,8 +281,6 @@ class TestHNEW6BoundedStreamQueue:
         assert q.full(), "Queue should be full for this test"
 
         # Now emit a token via the scheduler's internal method.
-        # Without the fix (unbounded queue), this was never an issue.
-        # With bounded queue, _emit_tokens must handle queue.Full gracefully.
         event = TokenEvent(
             request_id="full-queue-test",
             token_id=999,
@@ -287,16 +290,23 @@ class TestHNEW6BoundedStreamQueue:
         # This should not raise
         sched._emit_tokens([event])
 
-        # The new token should be in the queue (oldest was dropped)
-        found = False
+        # The queue should have been drained and an error finish event added
         items = []
         while not q.empty():
             item = q.get_nowait()
             items.append(item)
-            if item.token_id == 999:
-                found = True
 
-        assert found, "New token should have been added after dropping oldest"
+        # Should contain exactly the error finish event (queue was drained)
+        error_events = [e for e in items if e.finish_reason == "error"]
+        assert len(error_events) >= 1, (
+            "An error finish event should be delivered when backpressure overflow occurs"
+        )
+
+        # The request should have been added to the cancelled set
+        with sched._cancelled_lock:
+            assert "full-queue-test" in sched._cancelled, (
+                "Request should be cancelled on backpressure overflow"
+            )
 
     def test_finish_event_on_full_queue(self):
         """_signal_finish on a full queue still delivers the finish event."""
@@ -1190,3 +1200,723 @@ class TestD2BatchErrorRecovery:
             )
         finally:
             sched.stop()
+
+
+# ---------------------------------------------------------------------------
+# F08: Deadlock in two-phase eviction (cache_block + TieredKVCache)
+# ---------------------------------------------------------------------------
+
+
+class TestF08_DeadlockTwoPhaseEviction:
+    """Regression: F08 — cache_block() with tiered_cache must NOT deadlock.
+
+    Without the fix, cache_block() held self.lock and then called
+    tiered_cache.evict_to_ssd(), which also tried to acquire self.ram.lock
+    (the same lock). Python's threading.Lock is non-reentrant, so this
+    caused a deadlock.
+
+    The fix uses two-phase eviction: release the lock before calling
+    evict_to_ssd(), then re-acquire it to complete the allocation.
+    """
+
+    def test_cache_block_with_tiered_cache_completes(self):
+        """cache_block() with a TieredKVCache must complete without deadlock."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+
+        config = ServerConfig(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+
+        # Create a mock SSD cache that accepts save_block calls
+        class _MockSSD:
+            def save_block(self, block_hash, kv_data):
+                pass
+
+            def load_block(self, block_hash):
+                return None
+
+        tiered = TieredKVCache(ram=mgr, ssd=_MockSSD())
+
+        # Exhaust the pool by allocating all blocks
+        for i in range(config.num_blocks):
+            block = mgr.pool.get_free_block()
+            block.block_hash = f"existing-{i}"
+            block.token_ids = [i] * config.block_size
+            block.ref_count = 0  # Evictable
+            block.last_accessed = 0.0
+            block.kv_data = [{"keys": "mock", "values": "mock"}]
+            mgr.hash_table[block.block_hash] = block.block_id
+
+        assert mgr.pool.num_free == 0, "Pool should be exhausted"
+
+        # This call would deadlock before the fix (timeout detects it)
+        result = [None]
+        error = [None]
+
+        def _do_cache():
+            try:
+                result[0] = mgr.cache_block(
+                    block_hash="new-block-hash",
+                    token_ids=[100, 101, 102, 103],
+                    kv_data=[{"keys": "new", "values": "new"}],
+                    tiered_cache=tiered,
+                )
+            except Exception as e:
+                error[0] = e
+
+        t = threading.Thread(target=_do_cache)
+        t.start()
+        t.join(timeout=5.0)
+
+        assert not t.is_alive(), (
+            "cache_block() with tiered_cache deadlocked (thread still alive after 5s)"
+        )
+        assert error[0] is None, f"cache_block() raised: {error[0]}"
+        # Either successfully cached (got a block_id) or returned None
+        # (eviction freed a block and we allocated it)
+
+    def test_two_phase_eviction_result_is_valid(self):
+        """Two-phase eviction should produce a valid cached block."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+
+        config = ServerConfig(block_size=4, num_blocks=2)
+        mgr = KVCacheManager(config)
+
+        ssd_saved = {}
+
+        class _RecordingSSD:
+            def save_block(self, block_hash, kv_data):
+                ssd_saved[block_hash] = kv_data
+
+            def load_block(self, block_hash):
+                return ssd_saved.get(block_hash)
+
+        tiered = TieredKVCache(ram=mgr, ssd=_RecordingSSD())
+
+        # Fill both blocks as evictable
+        for i in range(2):
+            block = mgr.pool.get_free_block()
+            block.block_hash = f"old-{i}"
+            block.token_ids = [i] * config.block_size
+            block.ref_count = 0
+            block.last_accessed = 0.0
+            block.kv_data = [{"keys": "old", "values": "old"}]
+            mgr.hash_table[block.block_hash] = block.block_id
+
+        block_id = mgr.cache_block(
+            block_hash="fresh-hash",
+            token_ids=[10, 11, 12, 13],
+            kv_data=[{"keys": "fresh", "values": "fresh"}],
+            tiered_cache=tiered,
+        )
+
+        assert block_id is not None, "cache_block should return a block_id after two-phase eviction"
+        assert "fresh-hash" in mgr.hash_table, "New block should be in hash_table"
+        block = mgr.pool.blocks[block_id]
+        assert block.token_ids == [10, 11, 12, 13]
+        assert block.ref_count == 1
+        # The evicted block should have been saved to SSD
+        assert len(ssd_saved) >= 1, "At least one block should have been saved to SSD"
+
+
+# ---------------------------------------------------------------------------
+# F07: Collision blocks (block_hash=None) stuck in eviction heap
+# ---------------------------------------------------------------------------
+
+
+class TestF07_CollisionBlockFreed:
+    """Regression: F07 — collision blocks must be returned to free pool.
+
+    Without the fix, blocks with block_hash=None (created during hash
+    collisions) were pushed to the eviction heap when freed. But
+    _evict_lru_locked() skips block_hash=None entries, so these blocks
+    were stuck forever — neither in the free pool nor evictable.
+
+    The fix returns collision blocks directly to the free pool in
+    free_blocks() when ref_count reaches 0, bypassing the eviction heap.
+    """
+
+    def test_collision_block_returned_to_free_pool(self):
+        """Freeing a collision block (block_hash=None) returns it to the free pool."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager
+
+        config = ServerConfig(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+
+        # Allocate a block and simulate a collision (block_hash=None)
+        block = mgr.pool.get_free_block()
+        block.block_hash = None  # Collision block
+        block.token_ids = [1, 2, 3, 4]
+        block.ref_count = 1
+        block.last_accessed = 0.0
+
+        free_before = mgr.pool.num_free
+
+        # Free the collision block
+        mgr.free_blocks([block.block_id])
+
+        free_after = mgr.pool.num_free
+
+        assert free_after == free_before + 1, (
+            f"Collision block should be returned to free pool. "
+            f"Free before: {free_before}, after: {free_after}"
+        )
+
+        # Verify the block was fully reset
+        assert block.block_hash is None  # return_block sets it to None
+        assert block.ref_count == 0
+        assert block.token_ids == []
+
+    def test_collision_block_can_be_reallocated(self):
+        """A freed collision block can be re-allocated for new use."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager
+
+        config = ServerConfig(block_size=4, num_blocks=2)
+        mgr = KVCacheManager(config)
+
+        # Allocate both blocks
+        b1 = mgr.pool.get_free_block()
+        b2 = mgr.pool.get_free_block()
+        b1.block_hash = None  # Collision block
+        b1.ref_count = 1
+        b2.block_hash = "normal-hash"
+        b2.ref_count = 1
+        mgr.hash_table["normal-hash"] = b2.block_id
+
+        assert mgr.pool.num_free == 0, "Pool should be empty"
+
+        # Free the collision block
+        mgr.free_blocks([b1.block_id])
+
+        assert mgr.pool.num_free == 1, "One block should be free now"
+
+        # Allocate again — should succeed
+        b3 = mgr.pool.get_free_block()
+        assert b3.block_id == b1.block_id, (
+            "Re-allocated block should be the freed collision block"
+        )
+
+    def test_normal_block_not_returned_directly(self):
+        """Normal blocks (with block_hash) go to eviction heap, not directly freed."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager
+
+        config = ServerConfig(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+
+        block = mgr.pool.get_free_block()
+        block.block_hash = "some-hash"
+        block.token_ids = [1, 2, 3, 4]
+        block.ref_count = 1
+        block.last_accessed = 1.0
+        mgr.hash_table["some-hash"] = block.block_id
+
+        free_before = mgr.pool.num_free
+
+        # Free the normal block
+        mgr.free_blocks([block.block_id])
+
+        # Normal block stays in hash_table (for potential reuse) and goes to
+        # eviction heap — it should NOT be in the free pool yet
+        assert mgr.pool.num_free == free_before, (
+            "Normal block should NOT be returned directly to free pool"
+        )
+        assert "some-hash" in mgr.hash_table, (
+            "Normal block should remain in hash_table for cache reuse"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F09: Stuck sequence on insert() failure
+# ---------------------------------------------------------------------------
+
+
+class TestF09_StuckSequenceOnInsertFailure:
+    """Regression: F09 — failed insert() must not leave a stuck sequence.
+
+    Without the fix, _insert_new_requests_batch() added the sequence to
+    _active_sequences BEFORE calling BatchGenerator.insert(). If insert()
+    raised, the sequence was left in _active_sequences with no UID, so it
+    could never be cleaned up and permanently consumed a batch slot.
+
+    The fix moves the _active_sequences registration AFTER a successful
+    insert(), and the outer try/except pops the sequence from active set
+    if it was partially added.
+    """
+
+    def test_insert_failure_cleans_active_sequences(self):
+        """A failed insert() must not leave a sequence in _active_sequences."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=5
+        )
+        mock_bg._should_fail_next_insert = True
+
+        sched.run_inference_loop()
+        try:
+            req = InferenceRequest(
+                request_id="insert-fail-stuck",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=5,
+            )
+            sched.submit_request(req)
+
+            # The request should finish with error
+            events = sched.get_result("insert-fail-stuck", timeout=5.0)
+            assert events[-1].finish_reason == "error"
+
+            # Give cleanup time
+            time.sleep(0.3)
+
+            # Critical check: _active_sequences must be empty
+            with sched._active_lock:
+                assert "insert-fail-stuck" not in sched._active_sequences, (
+                    "Failed insert should not leave a sequence in _active_sequences"
+                )
+                assert len(sched._active_sequences) == 0, (
+                    f"Expected 0 active sequences, got {len(sched._active_sequences)}"
+                )
+        finally:
+            sched.stop()
+
+    def test_subsequent_request_uses_freed_slot(self):
+        """After a failed insert, the batch slot must be available for the next request."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=1, default_max_tokens=2
+        )
+        mock_bg._should_fail_next_insert = True
+
+        sched.run_inference_loop()
+        try:
+            # First request fails
+            req1 = InferenceRequest(
+                request_id="slot-fail",
+                prompt_tokens=[1, 2],
+                max_tokens=2,
+            )
+            sched.submit_request(req1)
+            events1 = sched.get_result("slot-fail", timeout=5.0)
+            assert events1[-1].finish_reason == "error"
+
+            # Give cleanup time
+            time.sleep(0.3)
+
+            # Second request should succeed (batch slot is free)
+            req2 = InferenceRequest(
+                request_id="slot-ok",
+                prompt_tokens=[3, 4],
+                max_tokens=2,
+            )
+            sched.submit_request(req2)
+            events2 = sched.get_result("slot-ok", timeout=5.0)
+            assert len(events2) == 2
+            assert events2[-1].finish_reason == "length"
+        finally:
+            sched.stop()
+
+
+# ---------------------------------------------------------------------------
+# F11: Backpressure signals error instead of silently dropping
+# ---------------------------------------------------------------------------
+
+
+class TestF11_BackpressureSignalsError:
+    """Regression: F11 — stream backpressure overflow must signal error.
+
+    Without the fix, when a stream queue was full, tokens were silently
+    dropped via a simple try/except around put_nowait(). This caused
+    silent data corruption — the client received incomplete output with
+    missing tokens and no indication of the problem.
+
+    The fix drains the queue, puts an error finish event, and adds the
+    request to the _cancelled set so the scheduler stops generating.
+    """
+
+    def test_backpressure_overflow_signals_error(self):
+        """Overflow on a full stream queue must deliver an error finish event."""
+        config = ServerConfig(max_batch_size=4)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        q = sched.register_stream("bp-overflow-test")
+
+        # Fill the queue to capacity
+        for i in range(q.maxsize):
+            q.put(TokenEvent(
+                request_id="bp-overflow-test",
+                token_id=i,
+                token_text=f"t{i}",
+                finish_reason=None,
+            ))
+        assert q.full(), "Queue must be full before testing overflow"
+
+        # Emit a token to a full queue
+        event = TokenEvent(
+            request_id="bp-overflow-test",
+            token_id=999,
+            token_text="overflow",
+            finish_reason=None,
+        )
+        sched._emit_tokens([event])
+
+        # Drain the queue and check for error
+        items = []
+        while not q.empty():
+            items.append(q.get_nowait())
+
+        error_events = [e for e in items if e.finish_reason == "error"]
+        assert len(error_events) >= 1, (
+            "An error finish event must be delivered on backpressure overflow. "
+            f"Got events: {[(e.token_id, e.finish_reason) for e in items]}"
+        )
+
+    def test_backpressure_overflow_cancels_request(self):
+        """Overflow must add request_id to _cancelled set."""
+        config = ServerConfig(max_batch_size=4)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        q = sched.register_stream("bp-cancel-test")
+
+        # Fill the queue
+        for i in range(q.maxsize):
+            q.put(TokenEvent(
+                request_id="bp-cancel-test",
+                token_id=i,
+                token_text=f"t{i}",
+                finish_reason=None,
+            ))
+
+        # Trigger overflow
+        event = TokenEvent(
+            request_id="bp-cancel-test",
+            token_id=999,
+            token_text="overflow",
+            finish_reason=None,
+        )
+        sched._emit_tokens([event])
+
+        with sched._cancelled_lock:
+            assert "bp-cancel-test" in sched._cancelled, (
+                "Request must be added to _cancelled on backpressure overflow"
+            )
+
+    def test_backpressure_overflow_does_not_crash(self):
+        """Overflow must not raise an exception."""
+        config = ServerConfig(max_batch_size=4)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        q = sched.register_stream("bp-nocrash-test")
+
+        # Fill the queue
+        for i in range(q.maxsize):
+            q.put(TokenEvent(
+                request_id="bp-nocrash-test",
+                token_id=i,
+                token_text=f"t{i}",
+                finish_reason=None,
+            ))
+
+        # Should NOT raise
+        event = TokenEvent(
+            request_id="bp-nocrash-test",
+            token_id=999,
+            token_text="overflow",
+            finish_reason=None,
+        )
+        sched._emit_tokens([event])  # No assertion needed — just must not raise
+
+
+# ---------------------------------------------------------------------------
+# F03: Model mismatch rejected with 400
+# ---------------------------------------------------------------------------
+
+
+class TestF03_ModelMismatchRejected:
+    """Regression: F03 — wrong model name must return 400, not silently proceed.
+
+    Without the fix, the server accepted any model name in the request body
+    and silently ran inference with the loaded model. This violated the
+    OpenAI API contract where a model mismatch should be an error.
+
+    The fix validates body.model against the loaded model name in
+    _validate_and_prepare_request() and raises HTTPException(400).
+    """
+
+    @pytest.mark.anyio
+    async def test_wrong_model_returns_400_chat(self):
+        """Chat with wrong model name returns 400."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _TimeoutMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "wrong-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 400, (
+            f"Expected 400 for model mismatch, got {resp.status_code}"
+        )
+        body = resp.json()
+        assert "error" in body
+        assert "mismatch" in body["error"]["message"].lower() or "wrong-model" in body["error"]["message"]
+
+    @pytest.mark.anyio
+    async def test_wrong_model_returns_400_completion(self):
+        """Completion with wrong model name returns 400."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _TimeoutMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/completions",
+                json={
+                    "model": "wrong-model",
+                    "prompt": "Hello world",
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "error" in body
+
+    @pytest.mark.anyio
+    async def test_empty_model_accepted(self):
+        """Empty model string (default) should be accepted — no mismatch."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _EOSStreamMockScheduler()  # Returns valid tokens
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 200, (
+            f"Empty model should be accepted, got {resp.status_code}: {resp.text}"
+        )
+
+    @pytest.mark.anyio
+    async def test_correct_model_accepted(self):
+        """Correct model name should be accepted."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _EOSStreamMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# F13: Shutdown gate — requests rejected with 503 when shutting down
+# ---------------------------------------------------------------------------
+
+
+class TestF13_ShutdownGate:
+    """Regression: F13 — requests must be rejected with 503 during shutdown.
+
+    Without the fix, the server continued accepting requests during
+    shutdown, leading to incomplete responses and resource contention.
+
+    The fix checks app.state.shutting_down in _validate_and_prepare_request()
+    and raises HTTPException(503) before any work is done.
+    """
+
+    @pytest.mark.anyio
+    async def test_chat_rejected_during_shutdown(self):
+        """Chat request returns 503 when server is shutting down."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _TimeoutMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        # Simulate shutdown state
+        app.state.shutting_down = True
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 503, (
+            f"Expected 503 during shutdown, got {resp.status_code}"
+        )
+        body = resp.json()
+        assert "error" in body
+        assert "shutting down" in body["error"]["message"].lower()
+
+    @pytest.mark.anyio
+    async def test_completion_rejected_during_shutdown(self):
+        """Completion request returns 503 when server is shutting down."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _TimeoutMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        app.state.shutting_down = True
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": "Once upon a time",
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 503
+
+    @pytest.mark.anyio
+    async def test_requests_accepted_before_shutdown(self):
+        """Requests should work normally when NOT shutting down."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _EOSStreamMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        assert app.state.shutting_down is False
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 200, (
+            f"Request should succeed before shutdown, got {resp.status_code}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# F16: Empty prompt rejected with 400
+# ---------------------------------------------------------------------------
+
+
+class TestF16_EmptyPromptRejected:
+    """Regression: F16 — empty prompts must return 400, not crash.
+
+    Without the fix, an empty messages list or empty prompt string would
+    produce an empty prompt_tokens list, which would cause downstream
+    errors (e.g., IndexError in token processing, or zero-length tensors).
+
+    The fix checks len(prompt_tokens) == 0 in _validate_and_prepare_request()
+    and raises HTTPException(400) with a descriptive message.
+    """
+
+    @pytest.mark.anyio
+    async def test_empty_messages_returns_400(self):
+        """Chat with empty messages list returns 400 when template yields empty tokens.
+
+        With a tokenizer whose apply_chat_template returns "" for empty messages,
+        the resulting prompt_tokens is [], which triggers the empty-prompt check.
+        """
+        config = ServerConfig(model="test-model")
+        mock_sched = _TimeoutMockScheduler()
+        tok = _MockTokenizerForServer()
+        # Override apply_chat_template to return "" for empty messages
+        tok.apply_chat_template = lambda messages, tokenize=False, add_generation_prompt=True: (
+            "" if not messages else "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
+        )
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 400, (
+            f"Expected 400 for empty messages, got {resp.status_code}"
+        )
+        body = resp.json()
+        assert "error" in body
+        assert "empty" in body["error"]["message"].lower() or "prompt" in body["error"]["message"].lower()
+
+    @pytest.mark.anyio
+    async def test_empty_prompt_string_returns_400(self):
+        """Completion with empty prompt string returns 400."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _TimeoutMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": "",
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 400, (
+            f"Expected 400 for empty prompt, got {resp.status_code}"
+        )
+        body = resp.json()
+        assert "error" in body
+
+    @pytest.mark.anyio
+    async def test_nonempty_prompt_accepted(self):
+        """Non-empty prompts should be accepted normally."""
+        config = ServerConfig(model="test-model")
+        mock_sched = _EOSStreamMockScheduler()
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": "Hello world",
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 200
