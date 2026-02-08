@@ -48,12 +48,9 @@ def _clone_cache_list(cache_list: list) -> list:
         # Plain KVCache fast path: has keys/values/offset, no group_size
         if (hasattr(obj, 'keys') and hasattr(obj, 'values')
                 and hasattr(obj, 'offset') and not hasattr(obj, 'group_size')):
-            new_obj = type(obj).__new__(type(obj))
+            new_obj = copy.copy(obj)
             new_obj.keys = obj.keys[:, :, :obj.offset, :]
             new_obj.values = obj.values[:, :, :obj.offset, :]
-            new_obj.offset = obj.offset
-            if hasattr(obj, 'step'):
-                new_obj.step = obj.step
             cloned.append(new_obj)
         else:
             # QuantizedKVCache, CacheList, dict, etc. — deepcopy fallback

@@ -2458,3 +2458,157 @@ class TestR1_ConcurrentSSDOps:
         assert target_block.ref_count == 1, (
             f"Target block ref_count should be 1, got {target_block.ref_count}"
         )
+
+
+# ---------------------------------------------------------------------------
+# R36: _clone_cache_list preserves all attributes (copy.copy vs __new__)
+# ---------------------------------------------------------------------------
+
+
+class TestR36_ClonePreservesAllAttributes:
+    """Regression: R36 — _clone_cache_list must preserve ALL object attributes.
+
+    The old implementation used ``type(obj).__new__(type(obj))`` and manually
+    copied only keys/values/offset/step.  Any additional attributes added to
+    KVCache (upstream or locally) were silently dropped, leading to subtle
+    corruption when the clone was later used.
+
+    The fix uses ``copy.copy(obj)`` which shallow-copies the entire ``__dict__``
+    (plus class-level defaults), then overwrites keys/values with sliced arrays.
+    """
+
+    def test_clone_preserves_extra_attributes(self):
+        """Extra attributes beyond keys/values/offset must survive cloning."""
+        import mlx.core as mx
+        from mlx_lm_server.sequence_cache import _clone_cache_list
+
+        class MockKVCache:
+            step = 256
+
+            def __init__(self):
+                self.keys = mx.ones((1, 4, 8, 16))
+                self.values = mx.zeros((1, 4, 8, 16))
+                self.offset = 8
+                # Extra attributes the old __new__() approach would lose
+                self._custom_flag = True
+                self.metadata = "test"
+
+        cache = MockKVCache()
+        cloned = _clone_cache_list([cache])
+
+        assert len(cloned) == 1
+        clone = cloned[0]
+
+        # Core attributes preserved
+        assert clone.offset == 8
+        assert clone.step == 256
+
+        # Extra attributes that old code would have dropped
+        assert hasattr(clone, "_custom_flag"), (
+            "_custom_flag missing on clone — copy.copy not used?"
+        )
+        assert clone._custom_flag is True
+        assert hasattr(clone, "metadata"), (
+            "metadata missing on clone — copy.copy not used?"
+        )
+        assert clone.metadata == "test"
+
+        # Keys/values must be independent (sliced copies, not shared refs)
+        assert clone.keys is not cache.keys, "keys should be a new array"
+        assert clone.values is not cache.values, "values should be a new array"
+
+        # Shape must match (sliced to offset=8, which is the full extent here)
+        assert clone.keys.shape == (1, 4, 8, 16)
+        assert clone.values.shape == (1, 4, 8, 16)
+
+    def test_clone_with_real_kvcache_class(self):
+        """Clone of a real KVCache preserves all attributes including step."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import KVCache
+        from mlx_lm_server.sequence_cache import _clone_cache_list
+
+        cache = KVCache()
+        # Populate keys/values/offset by calling update_and_fetch
+        k = mx.ones((1, 4, 5, 16))
+        v = mx.zeros((1, 4, 5, 16))
+        cache.update_and_fetch(k, v)
+        assert cache.offset == 5
+
+        # Record all attributes before cloning
+        original_attrs = set(vars(cache).keys())
+
+        cloned = _clone_cache_list([cache])
+        assert len(cloned) == 1
+        clone = cloned[0]
+
+        # Every instance attribute on the original must exist on the clone
+        clone_attrs = set(vars(clone).keys())
+        missing = original_attrs - clone_attrs
+        assert not missing, (
+            f"Clone is missing attributes present on original: {missing}"
+        )
+
+        # step is a class attribute — must be preserved
+        assert clone.step == cache.step, (
+            f"step mismatch: original={cache.step}, clone={clone.step}"
+        )
+
+        # offset preserved
+        assert clone.offset == 5
+
+        # Keys/values are independent arrays
+        assert clone.keys is not cache.keys
+        assert clone.values is not cache.values
+
+        # Sliced to offset=5
+        assert clone.keys.shape[2] == 5
+        assert clone.values.shape[2] == 5
+
+    def test_clone_copy_vs_new_attribute_completeness(self):
+        """All attributes (5+ beyond keys/values/offset) are preserved by clone."""
+        import mlx.core as mx
+        from mlx_lm_server.sequence_cache import _clone_cache_list
+
+        class RichMockKVCache:
+            step = 128
+
+            def __init__(self):
+                self.keys = mx.ones((1, 2, 4, 8))
+                self.values = mx.zeros((1, 2, 4, 8))
+                self.offset = 4
+                # 5+ extra attributes
+                self.layer_idx = 7
+                self.head_dim = 64
+                self._is_prefill = False
+                self.rope_theta = 10000.0
+                self.sliding_window = 4096
+                self.attention_mask_type = "causal"
+
+        cache = RichMockKVCache()
+        original_attr_names = set(vars(cache).keys())
+        assert len(original_attr_names) >= 8, (
+            f"Expected 8+ instance attrs, got {len(original_attr_names)}"
+        )
+
+        cloned = _clone_cache_list([cache])
+        clone = cloned[0]
+        clone_attr_names = set(vars(clone).keys())
+
+        # Attribute sets must be identical
+        assert original_attr_names == clone_attr_names, (
+            f"Attribute mismatch.\n"
+            f"  Missing on clone: {original_attr_names - clone_attr_names}\n"
+            f"  Extra on clone:   {clone_attr_names - original_attr_names}"
+        )
+
+        # Verify each extra attribute value
+        assert clone.layer_idx == 7
+        assert clone.head_dim == 64
+        assert clone._is_prefill is False
+        assert clone.rope_theta == 10000.0
+        assert clone.sliding_window == 4096
+        assert clone.attention_mask_type == "causal"
+
+        # Keys/values still independent
+        assert clone.keys is not cache.keys
+        assert clone.values is not cache.values
