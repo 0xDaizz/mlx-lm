@@ -1,0 +1,6 @@
+mlx-lm-server Comprehensive Benchmark
+Model: /Users/hw/mlx-lm/Qwen3-4B-4bit
+Part:  all
+Date:  2026-02-08 14:17:34
+============================================================
+

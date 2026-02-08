@@ -240,7 +240,10 @@ def create_app(
         tok = app.state.tokenizer
         timeout = app.state.config.request_timeout_s
 
-        sched.submit_request(inf_req)
+        try:
+            sched.submit_request(inf_req)
+        except RuntimeError as e:
+            raise HTTPException(status_code=429, detail=str(e))
         events = await asyncio.get_running_loop().run_in_executor(
             None, lambda: sched.get_result(request_id, timeout=timeout)
         )
@@ -500,7 +503,12 @@ def _stream_response(
     """
     async def event_generator() -> AsyncIterator[str]:
         token_queue = scheduler.register_stream(inf_req.request_id)
-        scheduler.submit_request(inf_req)
+        try:
+            scheduler.submit_request(inf_req)
+        except RuntimeError as e:
+            error_data = {"error": {"message": str(e), "type": "rate_limit_error"}}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            return
 
         loop = asyncio.get_running_loop()
 

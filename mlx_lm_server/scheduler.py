@@ -656,14 +656,15 @@ class Scheduler:
                                 req.request_id, e,
                             )
                             cache = None
+                            remaining_tokens = seq.token_ids
 
                 # Sequence-level cache lookup (fallback)
                 if cache is None and self._sequence_cache is not None:
                     cached, remaining = self._sequence_cache.find_longest_prefix(seq.token_ids)
                     if cached is not None:
                         cache = cached
-                        remaining_tokens = remaining if remaining else seq.token_ids
-                        num_seq_cached = len(seq.token_ids) - len(remaining) if remaining else len(seq.token_ids)
+                        remaining_tokens = remaining
+                        num_seq_cached = len(seq.token_ids) - len(remaining)
                         self._stats["cache_hits_sequence"] += 1
                         self._stats["total_cached_tokens"] += num_seq_cached
                         logger.debug(
