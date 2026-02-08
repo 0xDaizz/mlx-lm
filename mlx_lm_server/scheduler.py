@@ -644,6 +644,7 @@ class Scheduler:
                             kv_data=bd['kv_data_per_layer'],
                             tiered_cache=self._tiered_cache,
                             exclude_ids=protected_ids,
+                            ssd_policy=self.config.ssd_policy,
                         )
                         if block_id is not None:
                             protected_ids.add(block_id)

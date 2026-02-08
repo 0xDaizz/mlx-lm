@@ -433,7 +433,11 @@ class TestSSDWriterThread:
             writer.stop()
 
     def test_persistent_retry_on_failure(self, tmp_path):
-        """Persistent mode should retry on save failure."""
+        """Persistent mode should retry on save failure (return-value based).
+
+        save_block() swallows I/O errors and returns "error". The writer
+        _run() loop detects the "error" return and retries in persistent mode.
+        """
         from mlx_lm_server.ssd_writer import SSDWriterThread
         ssd = self._make_cache(tmp_path)
         writer = SSDWriterThread(ssd, queue_size=16, durability="persistent", max_retries=3)
@@ -443,7 +447,7 @@ class TestSSDWriterThread:
         def failing_save(*args, **kwargs):
             fail_count[0] += 1
             if fail_count[0] <= 2:
-                raise IOError("Simulated disk error")
+                return "error"  # Simulates save_block() returning "error" on I/O failure
             return original_save(*args, **kwargs)
 
         ssd.save_block = failing_save
@@ -452,6 +456,7 @@ class TestSSDWriterThread:
             time.sleep(1)
             stats = writer.get_stats()
             assert stats["writer_retry_attempts"] >= 1
+            assert stats["writer_save_success"] >= 1  # Should succeed after retries
         finally:
             ssd.save_block = original_save
             writer.stop()

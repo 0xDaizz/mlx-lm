@@ -89,29 +89,30 @@ class SSDWriterThread:
                 if result == "saved":
                     self._inc("writer_save_success")
                 elif result == "error":
-                    self._inc("writer_save_fail")
-                # "dedup" and "collision" are not failures
-            except Exception:
-                # Persistent mode: retry
-                if self._durability == "persistent":
-                    saved = False
-                    for attempt in range(1, self._max_retries + 1):
-                        self._inc("writer_retry_attempts")
-                        try:
-                            result = self._ssd.save_block(block_hash, kv_data, num_tokens)
-                            if result == "saved":
+                    # save_block() swallows I/O exceptions and returns "error".
+                    # Persistent mode: retry up to max_retries times.
+                    if self._durability == "persistent":
+                        saved = False
+                        for _attempt in range(1, self._max_retries + 1):
+                            self._inc("writer_retry_attempts")
+                            retry_result = self._ssd.save_block(block_hash, kv_data, num_tokens)
+                            if retry_result == "saved":
                                 self._inc("writer_save_success")
                                 saved = True
                                 break
-                        except Exception:
-                            continue
-                    if not saved:
-                        self._inc("writer_retry_final_fail")
+                        if not saved:
+                            self._inc("writer_retry_final_fail")
+                            self._inc("writer_save_fail")
+                            logger.error("SSD writer persistent retry exhausted: %s", block_hash)
+                    else:
                         self._inc("writer_save_fail")
-                        logger.exception("SSD writer persistent retry exhausted: %s", block_hash)
-                else:
-                    self._inc("writer_save_fail")
-                    logger.exception("SSD writer error: %s", block_hash)
+                        logger.error("SSD writer save failed: %s", block_hash)
+                # "dedup" and "collision" are not failures — no action needed
+            except Exception:
+                # Unexpected exception (not normally reached since save_block
+                # catches I/O errors, but defensive against unforeseen cases)
+                self._inc("writer_save_fail")
+                logger.exception("SSD writer unexpected error: %s", block_hash)
             finally:
                 with self._pending_lock:
                     self._pending.discard(block_hash)
@@ -152,8 +153,12 @@ class SSDWriterThread:
                 self._pending.discard(block_hash)
             self._inc("writer_queue_full_sync_fallback")
             try:
-                self._ssd.save_block(block_hash, kv_data, num_tokens)
-                self._inc("writer_save_success")
+                result = self._ssd.save_block(block_hash, kv_data, num_tokens)
+                if result == "saved":
+                    self._inc("writer_save_success")
+                elif result == "error":
+                    self._inc("writer_save_fail")
+                # "dedup" and "collision" are not counted as failures
             except Exception:
                 self._inc("writer_save_fail")
             return True

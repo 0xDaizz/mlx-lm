@@ -20,6 +20,7 @@ def main() -> None:
     ssd_cache = None
     tiered_cache = None
 
+    ssd_writer = None
     try:
         from mlx_lm_server.kv_cache_manager import (
             KVCacheManager, TieredKVCache, compute_model_fingerprint,
@@ -37,7 +38,16 @@ def main() -> None:
             ssd_for_manager = ssd_cache
         kv_cache_manager = KVCacheManager(config, ssd=ssd_for_manager)
         if config.ssd_enabled:
-            tiered_cache = TieredKVCache(kv_cache_manager, ssd_cache)
+            # Create async writer if write-through is enabled
+            if config.ssd_policy == "write_through" and config.ssd_async_writes:
+                from mlx_lm_server.ssd_writer import SSDWriterThread
+                ssd_writer = SSDWriterThread(
+                    ssd=ssd_cache,
+                    queue_size=config.ssd_writer_queue_size,
+                    durability=config.ssd_durability,
+                    max_retries=config.ssd_persistent_max_retries,
+                )
+            tiered_cache = TieredKVCache(kv_cache_manager, ssd_cache, writer=ssd_writer)
     except ImportError:
         pass
 
@@ -51,6 +61,8 @@ def main() -> None:
         kv_cache_manager=kv_cache_manager,
         tiered_cache=tiered_cache,
     )
+    if ssd_writer is not None:
+        scheduler._ssd_writer = ssd_writer
     scheduler.run_inference_loop()
 
     # --- Build and run ---
