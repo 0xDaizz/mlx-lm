@@ -26,7 +26,7 @@ def main() -> None:
         )
         from mlx_lm_server.ssd_cache import SSDCache
 
-        kv_cache_manager = KVCacheManager(config)
+        ssd_for_manager = None
         if config.ssd_enabled:
             fingerprint = compute_model_fingerprint(
                 config.model, model, config.kv_bits, config.kv_group_size,
@@ -34,6 +34,9 @@ def main() -> None:
             )
             ssd_dir = config.ssd_cache_dir / fingerprint
             ssd_cache = SSDCache(ssd_dir, config.ssd_ttl_days)
+            ssd_for_manager = ssd_cache
+        kv_cache_manager = KVCacheManager(config, ssd=ssd_for_manager)
+        if config.ssd_enabled:
             tiered_cache = TieredKVCache(kv_cache_manager, ssd_cache)
     except ImportError:
         pass

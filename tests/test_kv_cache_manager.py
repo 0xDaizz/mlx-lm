@@ -1472,3 +1472,235 @@ class TestComputeModelFingerprint:
             "model-x", model, 8, 64, adapter_path="/adapters/lora-A"
         )
         assert fp1 == fp2
+
+
+# ---------------------------------------------------------------------------
+# SSD-aware prefix lookup and block promote
+# ---------------------------------------------------------------------------
+
+
+class TestSSDPromote:
+    """Tests for SSD-aware find_cached_prefix and allocate_blocks promote."""
+
+    def _make_kv_data(self) -> list[dict[str, mx.array]]:
+        """Create multi-layer KV data suitable for SSD round-trip."""
+        return [
+            {
+                "keys": mx.random.normal((1, 2, 4, 8)),
+                "values": mx.random.normal((1, 2, 4, 8)),
+            }
+        ]
+
+    def test_find_cached_prefix_finds_ssd_blocks(self, tmp_path):
+        """Evict blocks to SSD -> find_cached_prefix still reports them as cached."""
+        config = make_config(block_size=4, num_blocks=8)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        # Allocate blocks and attach KV data
+        ids = mgr.allocate_blocks(tokens)
+        assert len(ids) == 2
+        for bid in ids:
+            mgr.pool.blocks[bid].kv_data = self._make_kv_data()
+
+        # Verify RAM lookup works
+        assert mgr.find_cached_prefix(tokens) == 8
+
+        # Free and evict to SSD
+        mgr.free_blocks(ids)
+        evicted = tiered.evict_to_ssd(num_blocks=2)
+        assert len(evicted) == 2
+
+        # Blocks are gone from RAM hash_table
+        assert mgr.num_cached_blocks == 0
+
+        # But find_cached_prefix should still find them via SSD index
+        assert mgr.find_cached_prefix(tokens) == 8
+
+    def test_allocate_blocks_promotes_from_ssd(self, tmp_path):
+        """Evict blocks to SSD -> allocate_blocks loads from SSD and populates RAM block."""
+        config = make_config(block_size=4, num_blocks=8)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        # Allocate blocks and attach KV data
+        ids = mgr.allocate_blocks(tokens)
+        kv_data_0 = self._make_kv_data()
+        kv_data_1 = self._make_kv_data()
+        mgr.pool.blocks[ids[0]].kv_data = kv_data_0
+        mgr.pool.blocks[ids[1]].kv_data = kv_data_1
+
+        # Save the block hashes before eviction
+        hash_0 = mgr.pool.blocks[ids[0]].block_hash
+        hash_1 = mgr.pool.blocks[ids[1]].block_hash
+
+        # Free and evict to SSD
+        mgr.free_blocks(ids)
+        evicted = tiered.evict_to_ssd(num_blocks=2)
+        assert len(evicted) == 2
+
+        # Blocks are gone from RAM
+        assert hash_0 not in mgr.hash_table
+        assert hash_1 not in mgr.hash_table
+
+        # Re-allocate the same tokens — should promote from SSD
+        new_ids = mgr.allocate_blocks(tokens)
+        assert len(new_ids) == 2
+
+        # Blocks should now be back in RAM hash_table
+        assert hash_0 in mgr.hash_table
+        assert hash_1 in mgr.hash_table
+
+        # Verify KV data was restored
+        for bid in new_ids:
+            block = mgr.pool.blocks[bid]
+            assert block.kv_data is not None
+            assert block.ref_count == 1
+            assert block.token_ids is not None
+            assert len(block.token_ids) == 4
+
+    def test_ssd_promote_with_partial_hit(self, tmp_path):
+        """Some blocks in RAM, some evicted to SSD -> correct hybrid prefix."""
+        config = make_config(block_size=4, num_blocks=8)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+        # Allocate all 3 blocks and attach KV data
+        ids = mgr.allocate_blocks(tokens)
+        assert len(ids) == 3
+        for bid in ids:
+            mgr.pool.blocks[bid].kv_data = self._make_kv_data()
+
+        hash_1 = mgr.pool.blocks[ids[1]].block_hash
+
+        # Free only block 1 (middle) and evict it to SSD
+        mgr.free_blocks([ids[1]])
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) == 1
+        assert hash_1 not in mgr.hash_table
+
+        # Block 0 is in RAM, block 1 is on SSD, block 2 is in RAM
+        # find_cached_prefix should find all 3 (block 0 from RAM, block 1 from SSD index,
+        # block 2 from RAM)
+        cached = mgr.find_cached_prefix(tokens)
+        assert cached == 12  # All 12 tokens found
+
+        # Free remaining blocks and re-allocate everything
+        mgr.free_blocks([ids[0], ids[2]])
+
+        # allocate_blocks should get block 0 from RAM (cache hit),
+        # block 1 promoted from SSD, block 2 from RAM (cache hit)
+        new_ids = mgr.allocate_blocks(tokens)
+        assert len(new_ids) == 3
+
+        # Block 1 should be back in RAM
+        assert hash_1 in mgr.hash_table
+        promoted_block = mgr.pool.blocks[mgr.hash_table[hash_1]]
+        assert promoted_block.kv_data is not None
+
+    def test_find_cached_prefix_without_ssd(self):
+        """ssd=None -> behaves exactly as before (backwards compat)."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)  # No ssd parameter
+        assert mgr.ssd is None
+
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+
+        # Allocate then evict
+        ids = mgr.allocate_blocks(tokens)
+        mgr.free_blocks(ids)
+        mgr.evict_lru(num_blocks=2)
+
+        # Without SSD, evicted blocks are gone
+        assert mgr.find_cached_prefix(tokens) == 0
+
+        # Fresh allocation works
+        new_ids = mgr.allocate_blocks(tokens)
+        assert len(new_ids) == 2
+
+    def test_ssd_promote_populates_kv_data(self, tmp_path):
+        """Promoted blocks from SSD have correct KV data that matches original."""
+        config = make_config(block_size=4, num_blocks=8)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens = [10, 20, 30, 40]
+
+        # Allocate and attach KV data
+        ids = mgr.allocate_blocks(tokens)
+        original_kv = self._make_kv_data()
+        mgr.pool.blocks[ids[0]].kv_data = original_kv
+
+        # Free and evict
+        mgr.free_blocks(ids)
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) == 1
+
+        # Re-allocate — SSD promote
+        new_ids = mgr.allocate_blocks(tokens)
+        assert len(new_ids) == 1
+        block = mgr.pool.blocks[new_ids[0]]
+
+        # KV data should be a list of dicts with keys/values
+        assert isinstance(block.kv_data, list)
+        assert len(block.kv_data) == 1
+        assert "keys" in block.kv_data[0]
+        assert "values" in block.kv_data[0]
+
+        # Verify the data matches (SSD round-trip preserves values)
+        assert mx.allclose(
+            block.kv_data[0]["keys"], original_kv[0]["keys"]
+        ).item()
+        assert mx.allclose(
+            block.kv_data[0]["values"], original_kv[0]["values"]
+        ).item()
+
+    def test_ssd_promote_under_pool_exhaustion(self, tmp_path):
+        """SSD promote works even when pool is initially exhausted (triggers eviction)."""
+        config = make_config(block_size=4, num_blocks=2)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        # Fill pool with tokens_a, attach KV data
+        tokens_a = [1, 2, 3, 4, 5, 6, 7, 8]
+        ids_a = mgr.allocate_blocks(tokens_a)
+        assert len(ids_a) == 2
+        for bid in ids_a:
+            mgr.pool.blocks[bid].kv_data = self._make_kv_data()
+
+        # Free and evict tokens_a to SSD
+        mgr.free_blocks(ids_a)
+        evicted = tiered.evict_to_ssd(num_blocks=2)
+        assert len(evicted) == 2
+        assert mgr.num_free_blocks == 2
+
+        # Fill pool with different tokens_b (uses both free blocks)
+        tokens_b = [100, 200, 300, 400, 500, 600, 700, 800]
+        ids_b = mgr.allocate_blocks(tokens_b)
+        assert len(ids_b) == 2
+        assert mgr.num_free_blocks == 0
+
+        # Free tokens_b so they're evictable
+        mgr.free_blocks(ids_b)
+
+        # Now re-allocate tokens_a — pool is full but tokens_b blocks are
+        # evictable, and tokens_a data should be promoted from SSD
+        new_ids = mgr.allocate_blocks(tokens_a)
+        assert len(new_ids) == 2
+
+        # Verify promoted blocks have KV data
+        for bid in new_ids:
+            block = mgr.pool.blocks[bid]
+            assert block.kv_data is not None
+            assert block.ref_count == 1

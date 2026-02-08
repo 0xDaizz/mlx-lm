@@ -201,7 +201,7 @@ class KVCacheManager:
         lock: Threading lock for thread-safe mutations.
     """
 
-    def __init__(self, config: ServerConfig) -> None:
+    def __init__(self, config: ServerConfig, ssd: SSDCache | None = None) -> None:
         self.config = config
         self.block_size = config.block_size
         self.pool = BlockPool(config.num_blocks)
@@ -209,6 +209,7 @@ class KVCacheManager:
         self.lock = threading.Lock()
         self._eviction_heap: list[tuple[float, int]] = []  # (last_accessed, block_id)
         self._heap_pushes: int = 0  # Total pushes since last rebuild
+        self.ssd = ssd  # Optional SSD tier for fallback lookups and promote
 
     def _rebuild_eviction_heap(self) -> None:
         """Rebuild eviction heap, removing stale entries. Must hold self.lock."""
@@ -260,6 +261,13 @@ class KVCacheManager:
                 block_hash = _compute_chain_hash(block_tokens, prev_hash)
 
                 if block_hash not in self.hash_table:
+                    # SSD fallback: check if block exists on disk (index-only, no I/O)
+                    if self.ssd is not None and self.ssd.has_block(block_hash):
+                        # Block was evicted to SSD — count as cached.
+                        # allocate_blocks() will handle the actual promote later.
+                        prev_hash = block_hash
+                        cached_tokens = end
+                        continue
                     break
 
                 block_id = self.hash_table[block_hash]
@@ -356,6 +364,46 @@ class KVCacheManager:
                             block_hash,
                         )
                         is_collision = True
+
+                # SSD promote: try loading block data from SSD before allocating fresh
+                if not is_collision and self.ssd is not None:
+                    raw_data = self.ssd.load_block(block_hash)
+                    if raw_data is not None:
+                        # Normalize format: ensure list[dict]
+                        if isinstance(raw_data, dict):
+                            raw_data = [raw_data]
+                        try:
+                            block = self.pool.get_free_block()
+                        except BlockPoolExhaustedError:
+                            evicted = self._evict_lru_locked(num_blocks=1)
+                            if not evicted:
+                                for bid in allocated_block_ids:
+                                    b = self.pool.blocks[bid]
+                                    if bid in freshly_allocated:
+                                        if b.block_hash is not None and b.block_hash in self.hash_table:
+                                            del self.hash_table[b.block_hash]
+                                        self.pool.return_block(bid)
+                                    else:
+                                        b.ref_count -= 1
+                                raise BlockPoolExhaustedError(
+                                    "Block pool exhausted and no blocks eligible for eviction"
+                                )
+                            block = self.pool.get_free_block()
+                        block.block_hash = block_hash
+                        block.token_ids = list(block_tokens)
+                        block.kv_data = raw_data
+                        block.ref_count = 1
+                        block.last_accessed = time.time()
+                        self.hash_table[block_hash] = block.block_id
+                        allocated_block_ids.append(block.block_id)
+                        freshly_allocated.append(block.block_id)
+                        prev_hash = block_hash
+                        logger.debug(
+                            "SSD promote for block %d (hash=%s)",
+                            block.block_id,
+                            block_hash,
+                        )
+                        continue
 
                 # Cache miss — allocate a new block
                 try:

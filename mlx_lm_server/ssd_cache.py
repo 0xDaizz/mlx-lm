@@ -306,6 +306,17 @@ class SSDCache:
             logger.warning("Failed to load SSD cache index, starting fresh: %s", e)
             self.index = {}
 
+    def has_block(self, block_hash: str) -> bool:
+        """Check if a block exists in the SSD index (no I/O, index-only).
+
+        Args:
+            block_hash: The block hash to check.
+
+        Returns:
+            True if the block is in the SSD index, False otherwise.
+        """
+        return block_hash in self.index
+
     @property
     def num_blocks(self) -> int:
         """Number of blocks stored on SSD."""
