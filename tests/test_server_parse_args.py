@@ -85,6 +85,27 @@ class TestParseArgsSSD:
         with pytest.raises(SystemExit):
             parse_args(["--ssd-flush-interval-s", "-1.0"])
 
+    def test_boolean_optional_action_fallback(self, monkeypatch):
+        """parse_args should work even without BooleanOptionalAction (Python 3.8)."""
+        import argparse as _argparse
+        # Temporarily remove BooleanOptionalAction
+        original = getattr(_argparse, "BooleanOptionalAction", None)
+        if original is not None:
+            monkeypatch.delattr(_argparse, "BooleanOptionalAction")
+
+        # Re-import to get fresh parse_args that checks hasattr
+        # parse_args checks at call-time, so we just call it
+        config = parse_args(["--no-ssd-async-writes"])
+        assert config.ssd_async_writes is False
+
+        config2 = parse_args(["--ssd-async-writes"])
+        assert config2.ssd_async_writes is True
+
+        config3 = parse_args([])
+        assert config3.ssd_async_writes is True
+
+        # Restore (monkeypatch handles this automatically)
+
     def test_combined_ssd_args(self):
         """All SSD args together should work."""
         config = parse_args([

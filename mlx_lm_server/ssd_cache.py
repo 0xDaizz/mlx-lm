@@ -40,7 +40,7 @@ class SSDCache:
         index: Maps block_hash (str) -> SSDBlockMeta.
     """
 
-    def __init__(self, cache_dir: Path, ttl_days: int = 7) -> None:
+    def __init__(self, cache_dir: Path, ttl_days: int = 7, flush_interval_s: float = 1.0) -> None:
         self.cache_dir = Path(cache_dir)
         self.ttl_days = ttl_days
         self._lock = threading.Lock()
@@ -50,6 +50,8 @@ class SSDCache:
         self._index_dirty = False
         self._mutation_count = 0
         self._flush_interval = 10
+        self._flush_interval_s = flush_interval_s
+        self._last_flush_time = time.monotonic()
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -280,14 +282,18 @@ class SSDCache:
             return len(to_prune)
 
     def _mark_dirty(self) -> None:
-        """Mark index as dirty; flush to disk after _flush_interval mutations."""
+        """Mark index as dirty; flush after mutation count or time threshold."""
         self._mutation_count += 1
-        if self._mutation_count >= self._flush_interval:
+        self._index_dirty = True
+
+        now = time.monotonic()
+        count_due = self._mutation_count >= self._flush_interval
+        time_due = (now - self._last_flush_time) >= self._flush_interval_s
+        if count_due or time_due:
             self.save_index()
             self._mutation_count = 0
             self._index_dirty = False
-        else:
-            self._index_dirty = True
+            self._last_flush_time = now
 
     def flush(self) -> None:
         """Flush pending index changes to disk. Call during shutdown."""
@@ -296,6 +302,7 @@ class SSDCache:
                 self.save_index()
                 self._mutation_count = 0
                 self._index_dirty = False
+                self._last_flush_time = time.monotonic()
 
     def save_index(self) -> None:
         """Persist the index to a JSON file in the cache directory.

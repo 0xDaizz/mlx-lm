@@ -724,9 +724,24 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--ssd-durability", type=str,
                         choices=["best_effort", "persistent"],
                         default="best_effort")
-    parser.add_argument("--ssd-async-writes",
-                        action=argparse.BooleanOptionalAction,
-                        default=True)
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument(
+            "--ssd-async-writes",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+        )
+    else:
+        parser.add_argument(
+            "--ssd-async-writes",
+            dest="ssd_async_writes",
+            action="store_true",
+        )
+        parser.add_argument(
+            "--no-ssd-async-writes",
+            dest="ssd_async_writes",
+            action="store_false",
+        )
+        parser.set_defaults(ssd_async_writes=True)
     parser.add_argument("--ssd-writer-queue-size", type=int, default=512)
     parser.add_argument("--ssd-persistent-max-retries", type=int, default=3)
     parser.add_argument("--ssd-flush-interval-s", type=float, default=1.0)

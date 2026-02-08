@@ -34,7 +34,11 @@ def main() -> None:
                 adapter_path=config.adapter_path,
             )
             ssd_dir = config.ssd_cache_dir / fingerprint
-            ssd_cache = SSDCache(ssd_dir, config.ssd_ttl_days)
+            ssd_cache = SSDCache(
+                ssd_dir,
+                config.ssd_ttl_days,
+                flush_interval_s=config.ssd_flush_interval_s,
+            )
             ssd_for_manager = ssd_cache
         kv_cache_manager = KVCacheManager(config, ssd=ssd_for_manager)
         if config.ssd_enabled:
@@ -47,7 +51,13 @@ def main() -> None:
                     durability=config.ssd_durability,
                     max_retries=config.ssd_persistent_max_retries,
                 )
-            tiered_cache = TieredKVCache(kv_cache_manager, ssd_cache, writer=ssd_writer)
+            tiered_cache = TieredKVCache(
+                kv_cache_manager,
+                ssd_cache,
+                writer=ssd_writer,
+                durability=config.ssd_durability,
+                max_retries=config.ssd_persistent_max_retries,
+            )
     except ImportError:
         pass
 

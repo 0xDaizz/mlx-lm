@@ -579,3 +579,160 @@ class TestSchedulerWriterInjection:
 
         scheduler = Scheduler(config=ServerConfig())
         assert scheduler._ssd_writer is None
+
+
+class TestSyncDurability:
+    """P0-1: Sync write paths should apply persistent retry."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    def test_write_through_sync_persistent_retry(self, tmp_path):
+        """write_through() with writer=None should retry on persistent."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(kv_mgr, ssd, writer=None, durability="persistent", max_retries=3)
+
+        call_count = [0]
+        original_save = ssd.save_block
+        def failing_save(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                return "error"
+            return original_save(*args, **kwargs)
+
+        ssd.save_block = failing_save
+        tiered.write_through("sync_retry_1", self._make_block_data())
+        # First call + 2 retries = 3 total calls until success
+        assert call_count[0] == 3
+        ssd.save_block = original_save
+        assert ssd.has_block("sync_retry_1")
+
+    def test_write_through_sync_best_effort_no_retry(self, tmp_path):
+        """write_through() with best_effort should NOT retry."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(kv_mgr, ssd, writer=None, durability="best_effort")
+
+        call_count = [0]
+        def always_fail(*args, **kwargs):
+            call_count[0] += 1
+            return "error"
+
+        ssd.save_block = always_fail
+        tiered.write_through("no_retry_1", self._make_block_data())
+        assert call_count[0] == 1  # Only 1 attempt, no retries
+
+    def test_evict_to_ssd_persistent_retry(self, tmp_path):
+        """evict_to_ssd() should retry saves in persistent mode."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(kv_mgr, ssd, writer=None, durability="persistent", max_retries=3)
+
+        # Set up a block to evict
+        tokens = list(range(1, 17))
+        block_id = kv_mgr.cache_block(
+            block_hash="evict_retry_hash",
+            token_ids=tokens,
+            kv_data=self._make_block_data(),
+            tiered_cache=tiered,
+            ssd_policy="evict_only",
+        )
+        assert block_id is not None
+        kv_mgr.free_blocks([block_id])
+
+        call_count = [0]
+        original_save = ssd.save_block
+        def failing_save(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 2:
+                return "error"
+            return original_save(*args, **kwargs)
+
+        ssd.save_block = failing_save
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) >= 1
+        assert call_count[0] >= 3  # retried until success
+        ssd.save_block = original_save
+
+    def test_write_through_enqueue_fail_falls_back_to_sync(self, tmp_path):
+        """When writer.enqueue() returns False, should fall back to sync save."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import MagicMock
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+
+        mock_writer = MagicMock()
+        mock_writer.enqueue.return_value = False  # Simulate closing/dedup
+
+        tiered = TieredKVCache(kv_mgr, ssd, writer=mock_writer, durability="best_effort")
+        tiered.write_through("fallback_sync_1", self._make_block_data())
+
+        # Should have fallen back to sync save
+        assert ssd.has_block("fallback_sync_1")
+
+
+class TestSSDFlushInterval:
+    """P0-2: Verify flush_interval_s is wired and effective."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    def test_flush_interval_s_stored(self, tmp_path):
+        """flush_interval_s should be stored on SSDCache."""
+        cache = SSDCache(tmp_path, flush_interval_s=2.5)
+        assert cache._flush_interval_s == 2.5
+
+    def test_flush_interval_s_default(self, tmp_path):
+        """Default flush_interval_s should be 1.0."""
+        cache = SSDCache(tmp_path)
+        assert cache._flush_interval_s == 1.0
+
+    def test_time_based_flush_triggers(self, tmp_path):
+        """_mark_dirty should flush when time threshold exceeded."""
+        cache = SSDCache(tmp_path, flush_interval_s=0.0)  # Immediate time-based flush
+        # Set mutation count below threshold to ensure only time triggers
+        cache._flush_interval = 1000  # Very high mutation threshold
+        cache._mutation_count = 0
+
+        # Manually advance the last flush time to simulate elapsed time
+        cache._last_flush_time = time.monotonic() - 1.0
+
+        # Test _mark_dirty directly:
+        cache._index_dirty = False
+        cache._mark_dirty()
+        # With flush_interval_s=0, time_due should be True
+        assert cache._index_dirty is False  # Was flushed
+        assert cache._mutation_count == 0
+
+    def test_mutation_based_flush_still_works(self, tmp_path):
+        """Mutation-count based flush should still trigger."""
+        cache = SSDCache(tmp_path, flush_interval_s=9999.0)  # Very long time interval
+        cache._flush_interval = 3  # Low mutation threshold
+        cache._mutation_count = 0
+        cache._last_flush_time = time.monotonic()  # Recent, so time won't trigger
+
+        # 2 mutations -- not enough
+        cache._mark_dirty()
+        cache._mark_dirty()
+        assert cache._index_dirty is True  # Not flushed yet
+
+        # 3rd mutation -- threshold reached
+        cache._mark_dirty()
+        assert cache._index_dirty is False  # Flushed
+        assert cache._mutation_count == 0

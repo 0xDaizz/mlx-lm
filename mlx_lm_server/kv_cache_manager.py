@@ -814,10 +814,37 @@ class TieredKVCache:
         ram: KVCacheManager,
         ssd: SSDCache | None = None,
         writer: SSDWriterThread | None = None,
+        durability: str = "best_effort",
+        max_retries: int = 3,
     ) -> None:
         self.ram = ram
         self.ssd = ssd
         self._writer = writer  # Optional SSDWriterThread for async writes
+        self._durability = durability
+        self._max_retries = max_retries
+
+    def _save_to_ssd_with_durability(self, block_hash: str, kv_data, num_tokens: int | None = None) -> str:
+        """Save to SSD with optional persistent retry.
+
+        Returns: "saved" | "dedup" | "collision" | "error"
+        """
+        if self.ssd is None:
+            return "error"
+
+        result = self.ssd.save_block(block_hash, kv_data, num_tokens)
+        if result != "error":
+            return result
+
+        if self._durability != "persistent":
+            return "error"
+
+        for _ in range(self._max_retries):
+            retry_result = self.ssd.save_block(block_hash, kv_data, num_tokens)
+            if retry_result != "error":
+                return retry_result
+
+        logger.warning("Sync SSD persistent retry exhausted for %s", block_hash)
+        return "error"
 
     def lookup(self, block_hash: str) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Look up KV data for a block hash, checking RAM then SSD.
@@ -860,9 +887,13 @@ class TieredKVCache:
             num_tokens: Number of tokens in the block (optional, for SSD metadata).
         """
         if self._writer is not None:
-            self._writer.enqueue(block_hash, kv_data, num_tokens)
-        elif self.ssd is not None:
-            self.ssd.save_block(block_hash, kv_data, num_tokens)
+            enqueued = self._writer.enqueue(block_hash, kv_data, num_tokens)
+            if not enqueued:
+                logger.debug("Writer enqueue returned False for %s (closing or dedup), attempting sync save", block_hash)
+                self._save_to_ssd_with_durability(block_hash, kv_data, num_tokens)
+            return
+        if self.ssd is not None:
+            self._save_to_ssd_with_durability(block_hash, kv_data, num_tokens)
 
     def get_writer_stats(self) -> dict[str, int]:
         """Return async writer stats (empty dict if no writer)."""
@@ -906,12 +937,11 @@ class TieredKVCache:
                         # Already persisted — just evict from RAM
                         pass  # fall through to the eviction logic below
                     else:
-                        try:
-                            self.ssd.save_block(block.block_hash, block.kv_data)
-                        except Exception as e:
+                        result = self._save_to_ssd_with_durability(block.block_hash, block.kv_data)
+                        if result == "error":
                             logger.warning(
-                                "SSD save failed for block %d, skipping eviction: %s",
-                                block.block_id, e,
+                                "SSD save failed for block %d, skipping eviction",
+                                block.block_id,
                             )
                             continue  # Skip eviction — keep block in RAM
 

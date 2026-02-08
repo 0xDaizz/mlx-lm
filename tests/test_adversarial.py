@@ -1485,7 +1485,7 @@ class TestDA_F2_SchedulerFreesBlocksDuringSSDSave:
         original_save = ssd.save_block
         save_called = [False]
 
-        def failing_save(block_hash, kv_data):
+        def failing_save(block_hash, kv_data, num_tokens=None):
             save_called[0] = True
             raise IOError("Disk full!")
 
