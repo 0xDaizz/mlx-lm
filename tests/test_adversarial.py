@@ -44,43 +44,17 @@ from mlx_lm_server.types import InferenceRequest, SequenceState, TokenEvent
 # ---------------------------------------------------------------------------
 
 
+from conftest import make_test_request as _make_request
+from conftest import make_test_config
+
+
 def _make_config(**overrides) -> ServerConfig:
-    defaults = {
-        "block_size": 4,
-        "num_blocks": 8,
-    }
-    defaults.update(overrides)
-    return ServerConfig(**defaults)
+    overrides.setdefault("num_blocks", 8)
+    return make_test_config(**overrides)
 
 
 def _make_scheduler_config(**overrides) -> ServerConfig:
-    defaults = dict(
-        block_size=4,
-        num_blocks=64,
-        max_batch_size=4,
-        max_queue_size=32,
-        prefill_batch_size=2,
-    )
-    defaults.update(overrides)
-    return ServerConfig(**defaults)
-
-
-def _make_request(
-    request_id: str = "req-1",
-    prompt_tokens: list[int] | None = None,
-    max_tokens: int = 10,
-    stream: bool = False,
-    stop_sequences: list[str] | None = None,
-    temperature: float = 1.0,
-) -> InferenceRequest:
-    return InferenceRequest(
-        request_id=request_id,
-        prompt_tokens=prompt_tokens or [1, 2, 3, 4],
-        max_tokens=max_tokens,
-        temperature=temperature,
-        stop_sequences=stop_sequences or [],
-        stream=stream,
-    )
+    return make_test_config(**overrides)
 
 
 def _make_kv_data(
@@ -292,7 +266,7 @@ class TestDA_P1_SSDCorruption:
         """load_block on a corrupted file should return None, not crash."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = _make_kv_data()
-        block_hash = 42
+        block_hash = "hash_42"
 
         cache.save_block(block_hash, kv_data)
 
@@ -311,7 +285,7 @@ class TestDA_P1_SSDCorruption:
         """load_block on a truncated file should return None."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = _make_kv_data()
-        block_hash = 99
+        block_hash = "hash_99"
 
         cache.save_block(block_hash, kv_data)
 
@@ -327,7 +301,7 @@ class TestDA_P1_SSDCorruption:
         """load_block on an empty file should return None."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = _make_kv_data()
-        block_hash = 77
+        block_hash = "hash_77"
 
         cache.save_block(block_hash, kv_data)
 
@@ -493,17 +467,17 @@ class TestDA_P1_StaleSSDIndex:
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = _make_kv_data()
 
-        cache.save_block(888, kv_data)
-        assert 888 in cache.index
+        cache.save_block("hash_888", kv_data)
+        assert "hash_888" in cache.index
 
         # Remove the file behind the cache's back
-        filepath = cache.index[888].filepath
+        filepath = cache.index["hash_888"].filepath
         filepath.unlink()
 
         # load_block should detect the missing file and clean up index
-        result = cache.load_block(888)
+        result = cache.load_block("hash_888")
         assert result is None
-        assert 888 not in cache.index
+        assert "hash_888" not in cache.index
 
     def test_da_p1_partial_index_write(self, tmp_path):
         """Corrupted index.json is handled gracefully on startup."""
@@ -512,7 +486,7 @@ class TestDA_P1_StaleSSDIndex:
 
         # Write partial/corrupt index
         index_path = cache_dir / "index.json"
-        index_path.write_text('{"12345": {"block_hash": 12345, "filepath": "')
+        index_path.write_text('{"hash_12345": {"block_hash": "hash_12345", "filepath": "')
 
         # Should recover gracefully
         cache = SSDCache(cache_dir=cache_dir)
@@ -1832,8 +1806,8 @@ class TestDA_F5_ServerRestartSSDResume:
         kv1 = _make_kv_data()
         kv2 = _make_kv_data()
 
-        ssd1.save_block(1001, kv1)
-        ssd1.save_block(1002, kv2)
+        ssd1.save_block("hash_1001", kv1)
+        ssd1.save_block("hash_1002", kv2)
         assert ssd1.num_blocks == 2
 
         # Phase 2: "Restart" — create a new SSDCache pointing to same dir
@@ -1841,15 +1815,15 @@ class TestDA_F5_ServerRestartSSDResume:
 
         # Index should have been loaded
         assert ssd2.num_blocks == 2
-        assert 1001 in ssd2.index
-        assert 1002 in ssd2.index
+        assert "hash_1001" in ssd2.index
+        assert "hash_1002" in ssd2.index
 
         # Blocks should be loadable
-        loaded1 = ssd2.load_block(1001)
+        loaded1 = ssd2.load_block("hash_1001")
         assert loaded1 is not None
         assert "keys" in loaded1 and "values" in loaded1
 
-        loaded2 = ssd2.load_block(1002)
+        loaded2 = ssd2.load_block("hash_1002")
         assert loaded2 is not None
 
     def test_da_f5_tiered_lookup_after_restart(self, tmp_path):
@@ -1896,20 +1870,20 @@ class TestDA_F5_ServerRestartSSDResume:
 
         # Phase 1: Save block with old timestamp
         ssd1 = SSDCache(cache_dir=cache_dir, ttl_days=7)
-        ssd1.save_block(2001, _make_kv_data())
+        ssd1.save_block("hash_2001", _make_kv_data())
 
         # Manually age the block beyond TTL
-        ssd1.index[2001].last_accessed = datetime.now() - timedelta(days=10)
+        ssd1.index["hash_2001"].last_accessed = datetime.now() - timedelta(days=10)
         ssd1.save_index()
 
         # Phase 2: "Restart"
         ssd2 = SSDCache(cache_dir=cache_dir, ttl_days=7)
-        assert 2001 in ssd2.index
+        assert "hash_2001" in ssd2.index
 
         # Prune should remove the expired block
         pruned = ssd2.prune_expired()
         assert pruned == 1
-        assert 2001 not in ssd2.index
+        assert "hash_2001" not in ssd2.index
 
     def test_da_f5_ssd_index_references_moved_files(self, tmp_path):
         """If safetensors files are moved/deleted between restarts,
@@ -1917,20 +1891,20 @@ class TestDA_F5_ServerRestartSSDResume:
         cache_dir = tmp_path / "ssd-cache"
 
         ssd1 = SSDCache(cache_dir=cache_dir, ttl_days=7)
-        ssd1.save_block(3001, _make_kv_data())
-        filepath = ssd1.index[3001].filepath
+        ssd1.save_block("hash_3001", _make_kv_data())
+        filepath = ssd1.index["hash_3001"].filepath
 
         # "External process" removes the file between restarts
         filepath.unlink()
 
         # Phase 2: restart
         ssd2 = SSDCache(cache_dir=cache_dir, ttl_days=7)
-        assert 3001 in ssd2.index  # Index still references it
+        assert "hash_3001" in ssd2.index  # Index still references it
 
         # load_block should detect missing file and clean up
-        result = ssd2.load_block(3001)
+        result = ssd2.load_block("hash_3001")
         assert result is None
-        assert 3001 not in ssd2.index
+        assert "hash_3001" not in ssd2.index
 
     def test_da_f5_multiple_restart_cycles(self, tmp_path):
         """Multiple save/restart/load cycles don't corrupt the index."""
@@ -1940,12 +1914,12 @@ class TestDA_F5_ServerRestartSSDResume:
             ssd = SSDCache(cache_dir=cache_dir, ttl_days=7)
 
             # Add a new block each cycle
-            block_hash = 4000 + cycle
+            block_hash = f"hash_{4000 + cycle}"
             ssd.save_block(block_hash, _make_kv_data())
 
             # Verify all previous blocks are still accessible
             for prev in range(cycle + 1):
-                prev_hash = 4000 + prev
+                prev_hash = f"hash_{4000 + prev}"
                 loaded = ssd.load_block(prev_hash)
                 assert loaded is not None, \
                     f"Block {prev_hash} lost after cycle {cycle}"
@@ -1954,7 +1928,7 @@ class TestDA_F5_ServerRestartSSDResume:
         ssd_final = SSDCache(cache_dir=cache_dir, ttl_days=7)
         assert ssd_final.num_blocks == 5
         for i in range(5):
-            assert (4000 + i) in ssd_final.index
+            assert f"hash_{4000 + i}" in ssd_final.index
 
 
 # ===========================================================================
@@ -2852,7 +2826,7 @@ class TestDA_P7_ConcurrentDecompose:
         Hashes should be identical across all threads."""
         block_size = 8
         shared_tokens = list(range(32))
-        all_hashes: list[list[int]] = []
+        all_hashes: list[list[str]] = []
         lock = threading.Lock()
         errors: list[Exception] = []
 

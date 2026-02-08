@@ -73,7 +73,7 @@ class TestSaveBlock:
         """save_block creates a safetensors file on disk."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = make_kv_data()
-        block_hash = 12345
+        block_hash = "hash_12345"
 
         cache.save_block(block_hash, kv_data)
 
@@ -86,7 +86,7 @@ class TestSaveBlock:
         """save_block records correct metadata in the index."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = make_kv_data(seq_len=16)
-        block_hash = 99999
+        block_hash = "hash_99999"
 
         cache.save_block(block_hash, kv_data)
 
@@ -106,7 +106,7 @@ class TestLoadBlock:
         """load_block returns data matching what was saved."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = make_kv_data(batch=1, heads=4, seq_len=8, head_dim=16)
-        block_hash = 42
+        block_hash = "hash_42"
 
         cache.save_block(block_hash, kv_data)
         loaded = cache.load_block(block_hash)
@@ -114,17 +114,21 @@ class TestLoadBlock:
         assert loaded is not None
         assert mx.allclose(loaded["keys"], kv_data["keys"]).item()
         assert mx.allclose(loaded["values"], kv_data["values"]).item()
+        assert loaded["keys"].shape == kv_data["keys"].shape, "Key shapes must match"
+        assert loaded["values"].shape == kv_data["values"].shape, "Value shapes must match"
+        assert loaded["keys"].dtype == kv_data["keys"].dtype, "Key dtypes must match"
+        assert loaded["values"].dtype == kv_data["values"].dtype, "Value dtypes must match"
 
     def test_load_missing_returns_none(self, tmp_path: Path):
         """load_block returns None for a non-existent block."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
-        assert cache.load_block(99999) is None
+        assert cache.load_block("nonexistent_hash") is None
 
     def test_load_updates_timestamp(self, tmp_path: Path):
         """load_block updates the last_accessed timestamp."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = make_kv_data()
-        block_hash = 100
+        block_hash = "hash_100"
 
         cache.save_block(block_hash, kv_data)
         time_before = cache.index[block_hash].last_accessed
@@ -143,7 +147,7 @@ class TestLoadBlock:
         """load_block handles missing file (stale index entry) gracefully."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = make_kv_data()
-        block_hash = 200
+        block_hash = "hash_200"
 
         cache.save_block(block_hash, kv_data)
         # Delete the file behind the cache's back
@@ -165,8 +169,8 @@ class TestPruneExpired:
         cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=0)
         kv_data = make_kv_data()
 
-        cache.save_block(111, kv_data)
-        cache.save_block(222, kv_data)
+        cache.save_block("hash_111", kv_data)
+        cache.save_block("hash_222", kv_data)
 
         # Force timestamps into the past
         for meta in cache.index.values():
@@ -181,28 +185,28 @@ class TestPruneExpired:
         cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7)
         kv_data = make_kv_data()
 
-        cache.save_block(111, kv_data)  # Recently saved
-        cache.save_block(222, kv_data)
+        cache.save_block("hash_111", kv_data)  # Recently saved
+        cache.save_block("hash_222", kv_data)
 
         # Make one block old and one recent
-        cache.index[111].last_accessed = datetime.now() - timedelta(days=10)
-        cache.index[222].last_accessed = datetime.now()
+        cache.index["hash_111"].last_accessed = datetime.now() - timedelta(days=10)
+        cache.index["hash_222"].last_accessed = datetime.now()
 
         pruned = cache.prune_expired()
         assert pruned == 1
-        assert 111 not in cache.index
-        assert 222 in cache.index
+        assert "hash_111" not in cache.index
+        assert "hash_222" in cache.index
 
     def test_prune_deletes_files(self, tmp_path: Path):
         """prune_expired removes the safetensors files from disk."""
         cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=0)
         kv_data = make_kv_data()
 
-        cache.save_block(333, kv_data)
-        filepath = cache.index[333].filepath
+        cache.save_block("hash_333", kv_data)
+        filepath = cache.index["hash_333"].filepath
         assert filepath.exists()
 
-        cache.index[333].last_accessed = datetime.now() - timedelta(seconds=1)
+        cache.index["hash_333"].last_accessed = datetime.now() - timedelta(seconds=1)
         cache.prune_expired()
         assert not filepath.exists()
 
@@ -219,26 +223,26 @@ class TestIndexPersistence:
         cache1 = SSDCache(cache_dir=cache_dir)
         kv_data = make_kv_data()
 
-        cache1.save_block(111, kv_data)
-        cache1.save_block(222, kv_data)
+        cache1.save_block("hash_111", kv_data)
+        cache1.save_block("hash_222", kv_data)
 
         # Create a new cache instance pointing at the same dir
         cache2 = SSDCache(cache_dir=cache_dir)
         assert cache2.num_blocks == 2
-        assert 111 in cache2.index
-        assert 222 in cache2.index
+        assert "hash_111" in cache2.index
+        assert "hash_222" in cache2.index
 
     def test_index_file_created(self, tmp_path: Path):
         """save_index creates a JSON file in the cache directory."""
         cache = SSDCache(cache_dir=tmp_path / "cache")
         kv_data = make_kv_data()
-        cache.save_block(999, kv_data)
+        cache.save_block("hash_999", kv_data)
 
         index_path = cache.cache_dir / "index.json"
         assert index_path.exists()
 
         data = json.loads(index_path.read_text())
-        assert "999" in data
+        assert "hash_999" in data
 
     def test_index_empty_on_fresh_start(self, tmp_path: Path):
         """New cache with no index file starts empty."""

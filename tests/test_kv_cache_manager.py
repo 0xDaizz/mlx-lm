@@ -38,14 +38,13 @@ from mlx_lm_server.types import KVCacheBlock
 # Helpers
 # ---------------------------------------------------------------------------
 
+from conftest import make_test_config
+
+
 def make_config(**overrides) -> ServerConfig:
     """Create a ServerConfig with small defaults suitable for testing."""
-    defaults = {
-        "block_size": 4,
-        "num_blocks": 8,
-    }
-    defaults.update(overrides)
-    return ServerConfig(**defaults)
+    overrides.setdefault("num_blocks", 8)
+    return make_test_config(**overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +92,7 @@ class TestBlockPool:
         """Returning a block to the pool clears its metadata."""
         pool = BlockPool(num_blocks=4)
         block = pool.get_free_block()
-        block.block_hash = 12345
+        block.block_hash = "hash_12345"
         block.token_ids = [1, 2, 3]
         block.ref_count = 2
         block.kv_data = {"layer0": "data"}
@@ -134,25 +133,26 @@ class TestComputeBlockHash:
     def test_hash_empty_prefix(self):
         """Hash works with an empty prefix (first block in sequence)."""
         h = compute_block_hash([], [1, 2, 3, 4])
-        assert isinstance(h, int)
+        assert isinstance(h, str)
 
     def test_hash_empty_block_tokens(self):
         """Hash works with empty block tokens (edge case)."""
         h = compute_block_hash([1, 2, 3], [])
-        assert isinstance(h, int)
+        assert isinstance(h, str)
 
     def test_hash_boundary_between_prefix_and_block(self):
         """Hash differentiates where the prefix/block boundary falls.
 
+        With blake2b and a separator sentinel between prefix and block,
         [1,2,3] prefix + [4] block and [1,2] prefix + [3,4] block
-        produce the same hash because the concatenation is identical: (1,2,3,4).
-        This is by design: the block hash represents the full context
-        up to and including the block.
+        produce DIFFERENT hashes because the separator position differs.
+        This is the correct behavior: blocks at different positions
+        in the sequence should have distinct hashes.
         """
         h1 = compute_block_hash([1, 2, 3], [4])
         h2 = compute_block_hash([1, 2], [3, 4])
-        # These are intentionally the same because (1,2,3,4) == (1,2,3,4)
-        assert h1 == h2
+        # These are now different because the separator position differs
+        assert h1 != h2
 
     def test_hash_via_manager_method(self):
         """KVCacheManager.compute_block_hash delegates correctly."""
@@ -321,6 +321,13 @@ class TestAllocateBlocks:
         ids_b = mgr.allocate_blocks(tokens_b)
         assert len(ids_b) == 1
 
+        # Verify the evicted blocks are truly reusable
+        assert mgr.num_free_blocks >= 0
+        # The newly allocated block should be in the hash table
+        block = mgr.pool.blocks[ids_b[0]]
+        assert block.ref_count == 1
+        assert block.token_ids == [100, 200, 300, 400]
+
     def test_alloc_exhaustion_no_evictable_raises(self):
         """When pool is exhausted and all blocks are in use, raises error."""
         config = make_config(block_size=4, num_blocks=1)
@@ -468,6 +475,12 @@ class TestEvictLRU:
         assert len(evicted) == 2
         assert evicted[0] == ids_a[0]  # oldest
         assert evicted[1] == ids_b[0]  # next oldest
+
+        # Verify evicted blocks are no longer in cache
+        assert mgr.find_cached_prefix(tokens_a) == 0, "Evicted prefix A should not be found"
+        assert mgr.find_cached_prefix(tokens_b) == 0, "Evicted prefix B should not be found"
+        # Block C should still be cached (not evicted)
+        assert mgr.find_cached_prefix(tokens_c) == len(tokens_c), "Non-evicted prefix C should still be cached"
 
     def test_evict_skips_in_use(self):
         """Eviction skips blocks with ref_count > 0."""
@@ -842,7 +855,7 @@ class TestTieredLookup:
         tiered = TieredKVCache(ram=mgr, ssd=ssd)
 
         kv_data = self._make_kv_data()
-        block_hash = 12345
+        block_hash = "hash_12345"
         ssd.save_block(block_hash, kv_data)
 
         result = tiered.lookup(block_hash)
@@ -855,7 +868,7 @@ class TestTieredLookup:
         mgr = KVCacheManager(config)
         tiered = TieredKVCache(ram=mgr, ssd=None)
 
-        result = tiered.lookup(99999)
+        result = tiered.lookup("nonexistent_hash")
         assert result is None
 
     def test_lookup_miss_with_ssd(self, tmp_path):
@@ -865,7 +878,7 @@ class TestTieredLookup:
         ssd = SSDCache(cache_dir=tmp_path / "cache")
         tiered = TieredKVCache(ram=mgr, ssd=ssd)
 
-        result = tiered.lookup(99999)
+        result = tiered.lookup("nonexistent_hash")
         assert result is None
 
 
@@ -1053,3 +1066,76 @@ class TestEvictionExclusion:
         assert len(evicted) == 1
         assert ids_b[0] in evicted
         assert ids_a[0] not in evicted
+
+
+# ---------------------------------------------------------------------------
+# cache_block() — atomic block caching with eviction fallback
+# ---------------------------------------------------------------------------
+
+
+class TestCacheBlock:
+    """Tests for KVCacheManager.cache_block()."""
+
+    def test_cache_block_new(self, tmp_path):
+        """cache_block() allocates and populates a new block."""
+        config = ServerConfig(block_size=4, num_blocks=8, ssd_cache_dir=tmp_path / "ssd")
+        mgr = KVCacheManager(config)
+
+        block_hash = mgr.compute_block_hash([], [1, 2, 3, 4])
+        block_id = mgr.cache_block(block_hash, [1, 2, 3, 4], [{"keys": "k", "values": "v"}])
+
+        assert block_id is not None
+        block = mgr.pool.blocks[block_id]
+        assert block.block_hash == block_hash
+        assert block.token_ids == [1, 2, 3, 4]
+        assert block.ref_count == 0
+        assert block.kv_data == [{"keys": "k", "values": "v"}]
+        assert block_hash in mgr.hash_table
+
+    def test_cache_block_duplicate_noop(self, tmp_path):
+        """cache_block() is a no-op for already-cached hashes."""
+        config = ServerConfig(block_size=4, num_blocks=8, ssd_cache_dir=tmp_path / "ssd")
+        mgr = KVCacheManager(config)
+
+        block_hash = mgr.compute_block_hash([], [1, 2, 3, 4])
+        bid1 = mgr.cache_block(block_hash, [1, 2, 3, 4], [{"keys": "k1"}])
+        bid2 = mgr.cache_block(block_hash, [1, 2, 3, 4], [{"keys": "k2"}])
+
+        assert bid1 == bid2
+        # Original data is preserved, not overwritten
+        assert mgr.pool.blocks[bid1].kv_data == [{"keys": "k1"}]
+
+    def test_cache_block_eviction_fallback(self, tmp_path):
+        """cache_block() evicts LRU blocks when pool is exhausted."""
+        config = ServerConfig(block_size=4, num_blocks=2, ssd_cache_dir=tmp_path / "ssd")
+        mgr = KVCacheManager(config)
+
+        # Fill all blocks
+        h1 = mgr.compute_block_hash([], [1, 2, 3, 4])
+        h2 = mgr.compute_block_hash([1, 2, 3, 4], [5, 6, 7, 8])
+        mgr.cache_block(h1, [1, 2, 3, 4], [{"keys": "k1"}])
+        mgr.cache_block(h2, [5, 6, 7, 8], [{"keys": "k2"}])
+
+        assert mgr.pool.num_free == 0
+
+        # Cache a third block — should evict oldest
+        h3 = mgr.compute_block_hash([1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12])
+        bid3 = mgr.cache_block(h3, [9, 10, 11, 12], [{"keys": "k3"}])
+
+        assert bid3 is not None
+        assert h3 in mgr.hash_table
+
+    def test_cache_block_returns_none_when_full(self, tmp_path):
+        """cache_block() returns None when pool is exhausted and nothing evictable."""
+        config = ServerConfig(block_size=4, num_blocks=1, ssd_cache_dir=tmp_path / "ssd")
+        mgr = KVCacheManager(config)
+
+        # Allocate and pin the only block (ref_count > 0 prevents eviction)
+        block_ids = mgr.allocate_blocks([1, 2, 3, 4])
+        assert len(block_ids) == 1
+
+        # Try to cache another block — should fail since the only block has ref_count=1
+        h2 = mgr.compute_block_hash([1, 2, 3, 4], [5, 6, 7, 8])
+        bid = mgr.cache_block(h2, [5, 6, 7, 8], [{"keys": "k2"}])
+
+        assert bid is None

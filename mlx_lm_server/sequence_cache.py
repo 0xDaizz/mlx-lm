@@ -3,6 +3,9 @@
 Thread-safe LRU cache mapping token sequences to List[KVCache] objects,
 the format BatchGenerator.insert(caches=...) expects.
 
+Uses a trie for O(M) prefix lookup (M = query length) instead of O(N*M)
+linear scan. LRU eviction is maintained via OrderedDict side-index.
+
 Modeled on upstream LRUPromptCache (mlx_lm/server.py).
 """
 
@@ -22,12 +25,23 @@ except ImportError:
     trim_prompt_cache = None
 
 
+class _TrieNode:
+    """Internal trie node for token-level prefix indexing."""
+
+    __slots__ = ("children", "cache_value", "token_key")
+
+    def __init__(self) -> None:
+        self.children: dict[int, _TrieNode] = {}
+        self.cache_value: list | None = None  # Non-None = this node stores a cached entry
+        self.token_key: tuple[int, ...] | None = None  # Full key for LRU tracking
+
+
 class SequenceCacheStore:
     """Thread-safe LRU cache for sequence-level KV caches.
 
     Maps token sequences (as tuples) to List[KVCache] objects.
-    On lookup, finds the longest matching prefix. If the cached
-    sequence is longer than the query, trims the cache copy.
+    On lookup, finds the longest matching prefix using a trie
+    for O(M) lookup instead of scanning all entries.
 
     Args:
         max_entries: Maximum number of cached entries before LRU eviction.
@@ -35,16 +49,20 @@ class SequenceCacheStore:
 
     def __init__(self, max_entries: int = 50) -> None:
         self._max_entries = max_entries
-        self._cache: OrderedDict[tuple[int, ...], list] = OrderedDict()
+        self._root = _TrieNode()
         self._lock = threading.Lock()
+        self._size = 0
+        # LRU tracking: maps token_key -> trie node (for eviction)
+        self._lru_order: OrderedDict[tuple[int, ...], _TrieNode] = OrderedDict()
 
     def find_longest_prefix(
         self, tokens: list[int]
     ) -> tuple[list | None, list[int]]:
         """Find the longest cached prefix matching the given tokens.
 
-        Searches all cached entries and finds the one with the longest
-        overlap with the given tokens.
+        Walks the trie following token IDs from root. At each node,
+        if cache_value is not None, records it as the best match so far.
+        Stops when no child exists for the next token or end of tokens.
 
         Args:
             tokens: Token sequence to look up.
@@ -54,50 +72,47 @@ class SequenceCacheStore:
             - cache_copy: Deep copy of cached List[KVCache], or None on miss
             - remaining_tokens: Tokens not covered by the cache
         """
-        token_tuple = tuple(tokens)
-
         with self._lock:
-            # Try exact match first (O(1))
-            if token_tuple in self._cache:
-                self._cache.move_to_end(token_tuple)
-                cache_copy = copy.deepcopy(self._cache[token_tuple])
-                return cache_copy, []
+            node = self._root
+            best_node: _TrieNode | None = None
+            best_depth = 0
 
-            # Search for longest matching prefix among all cached keys
-            best_key: tuple[int, ...] | None = None
-            best_match_len = 0
+            # Check root node (empty token key)
+            if node.cache_value is not None:
+                best_node = node
+                best_depth = 0
 
-            for cached_key in self._cache:
-                # Token-by-token prefix matching
-                common = 0
-                for a, b in zip(cached_key, token_tuple):
-                    if a != b:
-                        break
-                    common += 1
-                if common > best_match_len:
-                    best_key = cached_key
-                    best_match_len = common
+            # Walk the trie
+            for i, token in enumerate(tokens):
+                child = node.children.get(token)
+                if child is None:
+                    break
+                node = child
+                if node.cache_value is not None:
+                    best_node = node
+                    best_depth = i + 1
 
-            if best_key is None:
+            if best_node is None:
                 return None, list(tokens)
 
-            self._cache.move_to_end(best_key)
-            cache_copy = copy.deepcopy(self._cache[best_key])
+            # Refresh LRU order
+            assert best_node.token_key is not None
+            self._lru_order.move_to_end(best_node.token_key)
 
-            best_key_len = len(best_key)
+            cache_copy = copy.deepcopy(best_node.cache_value)
+            best_key_len = len(best_node.token_key)
 
-            if best_key_len > len(token_tuple):
-                # Cached sequence is longer — trim excess
-                excess = best_key_len - len(token_tuple)
+            if best_key_len > len(tokens):
+                # Cached sequence is longer than query -- trim excess
+                excess = best_key_len - len(tokens)
                 if can_trim_prompt_cache is not None and trim_prompt_cache is not None:
                     if can_trim_prompt_cache(cache_copy):
                         trim_prompt_cache(cache_copy, excess)
                 return cache_copy, []
-            elif best_key_len == len(token_tuple):
-                # Exact match (shouldn't reach here but handle it)
+            elif best_key_len == len(tokens):
                 return cache_copy, []
             else:
-                # Cached sequence is shorter — return remaining tokens
+                # Cached sequence is shorter -- return remaining tokens
                 remaining = list(tokens[best_key_len:])
                 return cache_copy, remaining
 
@@ -126,21 +141,83 @@ class SequenceCacheStore:
             cache_copy = copy.deepcopy(prompt_cache)
 
         with self._lock:
-            if token_tuple in self._cache:
-                self._cache[token_tuple] = cache_copy
-                self._cache.move_to_end(token_tuple)
+            # Walk/create trie nodes for each token
+            node = self._root
+            for token in token_tuple:
+                child = node.children.get(token)
+                if child is None:
+                    child = _TrieNode()
+                    node.children[token] = child
+                node = child
+
+            # 'node' is now the leaf for this token sequence
+            is_update = node.cache_value is not None
+
+            node.cache_value = cache_copy
+            node.token_key = token_tuple
+
+            if is_update:
+                # Update existing entry -- refresh LRU, don't change size
+                self._lru_order[token_tuple] = node
+                self._lru_order.move_to_end(token_tuple)
             else:
-                self._cache[token_tuple] = cache_copy
-                while len(self._cache) > self._max_entries:
-                    self._cache.popitem(last=False)
+                # New entry
+                self._lru_order[token_tuple] = node
+                self._size += 1
+
+                # Evict oldest entries if over capacity
+                while self._size > self._max_entries:
+                    self._evict_oldest()
+
+    def _evict_oldest(self) -> None:
+        """Evict the least recently used entry. Must be called with _lock held."""
+        if not self._lru_order:
+            return
+
+        evicted_key, evicted_node = self._lru_order.popitem(last=False)
+        evicted_node.cache_value = None
+        evicted_node.token_key = None
+        self._size -= 1
+
+        # Prune empty trie branches: walk from root to the evicted leaf
+        # and remove nodes that have no children and no cache_value
+        self._prune_path(evicted_key)
+
+    def _prune_path(self, token_key: tuple[int, ...]) -> None:
+        """Remove empty trie nodes along the path for token_key.
+
+        Walks from root to the leaf, then prunes upward removing nodes
+        that have no children and no cache_value. Must be called with _lock held.
+        """
+        if not token_key:
+            return  # Root node is never pruned
+
+        # Collect the path: list of (parent_node, token, child_node)
+        path: list[tuple[_TrieNode, int, _TrieNode]] = []
+        node = self._root
+        for token in token_key:
+            child = node.children.get(token)
+            if child is None:
+                return  # Path already pruned
+            path.append((node, token, child))
+            node = child
+
+        # Walk backwards pruning empty nodes
+        for parent, token, child in reversed(path):
+            if child.cache_value is None and not child.children:
+                del parent.children[token]
+            else:
+                break  # Stop pruning once we hit a node that's still needed
 
     @property
     def size(self) -> int:
         """Number of cached entries."""
         with self._lock:
-            return len(self._cache)
+            return self._size
 
     def clear(self) -> None:
         """Remove all cached entries."""
         with self._lock:
-            self._cache.clear()
+            self._root = _TrieNode()
+            self._lru_order.clear()
+            self._size = 0

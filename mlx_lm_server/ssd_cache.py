@@ -31,13 +31,13 @@ class SSDCache:
     Attributes:
         cache_dir: Directory where safetensors files are stored.
         ttl_days: Time-to-live in days; blocks older than this are pruned.
-        index: Maps block_hash (int) -> SSDBlockMeta.
+        index: Maps block_hash (str) -> SSDBlockMeta.
     """
 
     def __init__(self, cache_dir: Path, ttl_days: int = 7) -> None:
         self.cache_dir = Path(cache_dir)
         self.ttl_days = ttl_days
-        self.index: dict[int, SSDBlockMeta] = {}
+        self.index: dict[str, SSDBlockMeta] = {}
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -45,7 +45,7 @@ class SSDCache:
         # Load existing index if available
         self.load_index()
 
-    def save_block(self, block_hash: int, kv_data: list[dict[str, mx.array]] | dict[str, mx.array]) -> None:
+    def save_block(self, block_hash: str, kv_data: list[dict[str, mx.array]] | dict[str, mx.array]) -> None:
         """Save K/V tensors for a block to disk as a safetensors file.
 
         Args:
@@ -81,9 +81,9 @@ class SSDCache:
         )
         self.save_index()
 
-        logger.debug("Saved block %d to SSD: %s", block_hash, filepath)
+        logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
 
-    def load_block(self, block_hash: int) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
+    def load_block(self, block_hash: str) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Load K/V tensors for a block from disk.
 
         Updates the last_accessed timestamp on successful load.
@@ -117,7 +117,7 @@ class SSDCache:
         except Exception as e:
             # Corrupted, truncated, or unreadable file — remove stale entry
             logger.warning(
-                "Failed to load block %d from %s: %s. Removing stale index entry.",
+                "Failed to load block %s from %s: %s. Removing stale index entry.",
                 block_hash,
                 filepath,
                 e,
@@ -153,7 +153,7 @@ class SSDCache:
         meta.last_accessed = datetime.now()
         self.save_index()
 
-        logger.debug("Loaded block %d from SSD: %s", block_hash, filepath)
+        logger.debug("Loaded block %s from SSD: %s", block_hash, filepath)
         return result
 
     def prune_expired(self) -> int:
@@ -171,7 +171,7 @@ class SSDCache:
             meta = self.index[block_hash]
             if meta.filepath.exists():
                 meta.filepath.unlink()
-                logger.debug("Pruned expired block %d: %s", block_hash, meta.filepath)
+                logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
             del self.index[block_hash]
 
         if to_prune:
@@ -217,7 +217,7 @@ class SSDCache:
             data = json.loads(index_path.read_text())
             self.index = {}
             for bh_str, entry in data.items():
-                bh = int(bh_str)
+                bh = bh_str
                 self.index[bh] = SSDBlockMeta(
                     block_hash=entry["block_hash"],
                     filepath=Path(entry["filepath"]),

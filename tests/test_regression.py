@@ -839,3 +839,354 @@ class TestMNEW5DuplicateDecodeSequences:
         # No duplicates anywhere
         assert len(prefill_ids) == len(set(prefill_ids))
         assert len(decode_ids) == len(set(decode_ids))
+
+
+# ---------------------------------------------------------------------------
+# D2: Batch-path error recovery tests
+# ---------------------------------------------------------------------------
+
+
+class _GatedBatchGenerator:
+    """Mock BatchGenerator whose next() blocks on a gate and can raise on demand.
+
+    The gate pattern ensures requests remain active when we trigger the error:
+    - next() blocks on _gate (threading.Event) before processing
+    - The test calls trigger_failure() then opens the gate
+    - next() sees the failure flag and raises RuntimeError
+
+    After an error, the scheduler calls close() + _create_batch_generator().
+    Since model is None, _create_batch_generator does nothing, so for recovery
+    tests we must inject a fresh _GatedBatchGenerator.
+    """
+
+    def __init__(self) -> None:
+        self._uid_counter = 0
+        self._active: dict[int, dict] = {}
+        self._closed = False
+        self._gate = threading.Event()
+        self._gate.set()  # Open by default (no blocking)
+        self._fail_next = False
+        self._lock = threading.Lock()
+
+    def insert(self, prompts, max_tokens=None, caches=None, samplers=None,
+               logits_processors=None):
+        uids = []
+        for i, prompt in enumerate(prompts):
+            uid = self._uid_counter
+            self._uid_counter += 1
+            mt = max_tokens[i] if isinstance(max_tokens, list) else (max_tokens or 10)
+            self._active[uid] = {
+                "tokens": list(prompt) if hasattr(prompt, "__iter__") else [prompt],
+                "max_tokens": mt,
+                "step": 0,
+            }
+            uids.append(uid)
+        return uids
+
+    def next(self):
+        # Wait on gate — allows test to hold next() until ready
+        self._gate.wait(timeout=10.0)
+        with self._lock:
+            if self._fail_next:
+                self._fail_next = False
+                raise RuntimeError("Simulated batch error")
+        responses = []
+        finished = []
+        for uid, state in list(self._active.items()):
+            state["step"] += 1
+            token = 100 + state["step"]
+            finish = None
+            if state["step"] >= state["max_tokens"]:
+                finish = "length"
+                finished.append(uid)
+            responses.append(_MockResponse(uid=uid, token=token, finish_reason=finish))
+        for uid in finished:
+            del self._active[uid]
+        return responses
+
+    def remove(self, uids, return_prompt_caches=False):
+        result = {}
+        for uid in uids:
+            if uid in self._active:
+                if return_prompt_caches:
+                    result[uid] = [{"mock_cache": True}]
+                del self._active[uid]
+        return result if return_prompt_caches else None
+
+    def close(self):
+        self._closed = True
+        self._active.clear()
+        # Unblock any waiting next() calls so the thread doesn't deadlock
+        self._gate.set()
+
+    def hold_next(self) -> None:
+        """Block next() calls until release_next() or trigger_failure()."""
+        self._gate.clear()
+
+    def release_next(self) -> None:
+        """Unblock next() calls."""
+        self._gate.set()
+
+    def trigger_failure(self) -> None:
+        """Make the next next() call raise, then unblock the gate."""
+        with self._lock:
+            self._fail_next = True
+        self._gate.set()
+
+
+def _make_scheduler_with_gated_bg(
+    config: ServerConfig | None = None, **kwargs
+) -> tuple[Scheduler, _GatedBatchGenerator]:
+    """Create a Scheduler with a _GatedBatchGenerator injected."""
+    if config is None:
+        config = ServerConfig(**kwargs)
+
+    sched = Scheduler(config=config, model=None, tokenizer=None)
+
+    mock_bg = _GatedBatchGenerator()
+    sched._batch_generator = mock_bg
+    sched._sequence_cache = None
+
+    # Minimal mock tokenizer so the batch path uses str(token) fallback
+    mock_tokenizer = MagicMock()
+    mock_tokenizer.detokenizer = None
+    mock_tokenizer.decode = lambda ids: "".join(f"t{i}" for i in ids)
+    sched.tokenizer = mock_tokenizer
+
+    return sched, mock_bg
+
+
+class TestD2BatchErrorRecovery:
+    """D2: Verify scheduler handles batch errors correctly via _handle_batch_error.
+
+    These tests use a gated mock BatchGenerator whose next() can be held and
+    then made to raise, exercising the _handle_batch_error code path (distinct
+    from _handle_mock_error tested in test_scheduler.py::TestErrorRecovery).
+    """
+
+    def test_batch_error_signals_all_active(self):
+        """When BatchGenerator.next() raises, ALL active requests get error finish."""
+        sched, mock_bg = _make_scheduler_with_gated_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Hold next() so requests stay active while we set up the failure
+        mock_bg.hold_next()
+
+        sched.run_inference_loop()
+        try:
+            req1 = InferenceRequest(
+                request_id="berr-sig-1",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+            )
+            req2 = InferenceRequest(
+                request_id="berr-sig-2",
+                prompt_tokens=[4, 5, 6],
+                max_tokens=100,
+            )
+            sched.submit_request(req1)
+            sched.submit_request(req2)
+
+            # Wait until both are inserted (they'll block on next())
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with sched._active_lock:
+                    if len(sched._uid_to_request_id) >= 2:
+                        break
+                time.sleep(0.02)
+
+            # Trigger failure — this sets the flag AND unblocks the gate
+            mock_bg.trigger_failure()
+
+            # Both requests should finish with error
+            events1 = sched.get_result("berr-sig-1", timeout=5.0)
+            events2 = sched.get_result("berr-sig-2", timeout=5.0)
+
+            assert any(e.finish_reason == "error" for e in events1), (
+                f"berr-sig-1 should get error, got: {[e.finish_reason for e in events1]}"
+            )
+            assert any(e.finish_reason == "error" for e in events2), (
+                f"berr-sig-2 should get error, got: {[e.finish_reason for e in events2]}"
+            )
+        finally:
+            sched.stop()
+
+    def test_batch_error_frees_resources(self):
+        """After a batch error, active sequences are cleaned up and slots freed."""
+        sched, mock_bg = _make_scheduler_with_gated_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        mock_bg.hold_next()
+
+        sched.run_inference_loop()
+        try:
+            req = InferenceRequest(
+                request_id="berr-free-1",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+            )
+            sched.submit_request(req)
+
+            # Wait for insertion
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with sched._active_lock:
+                    if len(sched._uid_to_request_id) >= 1:
+                        break
+                time.sleep(0.02)
+
+            # Trigger batch error
+            mock_bg.trigger_failure()
+
+            # Wait for error result
+            events = sched.get_result("berr-free-1", timeout=5.0)
+            assert any(e.finish_reason == "error" for e in events)
+
+            # Give cleanup time to complete
+            time.sleep(0.3)
+
+            # Active sequences should be empty after error cleanup
+            assert sched.num_active_sequences == 0, (
+                f"Expected 0 active sequences after error, got {sched.num_active_sequences}"
+            )
+
+            # UID mappings should be cleared (part of _handle_batch_error)
+            assert len(sched._uid_to_request_id) == 0, (
+                "UID-to-request mappings should be cleared after batch error"
+            )
+            assert len(sched._request_id_to_uid) == 0, (
+                "Request-to-UID mappings should be cleared after batch error"
+            )
+
+            # Scheduler should still accept new requests (queue not broken)
+            req2 = InferenceRequest(
+                request_id="berr-free-2",
+                prompt_tokens=[7, 8, 9],
+                max_tokens=2,
+            )
+            sched.submit_request(req2)
+            assert sched.num_queued_requests >= 1
+        finally:
+            sched.stop()
+
+    def test_batch_error_recovery(self):
+        """After a batch error, NEW requests complete successfully."""
+        sched, mock_bg = _make_scheduler_with_gated_bg(
+            max_batch_size=4, default_max_tokens=3
+        )
+
+        mock_bg.hold_next()
+
+        sched.run_inference_loop()
+        try:
+            # Submit a request that will fail
+            req_fail = InferenceRequest(
+                request_id="berr-recov-fail",
+                prompt_tokens=[1, 2],
+                max_tokens=3,
+            )
+            sched.submit_request(req_fail)
+
+            # Wait for insertion
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with sched._active_lock:
+                    if len(sched._uid_to_request_id) >= 1:
+                        break
+                time.sleep(0.02)
+
+            # Trigger the error
+            mock_bg.trigger_failure()
+
+            # Wait for error result
+            events_fail = sched.get_result("berr-recov-fail", timeout=5.0)
+            assert any(e.finish_reason == "error" for e in events_fail), (
+                f"Failed request should get error, got: {[e.finish_reason for e in events_fail]}"
+            )
+
+            # Give cleanup time
+            time.sleep(0.3)
+
+            # After error, _handle_batch_error calls _create_batch_generator()
+            # which does nothing when model=None. Inject a fresh mock to
+            # simulate the recreated BatchGenerator.
+            fresh_bg = _GatedBatchGenerator()
+            sched._batch_generator = fresh_bg
+
+            # Submit a NEW request — it should succeed (scheduler recovered)
+            req_ok = InferenceRequest(
+                request_id="berr-recov-ok",
+                prompt_tokens=[10, 20],
+                max_tokens=3,
+            )
+            sched.submit_request(req_ok)
+
+            events_ok = sched.get_result("berr-recov-ok", timeout=5.0)
+            assert len(events_ok) == 3, (
+                f"Recovery request should get 3 tokens, got {len(events_ok)}"
+            )
+            assert events_ok[-1].finish_reason == "length", (
+                f"Recovery request should finish with 'length', got '{events_ok[-1].finish_reason}'"
+            )
+        finally:
+            sched.stop()
+
+    def test_stream_gets_error_finish(self):
+        """Streaming request receives error finish event when batch fails."""
+        sched, mock_bg = _make_scheduler_with_gated_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        mock_bg.hold_next()
+
+        sched.run_inference_loop()
+        try:
+            # Register stream BEFORE submitting
+            stream_q = sched.register_stream("berr-stream-1")
+
+            req = InferenceRequest(
+                request_id="berr-stream-1",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+                stream=True,
+            )
+            sched.submit_request(req)
+
+            # Wait for insertion
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                with sched._active_lock:
+                    if len(sched._uid_to_request_id) >= 1:
+                        break
+                time.sleep(0.02)
+
+            # Trigger batch error
+            mock_bg.trigger_failure()
+
+            # Read events from stream — should get an error finish
+            error_event = None
+            events_received = []
+            read_deadline = time.monotonic() + 5.0
+            while time.monotonic() < read_deadline:
+                try:
+                    ev = stream_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if ev is None:
+                    break
+                events_received.append(ev)
+                if ev.finish_reason is not None:
+                    error_event = ev
+                    break
+
+            assert error_event is not None, (
+                f"Stream should receive error finish event. "
+                f"Events received: {[(e.token_id, e.finish_reason) for e in events_received]}"
+            )
+            assert error_event.finish_reason == "error", (
+                f"Expected finish_reason='error', got '{error_event.finish_reason}'"
+            )
+        finally:
+            sched.stop()

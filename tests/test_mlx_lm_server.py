@@ -33,6 +33,7 @@ class MockScheduler:
         self.response_tokens = response_tokens or ["Hello", ",", " world", "!"]
         self.submitted: list[InferenceRequest] = []
         self.streams: dict[str, Queue[TokenEvent | None]] = {}
+        self.cancelled: list[str] = []
         self.shutdown_called = False
 
     def submit_request(self, request: InferenceRequest) -> None:
@@ -78,6 +79,10 @@ class MockScheduler:
             "free_blocks": 54,
             "hit_rate": 0.85,
         }
+
+    def cancel_request(self, request_id: str) -> bool:
+        self.cancelled.append(request_id)
+        return True
 
     def shutdown(self) -> None:
         self.shutdown_called = True
@@ -456,3 +461,276 @@ async def test_error_response_format(client):
     )
     # FastAPI returns 422 for validation errors (its own format)
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# B3: Input validation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def small_prompt_config(tmp_path):
+    """ServerConfig with a very small max_prompt_tokens for testing."""
+    return ServerConfig(
+        model="test-model",
+        block_size=4,
+        num_blocks=64,
+        ssd_cache_dir=tmp_path / "ssd-cache",
+        max_batch_size=2,
+        max_queue_size=8,
+        max_prompt_tokens=10,
+    )
+
+
+@pytest.fixture
+def small_prompt_app(small_prompt_config, mock_scheduler, mock_tokenizer):
+    return create_app(
+        config=small_prompt_config,
+        scheduler=mock_scheduler,
+        tokenizer=mock_tokenizer,
+    )
+
+
+@pytest.fixture
+async def small_prompt_client(small_prompt_app):
+    transport = ASGITransport(app=small_prompt_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.mark.anyio
+async def test_prompt_too_long_returns_400(small_prompt_client):
+    """B3: Prompt exceeding max_prompt_tokens returns 400."""
+    # MockTokenizer.encode splits on whitespace, so 15 words = 15 tokens > 10 limit
+    long_prompt_words = " ".join(f"word{i}" for i in range(15))
+    resp = await small_prompt_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": long_prompt_words}],
+            "max_tokens": 50,
+        },
+    )
+    assert resp.status_code == 400
+    data = resp.json()
+    assert "Prompt too long" in data["error"]["message"]
+
+    # Also test /v1/completions endpoint
+    resp2 = await small_prompt_client.post(
+        "/v1/completions",
+        json={
+            "model": "test-model",
+            "prompt": long_prompt_words,
+            "max_tokens": 50,
+        },
+    )
+    assert resp2.status_code == 400
+    data2 = resp2.json()
+    assert "Prompt too long" in data2["error"]["message"]
+
+
+@pytest.mark.anyio
+async def test_temperature_clamped(client, mock_scheduler):
+    """B3: temperature=5.0 is clamped to 2.0, no error."""
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 50,
+            "temperature": 5.0,
+        },
+    )
+    assert resp.status_code == 200
+    # Verify the submitted request used the clamped value
+    assert len(mock_scheduler.submitted) >= 1
+    submitted = mock_scheduler.submitted[-1]
+    assert submitted.temperature == 2.0
+
+
+@pytest.mark.anyio
+async def test_negative_temperature_clamped(client, mock_scheduler):
+    """B3: temperature=-1.0 is clamped to 0.0, no error."""
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 50,
+            "temperature": -1.0,
+        },
+    )
+    assert resp.status_code == 200
+    submitted = mock_scheduler.submitted[-1]
+    assert submitted.temperature == 0.0
+
+
+@pytest.mark.anyio
+async def test_max_tokens_clamped_to_minimum_1(client, mock_scheduler):
+    """B3: max_tokens=0 or negative is clamped to 1, no error."""
+    # Test with max_tokens=0
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 0,
+        },
+    )
+    assert resp.status_code == 200
+    submitted = mock_scheduler.submitted[-1]
+    assert submitted.max_tokens == 1
+
+    # Test with max_tokens=-5
+    resp2 = await client.post(
+        "/v1/completions",
+        json={
+            "model": "test-model",
+            "prompt": "Hello",
+            "max_tokens": -5,
+        },
+    )
+    assert resp2.status_code == 200
+    submitted2 = mock_scheduler.submitted[-1]
+    assert submitted2.max_tokens == 1
+
+
+# ---------------------------------------------------------------------------
+# B4: Unified timeout + auto-cancel tests
+# ---------------------------------------------------------------------------
+
+
+class SlowMockScheduler(MockScheduler):
+    """Scheduler mock whose get_result blocks until timeout expires."""
+
+    def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
+        """Block for longer than the timeout, then return empty (simulating timeout)."""
+        import time as _time
+        if timeout is not None:
+            _time.sleep(timeout + 0.1)
+        return []  # empty = timed out
+
+    def submit_request(self, request: InferenceRequest) -> None:
+        self.submitted.append(request)
+        # Do NOT push tokens into streams — simulate stalled inference
+
+
+class SlowStreamScheduler(MockScheduler):
+    """Scheduler mock that registers a stream queue but never pushes tokens."""
+
+    def submit_request(self, request: InferenceRequest) -> None:
+        self.submitted.append(request)
+        # Intentionally do NOT push tokens into the stream queue
+
+
+@pytest.fixture
+def short_timeout_config(tmp_path):
+    """ServerConfig with a very short request_timeout_s for testing."""
+    return ServerConfig(
+        model="test-model",
+        block_size=4,
+        num_blocks=64,
+        ssd_cache_dir=tmp_path / "ssd-cache",
+        max_batch_size=2,
+        max_queue_size=8,
+        request_timeout_s=0.1,  # 100ms — very short for fast tests
+    )
+
+
+@pytest.fixture
+def slow_scheduler():
+    return SlowMockScheduler()
+
+
+@pytest.fixture
+def slow_stream_scheduler():
+    return SlowStreamScheduler()
+
+
+@pytest.fixture
+def timeout_app(short_timeout_config, slow_scheduler, mock_tokenizer):
+    return create_app(
+        config=short_timeout_config,
+        scheduler=slow_scheduler,
+        tokenizer=mock_tokenizer,
+    )
+
+
+@pytest.fixture
+async def timeout_client(timeout_app):
+    transport = ASGITransport(app=timeout_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.fixture
+def stream_timeout_app(short_timeout_config, slow_stream_scheduler, mock_tokenizer):
+    return create_app(
+        config=short_timeout_config,
+        scheduler=slow_stream_scheduler,
+        tokenizer=mock_tokenizer,
+    )
+
+
+@pytest.fixture
+async def stream_timeout_client(stream_timeout_app):
+    transport = ASGITransport(app=stream_timeout_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        yield ac
+
+
+@pytest.mark.anyio
+async def test_timeout_uses_config_value(timeout_client, slow_scheduler):
+    """B4: Non-streaming request times out using config.request_timeout_s and returns 504."""
+    resp = await timeout_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 50,
+        },
+    )
+    assert resp.status_code == 504
+    data = resp.json()
+    assert "timed out" in data["error"]["message"].lower()
+    # Verify cancel was called
+    assert len(slow_scheduler.cancelled) == 1
+
+
+@pytest.mark.anyio
+async def test_stream_timeout_cancels_request(stream_timeout_client, slow_stream_scheduler):
+    """B4: Stream timeout cancels the request and emits an error SSE event."""
+    resp = await stream_timeout_client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hi"}],
+            "max_tokens": 50,
+            "stream": True,
+        },
+    )
+    assert resp.status_code == 200
+    assert "text/event-stream" in resp.headers["content-type"]
+
+    body = resp.text
+    lines = [l for l in body.strip().split("\n") if l.strip()]
+
+    # Should contain an error SSE event about stream timeout
+    error_found = False
+    for line in lines:
+        if line.startswith("data: ") and line != "data: [DONE]":
+            payload = line[len("data: "):]
+            try:
+                chunk = json.loads(payload)
+                if "error" in chunk:
+                    assert "Stream timeout" in chunk["error"]["message"]
+                    assert "0.1" in chunk["error"]["message"]  # config value reflected
+                    error_found = True
+            except json.JSONDecodeError:
+                pass
+
+    assert error_found, "Expected a stream timeout error SSE event"
+    # Should end with [DONE]
+    assert lines[-1] == "data: [DONE]"
+    # Verify cancel was called on the scheduler
+    assert len(slow_stream_scheduler.cancelled) == 1

@@ -15,7 +15,10 @@ Design references:
 
 from __future__ import annotations
 
+import heapq
+import hashlib
 import logging
+import struct
 import threading
 import time
 from collections import deque
@@ -91,22 +94,33 @@ class BlockPool:
         return len(self.free_queue)
 
 
-def compute_block_hash(prefix_tokens: list[int], block_tokens: list[int]) -> int:
+def compute_block_hash(prefix_tokens: list[int], block_tokens: list[int]) -> str:
     """Compute a deterministic hash for a KV cache block.
+
+    Uses blake2b for cross-process determinism (Python's hash() is randomized
+    per process via PYTHONHASHSEED).
 
     The hash is derived from the full token context: all tokens that came
     before this block (prefix) concatenated with the tokens in this block.
-    This ensures that the same token sequence always maps to the same hash,
-    enabling automatic prefix caching.
+    A separator sentinel is inserted between prefix and block tokens to
+    distinguish boundary positions. This ensures that the same token sequence
+    always maps to the same hash, enabling automatic prefix caching.
 
     Args:
         prefix_tokens: All tokens preceding this block.
         block_tokens: The tokens contained in this block.
 
     Returns:
-        Integer hash value uniquely identifying this block's content in context.
+        Hex digest string uniquely identifying this block's content in context.
     """
-    return hash(tuple(prefix_tokens) + tuple(block_tokens))
+    h = hashlib.blake2b(digest_size=16)
+    for tok in prefix_tokens:
+        h.update(struct.pack("<i", tok))
+    # Separator to distinguish prefix boundary
+    h.update(b"\xff\xff\xff\xff")
+    for tok in block_tokens:
+        h.update(struct.pack("<i", tok))
+    return h.hexdigest()
 
 
 class KVCacheManager:
@@ -132,12 +146,13 @@ class KVCacheManager:
         self.config = config
         self.block_size = config.block_size
         self.pool = BlockPool(config.num_blocks)
-        self.hash_table: dict[int, int] = {}  # block_hash -> block_id
+        self.hash_table: dict[str, int] = {}  # block_hash -> block_id
         self.lock = threading.Lock()
+        self._eviction_heap: list[tuple[float, int]] = []  # (last_accessed, block_id)
 
     def compute_block_hash(
         self, prefix_tokens: list[int], block_tokens: list[int]
-    ) -> int:
+    ) -> str:
         """Compute hash for a block given its prefix and content tokens.
 
         Delegates to the module-level compute_block_hash function.
@@ -182,7 +197,7 @@ class KVCacheManager:
                 # Collision verification: ensure stored tokens match
                 if block.token_ids != block_tokens:
                     logger.warning(
-                        "Hash collision detected for hash %d: "
+                        "Hash collision detected for hash %s: "
                         "stored tokens %s != requested tokens %s",
                         block_hash,
                         block.token_ids[:8],  # Log first few tokens
@@ -243,7 +258,7 @@ class KVCacheManager:
                         block.last_accessed = time.time()
                         allocated_block_ids.append(block_id)
                         logger.debug(
-                            "Cache hit for block %d (hash=%d, ref_count=%d)",
+                            "Cache hit for block %d (hash=%s, ref_count=%d)",
                             block_id,
                             block_hash,
                             block.ref_count,
@@ -252,7 +267,7 @@ class KVCacheManager:
                     else:
                         # Hash collision with different tokens — treat as miss
                         logger.warning(
-                            "Hash collision during allocation for hash %d",
+                            "Hash collision during allocation for hash %s",
                             block_hash,
                         )
 
@@ -292,7 +307,7 @@ class KVCacheManager:
                 allocated_block_ids.append(block.block_id)
                 freshly_allocated.append(block.block_id)
                 logger.debug(
-                    "Allocated new block %d (hash=%d)",
+                    "Allocated new block %d (hash=%s)",
                     block.block_id,
                     block_hash,
                 )
@@ -320,6 +335,8 @@ class KVCacheManager:
                     )
                     continue
                 block.ref_count -= 1
+                if block.ref_count == 0:
+                    heapq.heappush(self._eviction_heap, (block.last_accessed, block_id))
                 logger.debug(
                     "Freed block %d (ref_count now %d)", block_id, block.ref_count
                 )
@@ -346,6 +363,9 @@ class KVCacheManager:
     def _evict_lru_locked(self, num_blocks: int = 1, exclude_ids: set[int] | None = None) -> list[int]:
         """Internal eviction logic — caller must hold self.lock.
 
+        Uses a min-heap for O(log N) per eviction instead of O(N log N) sort.
+        Stale heap entries (reused blocks, non-zero ref_count) are lazily skipped.
+
         Args:
             num_blocks: Maximum number of blocks to evict.
             exclude_ids: Block IDs to exclude from eviction (e.g. freshly stored blocks).
@@ -353,29 +373,104 @@ class KVCacheManager:
         Returns:
             List of evicted block_ids.
         """
-        # Find all blocks with ref_count == 0 that are in the hash_table
-        candidates: list[KVCacheBlock] = []
-        for block_hash, block_id in self.hash_table.items():
-            block = self.pool.blocks[block_id]
-            if block.ref_count == 0 and (exclude_ids is None or block.block_id not in exclude_ids):
-                candidates.append(block)
-
-        # Sort by last_accessed ascending (oldest first = LRU)
-        candidates.sort(key=lambda b: b.last_accessed)
-
         evicted_ids: list[int] = []
-        for block in candidates[:num_blocks]:
-            # Save hash before return_block clears it
+
+        while len(evicted_ids) < num_blocks and self._eviction_heap:
+            ts, block_id = heapq.heappop(self._eviction_heap)
+            block = self.pool.blocks[block_id]
+
+            # Skip stale entries: block was reused, freed, or ref_count changed
+            if block.ref_count != 0:
+                continue
+            if block.block_hash is None:
+                continue  # Already returned to free pool
+            if block.last_accessed != ts:
+                continue  # Timestamp changed (block was accessed since being pushed)
+            if exclude_ids is not None and block_id in exclude_ids:
+                # Re-push excluded blocks so they can be evicted later
+                heapq.heappush(self._eviction_heap, (ts, block_id))
+                continue
+
+            # Evict this block
             saved_hash = block.block_hash
-            # Remove from hash table
             if saved_hash is not None and saved_hash in self.hash_table:
                 del self.hash_table[saved_hash]
-            # Return to free pool (clears block metadata)
-            self.pool.return_block(block.block_id)
-            evicted_ids.append(block.block_id)
-            logger.debug("Evicted block %d (hash=%s)", block.block_id, saved_hash)
+            self.pool.return_block(block_id)
+            evicted_ids.append(block_id)
+            logger.debug("Evicted block %d (hash=%s)", block_id, saved_hash)
+
+        # Fallback: if heap was all stale but there are still evictable blocks,
+        # do a linear scan (rare case, O(N))
+        if len(evicted_ids) < num_blocks:
+            candidates: list[KVCacheBlock] = []
+            for bh, bid in self.hash_table.items():
+                block = self.pool.blocks[bid]
+                if block.ref_count == 0 and (exclude_ids is None or bid not in exclude_ids):
+                    if bid not in evicted_ids:
+                        candidates.append(block)
+            candidates.sort(key=lambda b: b.last_accessed)
+
+            for block in candidates[:num_blocks - len(evicted_ids)]:
+                saved_hash = block.block_hash
+                if saved_hash is not None and saved_hash in self.hash_table:
+                    del self.hash_table[saved_hash]
+                self.pool.return_block(block.block_id)
+                evicted_ids.append(block.block_id)
+                logger.debug("Evicted block %d (hash=%s) [fallback]", block.block_id, saved_hash)
 
         return evicted_ids
+
+    def cache_block(
+        self,
+        block_hash: str,
+        token_ids: list[int],
+        kv_data: list,
+        tiered_cache=None,
+        exclude_ids: set[int] | None = None,
+    ) -> int | None:
+        """Atomically cache a block: allocate or reuse, with eviction fallback.
+
+        If the block_hash already exists in the hash table, this is a no-op
+        (the block is already cached). Otherwise, allocates a free block,
+        populates it, and registers it in the hash table.
+
+        Args:
+            block_hash: Hash identifying this block.
+            token_ids: Token IDs stored in this block (for collision verification).
+            kv_data: Per-layer KV data for this block.
+            tiered_cache: Optional TieredKVCache for SSD eviction fallback.
+            exclude_ids: Block IDs to exclude from eviction.
+
+        Returns:
+            The block_id of the cached block, or None if caching failed.
+        """
+        with self.lock:
+            # Already cached — nothing to do
+            if block_hash in self.hash_table:
+                return self.hash_table[block_hash]
+
+            # Try to allocate a free block
+            try:
+                block = self.pool.get_free_block()
+            except BlockPoolExhaustedError:
+                # Try eviction before giving up
+                if tiered_cache is not None:
+                    tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=exclude_ids)
+                else:
+                    self._evict_lru_locked(num_blocks=1, exclude_ids=exclude_ids)
+                try:
+                    block = self.pool.get_free_block()
+                except BlockPoolExhaustedError:
+                    return None
+
+            block.block_hash = block_hash
+            block.token_ids = list(token_ids)
+            block.ref_count = 0
+            block.last_accessed = time.time()
+            block.kv_data = list(kv_data)
+            self.hash_table[block_hash] = block.block_id
+            heapq.heappush(self._eviction_heap, (block.last_accessed, block.block_id))
+            return block.block_id
 
     # --- Convenience / introspection methods ---
 
@@ -479,7 +574,7 @@ class TieredKVCache:
         self.ram = ram
         self.ssd = ssd
 
-    def lookup(self, block_hash: int) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
+    def lookup(self, block_hash: str) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Look up KV data for a block hash, checking RAM then SSD.
 
         Args:

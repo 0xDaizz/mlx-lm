@@ -184,6 +184,19 @@ class Scheduler:
         self._ssd_prune_interval: int = 1000
         self._ssd_prune_counter: int = 0
 
+        # Cache effectiveness counters
+        self._stats: dict[str, int] = {
+            "cache_hits_sequence": 0,
+            "cache_hits_block": 0,
+            "cache_misses": 0,
+            "requests_completed": 0,
+            "requests_errored": 0,
+            "tokens_generated": 0,
+            "total_prefill_tokens": 0,
+            "total_cached_tokens": 0,
+            "total_requests": 0,
+        }
+
         # Initialize BatchGenerator if model is available
         if self.model is not None and BatchGenerator is not None:
             self._create_batch_generator()
@@ -223,6 +236,7 @@ class Scheduler:
         to prevent resource leaks (streaming requests use register_stream instead).
         """
         self.request_queue.add(request)
+        self._stats["total_requests"] += 1
 
         # Set up result storage only for non-streaming requests
         if not getattr(request, "stream", False):
@@ -402,6 +416,37 @@ class Scheduler:
             raise
 
         # 4. Process responses
+        events, uids_to_remove, finished_caches = self._process_batch_responses(responses)
+
+        # 5. Emit token events
+        self._emit_tokens(events)
+
+        # 6. Remove early-stopped UIDs from BatchGenerator
+        if uids_to_remove:
+            try:
+                caches = self._batch_generator.remove(
+                    uids_to_remove, return_prompt_caches=True
+                )
+                if caches:
+                    finished_caches.update(caches)
+            except Exception as e:
+                logger.warning("Failed to remove UIDs from BatchGenerator: %s", e)
+
+        # 7. Store finished caches
+        self._store_finished_caches(finished_caches)
+
+        # 8. Periodic SSD pruning
+        self._prune_ssd_if_needed()
+
+        # 9. Clean up finished sequences
+        self._cleanup_finished_batch()
+
+    def _process_batch_responses(self, responses) -> tuple[list[TokenEvent], list[int], dict[int, list]]:
+        """Process batch responses: detokenize, check stops, create events.
+
+        Returns:
+            Tuple of (events, uids_to_remove, finished_caches).
+        """
         uids_to_remove: list[int] = []
         events: list[TokenEvent] = []
         finished_caches: dict[int, list] = {}
@@ -441,6 +486,7 @@ class Scheduler:
             if finish_reason is not None:
                 seq.is_finished = True
                 seq.finish_reason = finish_reason
+                self._stats["requests_completed"] += 1
                 # Save prompt cache for sequence cache store and block decomposition
                 if r.prompt_cache is not None:
                     try:
@@ -459,21 +505,10 @@ class Scheduler:
             )
             events.append(event)
 
-        # 5. Emit token events
-        self._emit_tokens(events)
+        return events, uids_to_remove, finished_caches
 
-        # 6. Remove early-stopped UIDs from BatchGenerator
-        if uids_to_remove:
-            try:
-                caches = self._batch_generator.remove(
-                    uids_to_remove, return_prompt_caches=True
-                )
-                if caches:
-                    finished_caches.update(caches)
-            except Exception as e:
-                logger.warning("Failed to remove UIDs from BatchGenerator: %s", e)
-
-        # 7. Store finished caches in SequenceCacheStore and decompose to blocks
+    def _store_finished_caches(self, finished_caches: dict[int, list]) -> None:
+        """Store finished sequence caches and decompose to block-level cache."""
         for uid, prompt_cache in finished_caches.items():
             rid = self._uid_to_request_id.get(uid)
             if rid is None:
@@ -499,31 +534,20 @@ class Scheduler:
                     )
                     protected_ids: set[int] = set()
                     for bd in block_dicts:
-                        bh = bd['block_hash']
-                        with self.kv_cache_manager.lock:
-                            if bh not in self.kv_cache_manager.hash_table:
-                                try:
-                                    block = self.kv_cache_manager.pool.get_free_block()
-                                except Exception:
-                                    if self._tiered_cache is not None:
-                                        self._tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=protected_ids)
-                                    else:
-                                        self.kv_cache_manager._evict_lru_locked(num_blocks=1, exclude_ids=protected_ids)
-                                    try:
-                                        block = self.kv_cache_manager.pool.get_free_block()
-                                    except Exception:
-                                        continue
-                                block.block_hash = bh
-                                block.token_ids = bd['token_ids']
-                                block.ref_count = 0
-                                block.last_accessed = time.time()
-                                block.kv_data = list(bd['kv_data_per_layer'])
-                                self.kv_cache_manager.hash_table[bh] = block.block_id
-                                protected_ids.add(block.block_id)
+                        block_id = self.kv_cache_manager.cache_block(
+                            block_hash=bd['block_hash'],
+                            token_ids=bd['token_ids'],
+                            kv_data=bd['kv_data_per_layer'],
+                            tiered_cache=self._tiered_cache,
+                            exclude_ids=protected_ids,
+                        )
+                        if block_id is not None:
+                            protected_ids.add(block_id)
                 except Exception as e:
                     logger.debug("Failed to decompose cache to blocks: %s", e)
 
-        # 8. Periodic SSD pruning (P7.4)
+    def _prune_ssd_if_needed(self) -> None:
+        """Periodically prune expired SSD cache blocks."""
         self._ssd_prune_counter += 1
         if self._ssd_prune_counter >= self._ssd_prune_interval:
             self._ssd_prune_counter = 0
@@ -534,9 +558,6 @@ class Scheduler:
                         logger.info("Pruned %d expired SSD blocks", pruned)
                 except Exception as e:
                     logger.warning("SSD pruning failed: %s", e)
-
-        # 9. Clean up finished sequences
-        self._cleanup_finished_batch()
 
     def _process_cancellations_batch(self) -> None:
         """Remove cancelled requests from BatchGenerator."""
@@ -626,6 +647,8 @@ class Scheduler:
                                     "Block cache hit for %s: %d tokens cached",
                                     req.request_id, num_cached,
                                 )
+                                self._stats["cache_hits_block"] += 1
+                                self._stats["total_cached_tokens"] += num_cached
                                 remaining_tokens = seq.token_ids[num_cached:]
                         except Exception as e:
                             logger.warning(
@@ -640,11 +663,18 @@ class Scheduler:
                     if cached is not None:
                         cache = cached
                         remaining_tokens = remaining if remaining else seq.token_ids
+                        num_seq_cached = len(seq.token_ids) - len(remaining) if remaining else len(seq.token_ids)
+                        self._stats["cache_hits_sequence"] += 1
+                        self._stats["total_cached_tokens"] += num_seq_cached
                         logger.debug(
                             "Sequence cache hit for %s: %d tokens cached",
                             req.request_id,
-                            len(seq.token_ids) - len(remaining),
+                            num_seq_cached,
                         )
+
+                # Track cache miss (neither block nor sequence cache hit)
+                if cache is None:
+                    self._stats["cache_misses"] += 1
 
                 # Create sampler
                 sampler = None
@@ -657,6 +687,9 @@ class Scheduler:
                     seq.finish_reason = "length"
                     self._signal_finish(req.request_id, finish_reason="length")
                     continue
+
+                # Track prefill tokens (tokens that need actual computation)
+                self._stats["total_prefill_tokens"] += len(remaining_tokens)
 
                 # Handle edge case: full cache hit (remaining_tokens empty)
                 # Must pass at least the last token for logit generation
@@ -726,6 +759,7 @@ class Scheduler:
                 if not seq.is_finished:
                     seq.is_finished = True
                     seq.finish_reason = "error"
+                    self._stats["requests_errored"] += 1
                     self._signal_finish(seq.request_id, finish_reason="error")
         self._cleanup_finished_batch()
 
@@ -749,6 +783,7 @@ class Scheduler:
                 if not seq.is_finished:
                     seq.is_finished = True
                     seq.finish_reason = "error"
+                    self._stats["requests_errored"] += 1
                     self._signal_finish(seq.request_id, finish_reason="error")
         self._cleanup_finished()
 
@@ -850,12 +885,19 @@ class Scheduler:
         Real model prefill is handled by BatchGenerator in _batch_inference_step.
         """
         for seq in sequences:
+            # Track prefill vs cached tokens (mock path)
+            num_cached = seq.num_computed_tokens
+            num_prefill = len(seq.token_ids) - num_cached
+            self._stats["total_prefill_tokens"] += num_prefill
+            self._stats["total_cached_tokens"] += num_cached
             # Mock mode: mark all prompt tokens as computed (prefill complete)
             seq.num_computed_tokens = len(seq.token_ids)
             logger.debug(
-                "Prefill complete for %s (%d tokens)",
+                "Prefill complete for %s (%d tokens, %d cached, %d prefilled)",
                 seq.request_id,
                 seq.num_computed_tokens,
+                num_cached,
+                num_prefill,
             )
 
     def _run_decode_step(self, sequences: list[SequenceState]) -> list[TokenEvent]:
@@ -958,27 +1000,52 @@ class Scheduler:
 
     # --- Token Delivery ---
 
+    def _put_event_to_stream(
+        self, stream: queue.Queue, event: TokenEvent, request_id: str, is_finish: bool = False
+    ) -> None:
+        """Put a token event onto a stream queue with backpressure handling.
+
+        For finish events (is_finish=True), uses a blocking put with timeout
+        to guarantee delivery. For regular token events, uses put_nowait with
+        drop-oldest retry on full queue.
+        """
+        if is_finish:
+            try:
+                stream.put(event, timeout=5)
+            except queue.Full:
+                logger.warning("Stream queue full for %s during finish, dropping oldest", request_id)
+                try:
+                    stream.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    stream.put_nowait(event)
+                except queue.Full:
+                    logger.warning("Stream queue full for %s, finish event dropped", request_id)
+        else:
+            try:
+                stream.put_nowait(event)
+            except queue.Full:
+                try:
+                    stream.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    stream.put_nowait(event)
+                except queue.Full:
+                    logger.warning("Stream queue full for %s, dropping token", request_id)
+
     def _emit_tokens(self, events: list[TokenEvent]) -> None:
         """Deliver token events to streams and result buffers."""
         for event in events:
+            self._stats["tokens_generated"] += 1
             rid = event.request_id
 
             # Deliver to stream if registered
             with self._streams_lock:
                 stream = self._streams.get(rid)
             if stream is not None:
-                try:
-                    stream.put_nowait(event)
-                except queue.Full:
-                    # Drop oldest token to make room (slow consumer)
-                    try:
-                        stream.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        stream.put_nowait(event)
-                    except queue.Full:
-                        logger.warning("Stream queue full for %s, dropping token", rid)
+                self._put_event_to_stream(stream, event, rid, is_finish=(event.finish_reason is not None))
                 if event.finish_reason is not None:
                     with self._streams_lock:
                         self._streams.pop(rid, None)
@@ -1004,17 +1071,7 @@ class Scheduler:
         with self._streams_lock:
             stream = self._streams.pop(request_id, None)
         if stream is not None:
-            try:
-                stream.put_nowait(event)
-            except queue.Full:
-                try:
-                    stream.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    stream.put_nowait(event)
-                except queue.Full:
-                    logger.warning("Stream queue full for %s during finish signal", request_id)
+            self._put_event_to_stream(stream, event, request_id, is_finish=True)
 
         with self._results_lock:
             if request_id in self._results:
@@ -1032,6 +1089,9 @@ class Scheduler:
             ]
             for rid in finished_ids:
                 seq = self._active_sequences.pop(rid)
+                # Track completed (non-error) requests
+                if seq.finish_reason != "error":
+                    self._stats["requests_completed"] += 1
                 # Free KV cache blocks if manager is available
                 if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)
@@ -1065,6 +1125,25 @@ class Scheduler:
             stats["used_blocks"] = self.kv_cache_manager.num_used_blocks
             stats["free_blocks"] = self.kv_cache_manager.num_free_blocks
             stats["cached_blocks"] = self.kv_cache_manager.num_cached_blocks
+        # Add effectiveness counters
+        stats.update(self._stats)
+        total_lookups = (
+            self._stats["cache_hits_block"]
+            + self._stats["cache_hits_sequence"]
+            + self._stats["cache_misses"]
+        )
+        stats["cache_hit_rate"] = (
+            (self._stats["cache_hits_block"] + self._stats["cache_hits_sequence"])
+            / total_lookups
+            if total_lookups > 0
+            else 0.0
+        )
+        stats["cache_effectiveness"] = (
+            self._stats["total_cached_tokens"]
+            / (self._stats["total_cached_tokens"] + self._stats["total_prefill_tokens"])
+            if (self._stats["total_cached_tokens"] + self._stats["total_prefill_tokens"]) > 0
+            else 0.0
+        )
         return stats
 
     def shutdown(self) -> None:

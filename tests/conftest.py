@@ -15,6 +15,44 @@ from mlx_lm_server.server import create_app
 from mlx_lm_server.types import InferenceRequest, TokenEvent
 
 
+def make_test_request(
+    request_id: str = "req-1",
+    prompt_tokens: list[int] | None = None,
+    max_tokens: int = 10,
+    stream: bool = False,
+    stop_sequences: list[str] | None = None,
+    temperature: float = 1.0,
+    top_p: float = 1.0,
+    **kwargs,
+) -> InferenceRequest:
+    """Create an InferenceRequest with test defaults."""
+    return InferenceRequest(
+        request_id=request_id,
+        prompt_tokens=prompt_tokens or [1, 2, 3, 4],
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        stop_sequences=stop_sequences or [],
+        stream=stream,
+        **kwargs,
+    )
+
+
+def make_test_config(tmp_path: Path | None = None, **overrides) -> ServerConfig:
+    """Create a ServerConfig with small test defaults. Accepts **kwargs passthrough."""
+    defaults = dict(
+        block_size=4,
+        num_blocks=64,
+        max_batch_size=4,
+        max_queue_size=32,
+        prefill_batch_size=2,
+    )
+    if tmp_path is not None:
+        defaults["ssd_cache_dir"] = tmp_path / "ssd-cache"
+    defaults.update(overrides)
+    return ServerConfig(**defaults)
+
+
 @pytest.fixture
 def test_config(tmp_path: Path) -> ServerConfig:
     """Server config suitable for testing (small pool, temp SSD dir)."""

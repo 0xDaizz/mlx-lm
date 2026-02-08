@@ -821,7 +821,7 @@ class TestBlockCacheBridge:
         assert len(kv_mgr.hash_table) > 0, "Expected blocks from decomposition"
         for block_hash, block_id in kv_mgr.hash_table.items():
             block = kv_mgr.pool.blocks[block_id]
-            assert isinstance(block.block_hash, int)
+            assert isinstance(block.block_hash, str)
             assert len(block.token_ids) == kv_mgr.block_size
             if block.kv_data is not None:
                 # kv_data should be a list of per-layer dicts

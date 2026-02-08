@@ -36,7 +36,7 @@ class KVCacheBlock:
     """
 
     block_id: int
-    block_hash: int | None = None
+    block_hash: str | None = None
     token_ids: list[int] = field(default_factory=list)
     ref_count: int = 0
     last_accessed: float = field(default_factory=time.time)
@@ -80,7 +80,7 @@ class TokenEvent:
 class SSDBlockMeta:
     """Metadata for a KV cache block persisted to SSD."""
 
-    block_hash: int
+    block_hash: str
     filepath: Path
     last_accessed: datetime = field(default_factory=datetime.now)
     num_tokens: int = 0

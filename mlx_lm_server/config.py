@@ -45,5 +45,9 @@ class ServerConfig:
     default_temperature: float = 1.0
     default_top_p: float = 1.0
 
+    # Request limits
+    max_prompt_tokens: int = 32768  # Max prompt length in tokens
+    request_timeout_s: float = 120.0  # Timeout for inference requests
+
     # Distributed
     use_distributed: bool = False

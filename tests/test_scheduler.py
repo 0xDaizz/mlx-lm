@@ -15,39 +15,13 @@ from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.scheduler import RequestQueue, Scheduler
 from mlx_lm_server.types import InferenceRequest, SequenceState, TokenEvent
 
+from conftest import make_test_request as _make_request
+from conftest import make_test_config as _make_config
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def _make_request(
-    request_id: str = "req-1",
-    prompt_tokens: list[int] | None = None,
-    max_tokens: int = 10,
-    stream: bool = False,
-    stop_sequences: list[str] | None = None,
-    temperature: float = 1.0,
-) -> InferenceRequest:
-    return InferenceRequest(
-        request_id=request_id,
-        prompt_tokens=prompt_tokens or [1, 2, 3, 4],
-        max_tokens=max_tokens,
-        temperature=temperature,
-        stop_sequences=stop_sequences or [],
-        stream=stream,
-    )
-
-
-def _make_config(**overrides) -> ServerConfig:
-    defaults = dict(
-        block_size=4,
-        num_blocks=64,
-        max_batch_size=4,
-        max_queue_size=32,
-        prefill_batch_size=2,
-    )
-    defaults.update(overrides)
-    return ServerConfig(**defaults)
 
 
 def _make_scheduler(config: ServerConfig | None = None, **kwargs) -> Scheduler:
@@ -179,6 +153,7 @@ class TestScheduleStep:
         outputs = s.schedule_step()
         # Both should be in prefill (they have uncached prompt tokens)
         assert len(outputs.prefill_sequences) == 2
+        assert sorted([seq.request_id for seq in outputs.prefill_sequences]) == ["r1", "r2"]
         assert s.num_active_sequences == 2
         assert s.num_queued_requests == 0
 
@@ -562,6 +537,9 @@ class TestContinuousBatching:
             for rid, tokens in results.items():
                 assert len(tokens) == 3, f"{rid} got {len(tokens)} tokens"
                 assert tokens[-1].finish_reason == "stop"
+                # Verify actual token text content
+                token_texts = [t.token_text for t in tokens]
+                assert token_texts == ["t0", "t1", "t2"], f"{rid} got unexpected texts {token_texts}"
         finally:
             s.stop()
 
@@ -647,3 +625,242 @@ class TestRemainingTokens:
 
         mock_cache_mgr.find_cached_prefix.assert_called_once()
         assert seq.num_computed_tokens == 4
+
+
+# ---------------------------------------------------------------------------
+# D2  Error Recovery tests
+# ---------------------------------------------------------------------------
+
+
+class TestErrorRecovery:
+    """Tests for error recovery in the mock inference path."""
+
+    def test_batch_error_signals_all_active(self):
+        """All active requests get finish_reason='error' when _mock_generate crashes."""
+        s = _make_scheduler()
+
+        call_count = 0
+
+        def crash_on_step_1(rid, tids, step):
+            nonlocal call_count
+            call_count += 1
+            if step >= 1:
+                raise RuntimeError("test crash")
+            return (step + 100, f"t{step}", None)
+
+        s._mock_generate = crash_on_step_1
+
+        s.submit_request(_make_request("r1", max_tokens=10))
+        s.submit_request(_make_request("r2", max_tokens=10))
+
+        s.run_inference_loop(blocking=False)
+        try:
+            tokens_r1 = s.get_result("r1", timeout=5.0)
+            tokens_r2 = s.get_result("r2", timeout=5.0)
+
+            # Both requests should have received a finish event with error
+            assert any(t.finish_reason == "error" for t in tokens_r1), (
+                f"r1 should get error finish, got: {[t.finish_reason for t in tokens_r1]}"
+            )
+            assert any(t.finish_reason == "error" for t in tokens_r2), (
+                f"r2 should get error finish, got: {[t.finish_reason for t in tokens_r2]}"
+            )
+        finally:
+            s.stop()
+
+    def test_batch_error_frees_resources(self):
+        """After an error, active sequences are cleaned up and resources freed."""
+        from unittest.mock import MagicMock
+
+        mock_cache_mgr = MagicMock()
+        mock_cache_mgr.find_cached_prefix = MagicMock(return_value=0)
+
+        s = _make_scheduler(kv_cache_manager=mock_cache_mgr)
+
+        def crash_immediately(rid, tids, step):
+            raise RuntimeError("crash on step 0")
+
+        s._mock_generate = crash_immediately
+
+        s.submit_request(_make_request("r1", max_tokens=10))
+
+        s.run_inference_loop(blocking=False)
+        try:
+            tokens = s.get_result("r1", timeout=5.0)
+            assert any(t.finish_reason == "error" for t in tokens)
+
+            # Give a moment for cleanup to complete
+            time.sleep(0.2)
+
+            # Active sequences should be cleaned up
+            assert s.num_active_sequences == 0, (
+                f"Expected 0 active sequences, got {s.num_active_sequences}"
+            )
+            # Queue should be empty
+            assert s.request_queue.size == 0
+        finally:
+            s.stop()
+
+    def test_batch_error_recovery(self):
+        """After an error, new requests can still be processed successfully."""
+        s = _make_scheduler()
+
+        # First: crash on step 0
+        def crash_gen(rid, tids, step):
+            raise RuntimeError("crash on step 0")
+
+        s._mock_generate = crash_gen
+
+        s.submit_request(_make_request("req-fail", max_tokens=10))
+
+        s.run_inference_loop(blocking=False)
+        try:
+            tokens_fail = s.get_result("req-fail", timeout=5.0)
+            assert any(t.finish_reason == "error" for t in tokens_fail), (
+                f"req-fail should get error, got: {[t.finish_reason for t in tokens_fail]}"
+            )
+
+            # Now swap to a working generator: 3 tokens then stop
+            def working_gen(rid, tids, step):
+                if step >= 2:
+                    return (step + 200, f"ok{step}", "stop")
+                return (step + 200, f"ok{step}", None)
+
+            s._mock_generate = working_gen
+
+            s.submit_request(_make_request("req-ok", max_tokens=10))
+
+            tokens_ok = s.get_result("req-ok", timeout=5.0)
+            assert len(tokens_ok) == 3, (
+                f"req-ok should get 3 tokens, got {len(tokens_ok)}"
+            )
+            assert tokens_ok[-1].finish_reason == "stop", (
+                f"req-ok last token should be 'stop', got '{tokens_ok[-1].finish_reason}'"
+            )
+        finally:
+            s.stop()
+
+    def test_stream_gets_error_finish(self):
+        """Streaming requests receive a finish event with error on crash."""
+        s = _make_scheduler()
+
+        def crash_immediately(rid, tids, step):
+            raise RuntimeError("crash on step 0")
+
+        s._mock_generate = crash_immediately
+
+        stream_q = s.register_stream("err-stream")
+        s.submit_request(_make_request("err-stream", max_tokens=10, stream=True))
+
+        s.run_inference_loop(blocking=False)
+        try:
+            # Read events from the stream until we get a finish event
+            error_event = None
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                try:
+                    ev = stream_q.get(timeout=1.0)
+                except queue.Empty:
+                    continue
+                if ev is None:
+                    # Sentinel — stream ended
+                    break
+                if ev.finish_reason is not None:
+                    error_event = ev
+                    break
+
+            assert error_event is not None, "Should have received an error finish event"
+            assert error_event.finish_reason == "error", (
+                f"Expected finish_reason='error', got '{error_event.finish_reason}'"
+            )
+            assert error_event.token_text == "", (
+                f"Expected empty token_text on error, got '{error_event.token_text}'"
+            )
+        finally:
+            s.stop()
+
+
+# ---------------------------------------------------------------------------
+# E1  Cache Stats tests
+# ---------------------------------------------------------------------------
+
+
+class TestCacheStats:
+    """Tests for cache effectiveness counters (E1)."""
+
+    def test_stats_initialized(self):
+        """Scheduler starts with zeroed stats."""
+        s = _make_scheduler()
+        stats = s.get_cache_stats()
+        assert stats["cache_misses"] == 0
+        assert stats["cache_hits_block"] == 0
+        assert stats["cache_hits_sequence"] == 0
+        assert stats["requests_completed"] == 0
+        assert stats["requests_errored"] == 0
+        assert stats["tokens_generated"] == 0
+        assert stats["cache_hit_rate"] == 0.0
+
+    def test_stats_after_completion(self):
+        """Stats update after a request completes."""
+        s = _make_scheduler()
+        s._mock_generate = lambda rid, tids, step: (
+            step + 100,
+            f"t{step}",
+            "stop" if step >= 2 else None,
+        )
+        req = _make_request("stats-req", max_tokens=10)
+        s.submit_request(req)
+        s.run_inference_loop(blocking=False)
+        try:
+            s.get_result("stats-req", timeout=5.0)
+            stats = s.get_cache_stats()
+            assert stats["tokens_generated"] >= 3
+            assert stats["requests_completed"] >= 1
+        finally:
+            s.stop()
+
+    def test_stats_after_error(self):
+        """requests_errored increments after mock error."""
+        s = _make_scheduler()
+        s._mock_generate = lambda rid, tids, step: (_ for _ in ()).throw(
+            RuntimeError("crash")
+        )
+        req = _make_request("err-req", max_tokens=5)
+        s.submit_request(req)
+        s.run_inference_loop(blocking=False)
+        try:
+            result = s.get_result("err-req", timeout=5.0)
+            assert any(e.finish_reason == "error" for e in result)
+            stats = s.get_cache_stats()
+            assert stats["requests_errored"] >= 1
+        finally:
+            s.stop()
+
+    def test_cache_hit_rate_zero_when_no_lookups(self):
+        """cache_hit_rate is 0.0 when no cache lookups have occurred."""
+        s = _make_scheduler()
+        stats = s.get_cache_stats()
+        assert stats["cache_hit_rate"] == 0.0
+
+    def test_tokens_generated_multiple_requests(self):
+        """tokens_generated accumulates across multiple requests."""
+        s = _make_scheduler()
+        # Each request generates exactly 2 tokens then stops
+        s._mock_generate = lambda rid, tids, step: (
+            step + 1,
+            f"t{step}",
+            "stop" if step >= 1 else None,
+        )
+
+        s.submit_request(_make_request("r1", max_tokens=10))
+        s.submit_request(_make_request("r2", max_tokens=10))
+        s.run_inference_loop(blocking=False)
+        try:
+            s.get_result("r1", timeout=5.0)
+            s.get_result("r2", timeout=5.0)
+            stats = s.get_cache_stats()
+            # 2 tokens per request * 2 requests = 4 tokens minimum
+            assert stats["tokens_generated"] >= 4
+            assert stats["requests_completed"] >= 2
+        finally:
+            s.stop()

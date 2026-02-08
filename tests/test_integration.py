@@ -25,40 +25,19 @@ from mlx_lm_server.scheduler import Scheduler
 from mlx_lm_server.ssd_cache import SSDCache
 from mlx_lm_server.types import InferenceRequest, TokenEvent
 
+from conftest import make_test_request as _make_request
+from conftest import make_test_config
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 
-def _make_request(
-    request_id: str = "req-1",
-    prompt_tokens: list[int] | None = None,
-    max_tokens: int = 5,
-    stream: bool = False,
-    stop_sequences: list[str] | None = None,
-) -> InferenceRequest:
-    return InferenceRequest(
-        request_id=request_id,
-        prompt_tokens=prompt_tokens or [1, 2, 3, 4],
-        max_tokens=max_tokens,
-        stop_sequences=stop_sequences or [],
-        stream=stream,
-    )
-
-
 def _make_config(tmp_path: Path | None = None, **overrides) -> ServerConfig:
-    defaults = dict(
-        block_size=4,
-        num_blocks=64,
-        max_batch_size=8,
-        max_queue_size=32,
-        prefill_batch_size=4,
-    )
-    if tmp_path is not None:
-        defaults["ssd_cache_dir"] = tmp_path / "ssd-cache"
-    defaults.update(overrides)
-    return ServerConfig(**defaults)
+    overrides.setdefault("max_batch_size", 8)
+    overrides.setdefault("prefill_batch_size", 4)
+    return make_test_config(tmp_path=tmp_path, **overrides)
 
 
 # ---------------------------------------------------------------------------
@@ -338,7 +317,7 @@ class TestE2ESSD:
         ssd = SSDCache(cache_dir=tmp_path / "ssd-cache", ttl_days=7)
         tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
 
-        result = tiered.lookup(999999)
+        result = tiered.lookup("nonexistent_hash")
         assert result is None
 
     def test_e2e_ssd_evict_without_kv_data(self, tmp_path):
@@ -495,3 +474,434 @@ class TestE2EConcurrent:
                 assert tokens[-1].finish_reason == "stop"
         finally:
             scheduler.stop()
+
+
+# ---------------------------------------------------------------------------
+# D4 — Full SSD Round-Trip Integration Tests
+# ---------------------------------------------------------------------------
+
+
+class TestSSDRoundTrip:
+    """Full SSD round-trip integration tests (D4).
+
+    Tests multi-layer KV data save/load through the tiered cache,
+    verifying data integrity after SSD round-trip.
+    """
+
+    def test_ssd_multilayer_roundtrip(self, tmp_path):
+        """Multi-layer KV data survives SSD save/load round-trip intact."""
+        ssd = SSDCache(cache_dir=tmp_path / "ssd-roundtrip", ttl_days=7)
+
+        # Create realistic multi-layer KV data (4 layers)
+        num_layers = 4
+        kv_data = []
+        for i in range(num_layers):
+            scale = float(i + 1)
+            kv_data.append({
+                "keys": mx.ones((1, 8, 4, 16)) * scale,
+                "values": mx.ones((1, 8, 4, 16)) * (scale + 0.5),
+            })
+
+        # Save to SSD
+        ssd.save_block("test_hash_abc123", kv_data)
+
+        # Load from SSD
+        loaded = ssd.load_block("test_hash_abc123")
+
+        # Verify loaded is not None
+        assert loaded is not None, "load_block returned None"
+
+        # Verify loaded is a list with the correct number of layers
+        assert isinstance(loaded, list), f"Expected list, got {type(loaded)}"
+        assert len(loaded) == num_layers, (
+            f"Expected {num_layers} layers, got {len(loaded)}"
+        )
+
+        # For each layer, verify keys and values match exactly
+        for i in range(num_layers):
+            scale = float(i + 1)
+            expected_keys = mx.ones((1, 8, 4, 16)) * scale
+            expected_values = mx.ones((1, 8, 4, 16)) * (scale + 0.5)
+
+            assert mx.allclose(loaded[i]["keys"], expected_keys).item(), (
+                f"Layer {i} keys mismatch"
+            )
+            assert mx.allclose(loaded[i]["values"], expected_values).item(), (
+                f"Layer {i} values mismatch"
+            )
+
+            # Verify shapes match
+            assert loaded[i]["keys"].shape == (1, 8, 4, 16), (
+                f"Layer {i} keys shape mismatch: {loaded[i]['keys'].shape}"
+            )
+            assert loaded[i]["values"].shape == (1, 8, 4, 16), (
+                f"Layer {i} values shape mismatch: {loaded[i]['values'].shape}"
+            )
+
+            # Verify dtypes match
+            assert loaded[i]["keys"].dtype == expected_keys.dtype, (
+                f"Layer {i} keys dtype mismatch: {loaded[i]['keys'].dtype}"
+            )
+            assert loaded[i]["values"].dtype == expected_values.dtype, (
+                f"Layer {i} values dtype mismatch: {loaded[i]['values'].dtype}"
+            )
+
+    def test_ssd_tiered_evict_reload_multilayer(self, tmp_path):
+        """Tiered cache evict-to-SSD and reload preserves multi-layer KV data."""
+        config = _make_config(tmp_path=tmp_path, block_size=4, num_blocks=8)
+        kv_mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "ssd-tiered", ttl_days=7)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        # Allocate blocks for tokens [1,2,3,4,5,6,7,8] (2 blocks of 4)
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        ids = kv_mgr.allocate_blocks(tokens)
+        assert len(ids) == 2
+
+        # Create multi-layer KV data for each block (2 layers)
+        num_layers = 2
+        original_data = {}
+        for block_idx, block_id in enumerate(ids):
+            block = kv_mgr.pool.blocks[block_id]
+            kv_data = []
+            for layer in range(num_layers):
+                scale = float((block_idx + 1) * 10 + layer)
+                kv_data.append({
+                    "keys": mx.ones((1, 4, 4, 8)) * scale,
+                    "values": mx.ones((1, 4, 4, 8)) * (scale + 0.1),
+                })
+            block.kv_data = kv_data
+            original_data[block.block_hash] = kv_data
+
+        # Save the block hashes before eviction
+        block_0 = kv_mgr.pool.blocks[ids[0]]
+        block_1 = kv_mgr.pool.blocks[ids[1]]
+        hash_0 = block_0.block_hash
+        hash_1 = block_1.block_hash
+        assert hash_0 is not None
+        assert hash_1 is not None
+
+        # Free blocks so they are eligible for eviction
+        kv_mgr.free_blocks(ids)
+
+        # Evict to SSD
+        evicted = tiered.evict_to_ssd(num_blocks=2)
+        assert len(evicted) == 2
+
+        # Verify SSD has 2 blocks
+        assert ssd.num_blocks == 2
+
+        # Verify hashes are no longer in RAM hash_table
+        assert hash_0 not in kv_mgr.hash_table
+        assert hash_1 not in kv_mgr.hash_table
+
+        # Lookup via tiered cache — should find in SSD
+        result_0 = tiered.lookup(hash_0)
+        assert result_0 is not None, "Tiered lookup for hash_0 returned None"
+        assert isinstance(result_0, list), f"Expected list, got {type(result_0)}"
+        assert len(result_0) == num_layers
+
+        # Verify the loaded data matches original
+        for layer in range(num_layers):
+            assert mx.allclose(
+                result_0[layer]["keys"],
+                original_data[hash_0][layer]["keys"],
+            ).item(), f"hash_0 layer {layer} keys mismatch after SSD round-trip"
+            assert mx.allclose(
+                result_0[layer]["values"],
+                original_data[hash_0][layer]["values"],
+            ).item(), f"hash_0 layer {layer} values mismatch after SSD round-trip"
+
+        # Also verify block 1
+        result_1 = tiered.lookup(hash_1)
+        assert result_1 is not None, "Tiered lookup for hash_1 returned None"
+        assert isinstance(result_1, list)
+        assert len(result_1) == num_layers
+
+        for layer in range(num_layers):
+            assert mx.allclose(
+                result_1[layer]["keys"],
+                original_data[hash_1][layer]["keys"],
+            ).item(), f"hash_1 layer {layer} keys mismatch after SSD round-trip"
+            assert mx.allclose(
+                result_1[layer]["values"],
+                original_data[hash_1][layer]["values"],
+            ).item(), f"hash_1 layer {layer} values mismatch after SSD round-trip"
+
+    def test_ssd_roundtrip_preserves_dtype(self, tmp_path):
+        """SSD round-trip preserves float16 dtype."""
+        ssd = SSDCache(cache_dir=tmp_path / "ssd-dtype", ttl_days=7)
+
+        kv_data = [{
+            "keys": mx.ones((1, 4, 4, 8), dtype=mx.float16),
+            "values": mx.zeros((1, 4, 4, 8), dtype=mx.float16),
+        }]
+
+        ssd.save_block("dtype_test_hash", kv_data)
+        loaded = ssd.load_block("dtype_test_hash")
+
+        assert loaded is not None, "load_block returned None"
+        assert isinstance(loaded, list)
+        assert len(loaded) == 1
+
+        assert loaded[0]["keys"].dtype == mx.float16, (
+            f"Expected float16 keys, got {loaded[0]['keys'].dtype}"
+        )
+        assert loaded[0]["values"].dtype == mx.float16, (
+            f"Expected float16 values, got {loaded[0]['values'].dtype}"
+        )
+
+        # Verify data values are correct
+        assert mx.allclose(
+            loaded[0]["keys"],
+            mx.ones((1, 4, 4, 8), dtype=mx.float16),
+        ).item(), "float16 keys data mismatch after round-trip"
+        assert mx.allclose(
+            loaded[0]["values"],
+            mx.zeros((1, 4, 4, 8), dtype=mx.float16),
+        ).item(), "float16 values data mismatch after round-trip"
+
+    def test_ssd_prefix_after_reload(self, tmp_path):
+        """find_cached_prefix only checks RAM hash_table, not SSD.
+
+        Documents current behavior: after eviction to SSD, blocks are no
+        longer discoverable via find_cached_prefix (which only checks
+        the RAM hash_table). The SSD tier is only consulted via
+        tiered.lookup() with an explicit block hash.
+        """
+        config = _make_config(tmp_path=tmp_path, block_size=4, num_blocks=8)
+        kv_mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "ssd-prefix", ttl_days=7)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        # Allocate blocks for tokens [10,20,30,40] (1 block of 4)
+        tokens = [10, 20, 30, 40]
+        ids = kv_mgr.allocate_blocks(tokens)
+        assert len(ids) == 1
+
+        # Attach KV data to the block
+        block = kv_mgr.pool.blocks[ids[0]]
+        block.kv_data = [{
+            "keys": mx.ones((1, 4, 4, 8)),
+            "values": mx.ones((1, 4, 4, 8)),
+        }]
+
+        # Save the block hash
+        block_hash = block.block_hash
+        assert block_hash is not None
+        assert block_hash in kv_mgr.hash_table
+
+        # Verify find_cached_prefix finds the first block
+        query = [10, 20, 30, 40, 50, 60, 70, 80]
+        cached = kv_mgr.find_cached_prefix(query)
+        assert cached == 4, f"Expected 4 cached tokens before eviction, got {cached}"
+
+        # Free and evict to SSD
+        kv_mgr.free_blocks(ids)
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) == 1
+
+        # Hash is removed from RAM hash_table
+        assert block_hash not in kv_mgr.hash_table
+
+        # find_cached_prefix returns 0 — SSD is not consulted
+        cached_after = kv_mgr.find_cached_prefix(query)
+        assert cached_after == 0, (
+            f"Expected 0 cached tokens after SSD eviction, got {cached_after}"
+        )
+
+        # But tiered.lookup() still finds the data in SSD
+        ssd_result = tiered.lookup(block_hash)
+        assert ssd_result is not None, "Tiered lookup should find block in SSD"
+
+    def test_ssd_cache_roundtrip_with_data_integrity(self, tmp_path):
+        """Full SSD round-trip: create KV data -> allocate -> cache -> evict -> SSD -> reload -> verify.
+
+        This is a comprehensive integration test that exercises the entire tiered
+        cache flow end-to-end, using realistic block hashes from compute_block_hash()
+        and random KV data to verify data integrity after an SSD round-trip.
+
+        Steps verified:
+        1. Create KVCacheManager, SSDCache, and TieredKVCache
+        2. Create random multi-layer KV data with mx.random.uniform
+        3. Allocate blocks using compute_block_hash for realistic hashes
+        4. Verify blocks exist in RAM
+        5. Evict blocks from RAM via TieredKVCache (saves to SSD)
+        6. Verify blocks are no longer in RAM
+        7. Verify SSD index contains the block hash entries
+        8. Lookup via TieredKVCache (falls through to SSD)
+        9. Load block data from SSD
+        10. Verify loaded data matches original (shape, dtype, values)
+        """
+        from mlx_lm_server.kv_cache_manager import compute_block_hash
+
+        # --- Step 1: Create manager, SSD cache, and tiered wrapper ---
+        block_size = 4
+        num_layers = 3
+        n_heads = 4
+        head_dim = 16
+        config = _make_config(
+            tmp_path=tmp_path, block_size=block_size, num_blocks=8,
+        )
+        kv_mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "ssd-integrity", ttl_days=7)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        # --- Step 2: Create random multi-layer KV data ---
+        # Use a fixed seed for reproducibility within the test
+        mx.random.seed(42)
+        token_sequence = [100, 200, 300, 400, 500, 600, 700, 800]  # 2 blocks of 4
+
+        # Compute expected block hashes using compute_block_hash
+        block_0_tokens = token_sequence[0:block_size]
+        block_1_tokens = token_sequence[block_size:2 * block_size]
+        expected_hash_0 = compute_block_hash([], block_0_tokens)
+        expected_hash_1 = compute_block_hash(
+            token_sequence[:block_size], block_1_tokens,
+        )
+
+        # Create per-block, per-layer KV data using random arrays
+        original_kv = {}  # hash -> list[dict] for verification later
+        for block_idx, expected_hash in enumerate([expected_hash_0, expected_hash_1]):
+            layers = []
+            for layer_idx in range(num_layers):
+                keys = mx.random.uniform(
+                    shape=(1, n_heads, block_size, head_dim),
+                )
+                values = mx.random.uniform(
+                    shape=(1, n_heads, block_size, head_dim),
+                )
+                # Force evaluation so arrays are materialized
+                mx.eval(keys)
+                mx.eval(values)
+                layers.append({"keys": keys, "values": values})
+            original_kv[expected_hash] = layers
+
+        # --- Step 3: Allocate blocks and store KV data ---
+        block_ids = kv_mgr.allocate_blocks(token_sequence)
+        assert len(block_ids) == 2, f"Expected 2 blocks, got {len(block_ids)}"
+
+        # Attach KV data to each block
+        for i, block_id in enumerate(block_ids):
+            block = kv_mgr.pool.blocks[block_id]
+            block_hash = block.block_hash
+            assert block_hash is not None, f"Block {block_id} has no hash"
+            block.kv_data = original_kv[block_hash]
+
+        # Verify block hashes match expected
+        block_0 = kv_mgr.pool.blocks[block_ids[0]]
+        block_1 = kv_mgr.pool.blocks[block_ids[1]]
+        assert block_0.block_hash == expected_hash_0, (
+            f"Block 0 hash mismatch: {block_0.block_hash} != {expected_hash_0}"
+        )
+        assert block_1.block_hash == expected_hash_1, (
+            f"Block 1 hash mismatch: {block_1.block_hash} != {expected_hash_1}"
+        )
+
+        # --- Step 4: Verify blocks exist in RAM ---
+        assert expected_hash_0 in kv_mgr.hash_table, "Block 0 not in RAM hash_table"
+        assert expected_hash_1 in kv_mgr.hash_table, "Block 1 not in RAM hash_table"
+
+        # Verify RAM lookup via tiered cache returns data
+        ram_result_0 = tiered.lookup(expected_hash_0)
+        assert ram_result_0 is not None, "RAM lookup for block 0 returned None"
+        assert isinstance(ram_result_0, list), f"Expected list, got {type(ram_result_0)}"
+        assert len(ram_result_0) == num_layers
+
+        # --- Step 5: Free blocks and evict to SSD ---
+        kv_mgr.free_blocks(block_ids)
+        evicted = tiered.evict_to_ssd(num_blocks=2)
+        assert len(evicted) == 2, f"Expected 2 evicted blocks, got {len(evicted)}"
+
+        # --- Step 6: Verify blocks are no longer in RAM ---
+        assert expected_hash_0 not in kv_mgr.hash_table, (
+            "Block 0 still in RAM after eviction"
+        )
+        assert expected_hash_1 not in kv_mgr.hash_table, (
+            "Block 1 still in RAM after eviction"
+        )
+        assert kv_mgr.num_free_blocks == 8, (
+            f"Expected all 8 blocks free, got {kv_mgr.num_free_blocks}"
+        )
+
+        # --- Step 7: Verify SSD index contains block hash entries ---
+        assert ssd.num_blocks == 2, f"Expected 2 SSD blocks, got {ssd.num_blocks}"
+        assert expected_hash_0 in ssd.index, "Block 0 hash not in SSD index"
+        assert expected_hash_1 in ssd.index, "Block 1 hash not in SSD index"
+
+        # Verify the SSD index file on disk contains the entries
+        index_path = ssd.cache_dir / "index.json"
+        assert index_path.exists(), "SSD index.json file does not exist"
+        import json
+        index_data = json.loads(index_path.read_text())
+        assert expected_hash_0 in index_data, (
+            "Block 0 hash not in persisted index.json"
+        )
+        assert expected_hash_1 in index_data, (
+            "Block 1 hash not in persisted index.json"
+        )
+
+        # Verify safetensors files exist on disk
+        assert (ssd.cache_dir / f"block_{expected_hash_0}.safetensors").exists(), (
+            "Block 0 safetensors file missing"
+        )
+        assert (ssd.cache_dir / f"block_{expected_hash_1}.safetensors").exists(), (
+            "Block 1 safetensors file missing"
+        )
+
+        # --- Steps 8-9: Lookup via TieredKVCache (falls through to SSD) ---
+        loaded_0 = tiered.lookup(expected_hash_0)
+        loaded_1 = tiered.lookup(expected_hash_1)
+
+        assert loaded_0 is not None, "Tiered lookup for block 0 returned None"
+        assert loaded_1 is not None, "Tiered lookup for block 1 returned None"
+
+        # --- Step 10: Verify loaded data matches original ---
+        for block_hash, loaded_data in [
+            (expected_hash_0, loaded_0),
+            (expected_hash_1, loaded_1),
+        ]:
+            original = original_kv[block_hash]
+            assert isinstance(loaded_data, list), (
+                f"Expected list for {block_hash}, got {type(loaded_data)}"
+            )
+            assert len(loaded_data) == num_layers, (
+                f"Expected {num_layers} layers for {block_hash}, "
+                f"got {len(loaded_data)}"
+            )
+
+            for layer_idx in range(num_layers):
+                orig_keys = original[layer_idx]["keys"]
+                orig_values = original[layer_idx]["values"]
+                load_keys = loaded_data[layer_idx]["keys"]
+                load_values = loaded_data[layer_idx]["values"]
+
+                # Shape preservation
+                assert load_keys.shape == orig_keys.shape, (
+                    f"{block_hash} layer {layer_idx} keys shape mismatch: "
+                    f"{load_keys.shape} != {orig_keys.shape}"
+                )
+                assert load_values.shape == orig_values.shape, (
+                    f"{block_hash} layer {layer_idx} values shape mismatch: "
+                    f"{load_values.shape} != {orig_values.shape}"
+                )
+
+                # Dtype preservation
+                assert load_keys.dtype == orig_keys.dtype, (
+                    f"{block_hash} layer {layer_idx} keys dtype mismatch: "
+                    f"{load_keys.dtype} != {orig_keys.dtype}"
+                )
+                assert load_values.dtype == orig_values.dtype, (
+                    f"{block_hash} layer {layer_idx} values dtype mismatch: "
+                    f"{load_values.dtype} != {orig_values.dtype}"
+                )
+
+                # Data integrity (values match exactly)
+                assert mx.allclose(load_keys, orig_keys).item(), (
+                    f"{block_hash} layer {layer_idx} keys data mismatch "
+                    f"after SSD round-trip"
+                )
+                assert mx.allclose(load_values, orig_values).item(), (
+                    f"{block_hash} layer {layer_idx} values data mismatch "
+                    f"after SSD round-trip"
+                )

@@ -221,43 +221,28 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
-    # POST /v1/chat/completions
+    # Common non-streaming inference helper
     # ------------------------------------------------------------------
 
-    @app.post("/v1/chat/completions")
-    async def chat_completions(body: ChatCompletionRequest):
-        tok = app.state.tokenizer
-        if tok is None:
-            raise HTTPException(status_code=500, detail="Tokenizer not loaded")
+    async def _do_inference(
+        prompt_tokens: list[int],
+        request_id: str,
+        inf_req: InferenceRequest,
+        format_response,
+    ):
+        """Common inference logic for non-streaming requests.
 
-        # Build a prompt string from messages using chat template if available
-        prompt_text = _format_chat_messages(body.messages, tok)
-        prompt_tokens: list[int] = tok.encode(prompt_text)
-
-        request_id = _make_request_id()
-        stop_seqs = _normalize_stop(body.stop)
-
-        inf_req = InferenceRequest(
-            request_id=request_id,
-            prompt_tokens=prompt_tokens,
-            max_tokens=body.max_tokens,
-            temperature=body.temperature,
-            top_p=body.top_p,
-            stop_sequences=stop_seqs,
-            stream=body.stream,
-        )
-
+        Args:
+            format_response: Callable(request_id, model_name, completion_text,
+                finish_reason, prompt_token_count, completion_token_count) -> response model
+        """
         sched = app.state.scheduler
+        tok = app.state.tokenizer
+        timeout = app.state.config.request_timeout_s
 
-        if body.stream:
-            return _stream_chat_response(
-                sched, inf_req, app.state.model_name, request_id, len(prompt_tokens), tok
-            )
-
-        # Non-streaming: submit and collect all tokens
         sched.submit_request(inf_req)
         events = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: sched.get_result(request_id, timeout=300)
+            None, lambda: sched.get_result(request_id, timeout=timeout)
         )
 
         if not events:
@@ -274,23 +259,58 @@ def create_app(
         finish_reason = events[-1].finish_reason if events else "stop"
         completion_tokens = len(filtered_events)
 
-        return ChatCompletionResponse(
-            id=request_id,
-            created=int(time.time()),
-            model=app.state.model_name,
-            choices=[
-                ChatCompletionResponseChoice(
-                    index=0,
-                    message=ChatMessage(role="assistant", content=completion_text),
-                    finish_reason=finish_reason,
-                )
-            ],
-            usage=UsageInfo(
-                prompt_tokens=len(prompt_tokens),
-                completion_tokens=completion_tokens,
-                total_tokens=len(prompt_tokens) + completion_tokens,
-            ),
+        return format_response(
+            request_id, app.state.model_name, completion_text,
+            finish_reason, len(prompt_tokens), completion_tokens,
         )
+
+    # ------------------------------------------------------------------
+    # POST /v1/chat/completions
+    # ------------------------------------------------------------------
+
+    @app.post("/v1/chat/completions")
+    async def chat_completions(body: ChatCompletionRequest):
+        tok = app.state.tokenizer
+        if tok is None:
+            raise HTTPException(status_code=500, detail="Tokenizer not loaded")
+
+        prompt_text = _format_chat_messages(body.messages, tok)
+        prompt_tokens: list[int] = tok.encode(prompt_text)
+        request_id = _make_request_id()
+        stop_seqs = _normalize_stop(body.stop)
+
+        # Validate prompt length
+        cfg = app.state.config
+        if len(prompt_tokens) > cfg.max_prompt_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prompt too long: {len(prompt_tokens)} tokens exceeds maximum of {cfg.max_prompt_tokens}",
+            )
+
+        # Clamp generation parameters
+        temperature = max(0.0, min(2.0, body.temperature))
+        top_p = max(0.0, min(1.0, body.top_p))
+        max_tokens = max(1, body.max_tokens)
+
+        inf_req = InferenceRequest(
+            request_id=request_id,
+            prompt_tokens=prompt_tokens,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop_sequences=stop_seqs,
+            stream=body.stream,
+        )
+
+        if body.stream:
+            return _stream_response(
+                app.state.scheduler, inf_req, app.state.model_name,
+                request_id, len(prompt_tokens), tok,
+                format_chunk=_format_chat_chunk,
+                request_timeout_s=cfg.request_timeout_s,
+            )
+
+        return await _do_inference(prompt_tokens, request_id, inf_req, _format_chat_response)
 
     # ------------------------------------------------------------------
     # POST /v1/completions
@@ -303,63 +323,41 @@ def create_app(
             raise HTTPException(status_code=500, detail="Tokenizer not loaded")
 
         prompt_tokens: list[int] = tok.encode(body.prompt)
-
         request_id = _make_completion_id()
         stop_seqs = _normalize_stop(body.stop)
+
+        # Validate prompt length
+        cfg = app.state.config
+        if len(prompt_tokens) > cfg.max_prompt_tokens:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prompt too long: {len(prompt_tokens)} tokens exceeds maximum of {cfg.max_prompt_tokens}",
+            )
+
+        # Clamp generation parameters
+        temperature = max(0.0, min(2.0, body.temperature))
+        top_p = max(0.0, min(1.0, body.top_p))
+        max_tokens = max(1, body.max_tokens)
 
         inf_req = InferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
-            max_tokens=body.max_tokens,
-            temperature=body.temperature,
-            top_p=body.top_p,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
             stop_sequences=stop_seqs,
             stream=body.stream,
         )
 
-        sched = app.state.scheduler
-
         if body.stream:
-            return _stream_completion_response(
-                sched, inf_req, app.state.model_name, request_id, len(prompt_tokens), tok
+            return _stream_response(
+                app.state.scheduler, inf_req, app.state.model_name,
+                request_id, len(prompt_tokens), tok,
+                format_chunk=_format_completion_chunk,
+                request_timeout_s=cfg.request_timeout_s,
             )
 
-        sched.submit_request(inf_req)
-        events = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: sched.get_result(request_id, timeout=300)
-        )
-
-        if not events:
-            sched.cancel_request(request_id)
-            raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
-
-        # Exclude EOS token text from output if present
-        filtered_events = events
-        if events and events[-1].finish_reason == "stop" and tok is not None:
-            eos_token = getattr(tok, "eos_token", None)
-            if eos_token is not None and events[-1].token_text == eos_token:
-                filtered_events = events[:-1]
-        completion_text = "".join(e.token_text for e in filtered_events)
-        finish_reason = events[-1].finish_reason if events else "stop"
-        completion_tokens = len(filtered_events)
-
-        return CompletionResponse(
-            id=request_id,
-            created=int(time.time()),
-            model=app.state.model_name,
-            choices=[
-                CompletionResponseChoice(
-                    index=0,
-                    text=completion_text,
-                    finish_reason=finish_reason,
-                )
-            ],
-            usage=UsageInfo(
-                prompt_tokens=len(prompt_tokens),
-                completion_tokens=completion_tokens,
-                total_tokens=len(prompt_tokens) + completion_tokens,
-            ),
-        )
+        return await _do_inference(prompt_tokens, request_id, inf_req, _format_completion_response)
 
     # ------------------------------------------------------------------
     # GET /v1/models
@@ -414,81 +412,92 @@ def _format_chat_messages(messages: list[ChatMessage], tokenizer: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Streaming helpers
+# Chunk / response formatters
 # ---------------------------------------------------------------------------
 
 
-def _stream_chat_response(
-    scheduler: SchedulerProtocol,
-    inf_req: InferenceRequest,
-    model_name: str,
-    request_id: str,
-    prompt_tokens: int,
-    tokenizer: Any = None,
-) -> StreamingResponse:
-    async def event_generator() -> AsyncIterator[str]:
-        token_queue = scheduler.register_stream(inf_req.request_id)
-        scheduler.submit_request(inf_req)
+def _format_chat_chunk(request_id: str, model_name: str, token_text: str, finish_reason: str | None) -> dict:
+    """Format a chat completion SSE chunk."""
+    return {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{"index": 0, "delta": {"content": token_text}, "finish_reason": finish_reason}],
+    }
 
-        completion_tokens = 0
-        loop = asyncio.get_running_loop()
 
-        while True:
-            try:
-                event: TokenEvent | None = await loop.run_in_executor(
-                    None, lambda: token_queue.get(timeout=120)
-                )
-            except queue.Empty:
-                error_data = {"error": {"message": "Stream timeout: no tokens received for 120 seconds", "type": "server_error"}}
-                yield f"data: {json.dumps(error_data)}\n\n"
-                break
-            if event is None:
-                break
+def _format_completion_chunk(request_id: str, model_name: str, token_text: str, finish_reason: str | None) -> dict:
+    """Format a text completion SSE chunk."""
+    return {
+        "id": request_id,
+        "object": "text_completion",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [{"index": 0, "text": token_text, "finish_reason": finish_reason}],
+    }
 
-            completion_tokens += 1
 
-            # Filter EOS token text in streaming
-            token_text = event.token_text
-            if event.finish_reason == "stop" and tokenizer is not None:
-                eos_token = getattr(tokenizer, "eos_token", None)
-                if eos_token is not None and token_text == eos_token:
-                    token_text = ""
-
-            chunk = {
-                "id": request_id,
-                "object": "chat.completion.chunk",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "delta": {"content": token_text},
-                        "finish_reason": event.finish_reason,
-                    }
-                ],
-            }
-            yield f"data: {json.dumps(chunk)}\n\n"
-
-            if event.finish_reason is not None:
-                break
-
-        yield "data: [DONE]\n\n"
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+def _format_chat_response(request_id, model_name, text, finish_reason, prompt_tokens, completion_tokens):
+    """Format a non-streaming chat completion response."""
+    return ChatCompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model_name,
+        choices=[ChatCompletionResponseChoice(
+            index=0,
+            message=ChatMessage(role="assistant", content=text),
+            finish_reason=finish_reason,
+        )],
+        usage=UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
     )
 
 
-def _stream_completion_response(
+def _format_completion_response(request_id, model_name, text, finish_reason, prompt_tokens, completion_tokens):
+    """Format a non-streaming text completion response."""
+    return CompletionResponse(
+        id=request_id,
+        created=int(time.time()),
+        model=model_name,
+        choices=[CompletionResponseChoice(
+            index=0,
+            text=text,
+            finish_reason=finish_reason,
+        )],
+        usage=UsageInfo(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens,
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Streaming helper
+# ---------------------------------------------------------------------------
+
+
+def _stream_response(
     scheduler: SchedulerProtocol,
     inf_req: InferenceRequest,
     model_name: str,
     request_id: str,
     prompt_tokens: int,
     tokenizer: Any = None,
+    format_chunk=None,
+    request_timeout_s: float = 120.0,
 ) -> StreamingResponse:
+    """Unified SSE streaming for both chat and completion endpoints.
+
+    Args:
+        format_chunk: Callable(request_id, model_name, token_text, finish_reason) -> dict
+            Creates the SSE chunk payload. Differs between chat and completion formats.
+        request_timeout_s: Per-token timeout in seconds for the stream queue.
+    """
     async def event_generator() -> AsyncIterator[str]:
         token_queue = scheduler.register_stream(inf_req.request_id)
         scheduler.submit_request(inf_req)
@@ -498,10 +507,11 @@ def _stream_completion_response(
         while True:
             try:
                 event: TokenEvent | None = await loop.run_in_executor(
-                    None, lambda: token_queue.get(timeout=120)
+                    None, lambda: token_queue.get(timeout=request_timeout_s)
                 )
             except queue.Empty:
-                error_data = {"error": {"message": "Stream timeout: no tokens received for 120 seconds", "type": "server_error"}}
+                scheduler.cancel_request(inf_req.request_id)
+                error_data = {"error": {"message": f"Stream timeout: no tokens received for {request_timeout_s} seconds", "type": "server_error"}}
                 yield f"data: {json.dumps(error_data)}\n\n"
                 break
             if event is None:
@@ -514,19 +524,7 @@ def _stream_completion_response(
                 if eos_token is not None and token_text == eos_token:
                     token_text = ""
 
-            chunk = {
-                "id": request_id,
-                "object": "text_completion",
-                "created": int(time.time()),
-                "model": model_name,
-                "choices": [
-                    {
-                        "index": 0,
-                        "text": token_text,
-                        "finish_reason": event.finish_reason,
-                    }
-                ],
-            }
+            chunk = format_chunk(request_id, model_name, token_text, event.finish_reason)
             yield f"data: {json.dumps(chunk)}\n\n"
 
             if event.finish_reason is not None:
@@ -569,6 +567,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--completion-batch-size", type=int, default=32)
     parser.add_argument("--max-kv-size", type=int, default=None)
     parser.add_argument("--sequence-cache-size", type=int, default=50)
+    parser.add_argument("--max-prompt-tokens", type=int, default=32768)
+    parser.add_argument("--request-timeout-s", type=float, default=120.0)
 
     parsed = parser.parse_args(args)
 
@@ -588,6 +588,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "default_max_tokens": parsed.default_max_tokens,
         "completion_batch_size": parsed.completion_batch_size,
         "sequence_cache_size": parsed.sequence_cache_size,
+        "max_prompt_tokens": parsed.max_prompt_tokens,
+        "request_timeout_s": parsed.request_timeout_s,
     }
 
     if parsed.adapter_path is not None:
