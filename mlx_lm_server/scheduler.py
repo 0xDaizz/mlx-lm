@@ -836,6 +836,10 @@ class Scheduler:
 
                 # Handle max_tokens=0 gracefully
                 if req.max_tokens <= 0:
+                    # Free any blocks allocated during cache lookup
+                    if self.kv_cache_manager is not None and seq.block_ids:
+                        self.kv_cache_manager.free_blocks(seq.block_ids)
+                        seq.block_ids = []
                     seq.is_finished = True
                     seq.finish_reason = "length"
                     self._signal_finish(req.request_id, finish_reason="length")
@@ -952,6 +956,7 @@ class Scheduler:
         self._create_batch_generator()
         self._uid_to_request_id.clear()
         self._request_id_to_uid.clear()
+        self._pending_cache_saves.clear()
 
     def _handle_mock_error(self) -> None:
         """Handle error in mock inference path (existing behavior)."""
@@ -1366,6 +1371,11 @@ class Scheduler:
         if (self._tiered_cache is not None
                 and hasattr(self._tiered_cache, 'get_writer_stats')):
             stats.update(self._tiered_cache.get_writer_stats())
+
+        # Merge sync durability stats (tiered_sync_ prefix)
+        if (self._tiered_cache is not None
+                and hasattr(self._tiered_cache, 'get_sync_stats')):
+            stats.update(self._tiered_cache.get_sync_stats())
 
         stats["cache_hit_rate"] = (
             hits / total_lookups if total_lookups > 0 else 0.0

@@ -164,11 +164,10 @@ class SequenceCacheStore:
         # A full deepcopy of large KV tensors is extremely expensive but
         # needed for correctness when the stored objects are mutable dicts.
         try:
-            # Check if this looks like a real KV cache list (has .state attr)
-            if prompt_cache and hasattr(prompt_cache[0], "state"):
-                cache_copy = list(prompt_cache)
-            else:
-                cache_copy = copy.deepcopy(prompt_cache)
+            # Clone cache list to prevent shared mutation with BatchGenerator.
+            # _clone_cache_list() uses fast slice-based copy for plain KVCache
+            # and falls back to deepcopy for other types.
+            cache_copy = _clone_cache_list(prompt_cache)
         except Exception:
             cache_copy = copy.deepcopy(prompt_cache)
 

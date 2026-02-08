@@ -268,7 +268,11 @@ class TestEvictionDedup:
         return [{"keys": mx.zeros((1, 4, 16, 64)), "values": mx.zeros((1, 4, 16, 64))}]
 
     def test_evict_skips_ssd_existing(self, tmp_path):
-        """Eviction should skip save_block if block already on SSD."""
+        """Eviction should call save_block even for blocks already on SSD (no has_block pre-check).
+
+        With P0-2, eviction always calls _save_to_ssd_with_durability for every block.
+        For blocks already on SSD, save_block returns "dedup" which is accepted as success.
+        """
         from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
         from mlx_lm_server.ssd_cache import SSDCache
         from mlx_lm_server.config import ServerConfig
@@ -283,16 +287,16 @@ class TestEvictionDedup:
                                       tiered_cache=tiered, ssd_policy="write_through")
         assert block_id is not None
         assert ssd.has_block("ev_hash_1")
-        saves_before = ssd._stats["ssd_save_success"]
+        dedup_before = ssd._stats["ssd_save_dedup_skip"]
 
         # Free the block (ref_count=0) so it's evictable
         kv_mgr.free_blocks([block_id])
 
-        # Evict should skip SSD save since block already exists
+        # Evict — save_block is called (no has_block pre-check) but returns "dedup"
         evicted = tiered.evict_to_ssd(num_blocks=1)
         assert len(evicted) >= 1
-        # Save count should NOT increase (block was already on SSD)
-        assert ssd._stats["ssd_save_success"] == saves_before
+        # save_block was called and returned "dedup" for the already-saved block
+        assert ssd._stats["ssd_save_dedup_skip"] > dedup_before
 
 
 class TestSSDWriterThread:
@@ -311,7 +315,7 @@ class TestSSDWriterThread:
         writer = SSDWriterThread(ssd, queue_size=16)
         try:
             result = writer.enqueue("async_1", self._make_block_data())
-            assert result is True
+            assert result == "queued"
             # Give writer time to process
             time.sleep(0.2)
             assert ssd.has_block("async_1")
@@ -326,7 +330,7 @@ class TestSSDWriterThread:
         try:
             writer.enqueue("dup_1", self._make_block_data())
             result = writer.enqueue("dup_1", self._make_block_data())
-            assert result is False
+            assert result == "dedup"
             stats = writer.get_stats()
             assert stats["writer_enqueue_dedup_skip"] >= 1
         finally:
@@ -353,7 +357,7 @@ class TestSSDWriterThread:
         writer = SSDWriterThread(ssd, queue_size=16)
         writer.stop()
         result = writer.enqueue("after_stop", self._make_block_data())
-        assert result is False
+        assert result == "closing"
 
     def test_backpressure_sync_fallback(self, tmp_path):
         """When queue is full, sync fallback should save directly."""
@@ -668,7 +672,7 @@ class TestSyncDurability:
         ssd.save_block = original_save
 
     def test_write_through_enqueue_fail_falls_back_to_sync(self, tmp_path):
-        """When writer.enqueue() returns False, should fall back to sync save."""
+        """When writer.enqueue() returns 'closing', should fall back to sync save."""
         from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
         from mlx_lm_server.ssd_cache import SSDCache
         from mlx_lm_server.config import ServerConfig
@@ -678,7 +682,7 @@ class TestSyncDurability:
         kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
 
         mock_writer = MagicMock()
-        mock_writer.enqueue.return_value = False  # Simulate closing/dedup
+        mock_writer.enqueue.return_value = "closing"  # Writer shutting down
 
         tiered = TieredKVCache(kv_mgr, ssd, writer=mock_writer, durability="best_effort")
         tiered.write_through("fallback_sync_1", self._make_block_data())
@@ -736,3 +740,516 @@ class TestSSDFlushInterval:
         cache._mark_dirty()
         assert cache._index_dirty is False  # Flushed
         assert cache._mutation_count == 0
+
+
+# ---------------------------------------------------------------------------
+# New test classes for P0-1 through P2-1 fixes
+# ---------------------------------------------------------------------------
+
+
+class TestP01WriterShutdown:
+    """P0-1: Writer shutdown robustness — polling-based drain, no sentinel."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    @pytest.mark.timeout(10)
+    def test_stop_timeout_thread_exits(self, tmp_path):
+        """Start writer, enqueue items, verify stop(drain_timeout=5) returns True and thread exits."""
+        from mlx_lm_server.ssd_writer import SSDWriterThread
+
+        ssd = SSDCache(tmp_path)
+        writer = SSDWriterThread(ssd, queue_size=64)
+        for i in range(10):
+            writer.enqueue(f"shutdown_{i}", self._make_block_data())
+        ok = writer.stop(drain_timeout=5.0)
+        assert ok is True
+        assert not writer._thread.is_alive()
+
+    @pytest.mark.timeout(10)
+    def test_stop_with_slow_saves(self, tmp_path):
+        """Mock save_block to be slow (0.2s sleep), enqueue 5 items, stop and verify all written."""
+        from mlx_lm_server.ssd_writer import SSDWriterThread
+
+        ssd = SSDCache(tmp_path)
+        original_save = ssd.save_block
+
+        def slow_save(*args, **kwargs):
+            time.sleep(0.2)
+            return original_save(*args, **kwargs)
+
+        ssd.save_block = slow_save
+        writer = SSDWriterThread(ssd, queue_size=64)
+        for i in range(5):
+            writer.enqueue(f"slow_{i}", self._make_block_data())
+        ok = writer.stop(drain_timeout=3.0)
+        ssd.save_block = original_save
+        assert ok is True
+        stats = writer.get_stats()
+        assert stats["writer_save_success"] == 5
+
+    @pytest.mark.timeout(10)
+    def test_rapid_stop_after_start(self, tmp_path):
+        """Create writer, immediately stop(), verify clean exit."""
+        from mlx_lm_server.ssd_writer import SSDWriterThread
+
+        ssd = SSDCache(tmp_path)
+        writer = SSDWriterThread(ssd, queue_size=16)
+        ok = writer.stop(drain_timeout=2.0)
+        assert ok is True
+
+    @pytest.mark.timeout(10)
+    def test_no_zombie_thread_after_stop(self, tmp_path):
+        """Start writer, stop(), verify thread.is_alive() is False."""
+        from mlx_lm_server.ssd_writer import SSDWriterThread
+
+        ssd = SSDCache(tmp_path)
+        writer = SSDWriterThread(ssd, queue_size=16)
+        writer.enqueue("zombie_check", self._make_block_data())
+        writer.stop(drain_timeout=3.0)
+        assert not writer._thread.is_alive()
+
+
+class TestP02EvictionSafety:
+    """P0-2: Eviction always persists — no has_block pre-check."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    def test_stale_index_eviction_resaves(self, tmp_path):
+        """Save block to SSD, delete file but keep index, then evict: should re-save."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+        tokens = list(range(1, 17))
+
+        # Cache block with write-through
+        block_id = kv_mgr.cache_block("stale_ev_hash", tokens, self._make_block_data(),
+                                      tiered_cache=tiered, ssd_policy="write_through")
+        assert block_id is not None
+        assert ssd.has_block("stale_ev_hash")
+
+        # Delete the file but keep the index entry (simulate stale index)
+        filepath = ssd.index["stale_ev_hash"].filepath
+        filepath = Path(filepath) if not isinstance(filepath, Path) else filepath
+        filepath.unlink()
+
+        # Free the block so it's evictable
+        kv_mgr.free_blocks([block_id])
+
+        saves_before = ssd._stats["ssd_save_success"]
+        stale_cleaned_before = ssd._stats["ssd_stale_index_cleaned"]
+
+        # Evict — save_block should detect stale index and re-save
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) >= 1
+        # Should have re-saved (stale index cleaned + new save)
+        assert ssd._stats["ssd_stale_index_cleaned"] > stale_cleaned_before
+        assert ssd._stats["ssd_save_success"] > saves_before
+
+    def test_collision_blocks_not_evicted(self, tmp_path):
+        """When save_block returns 'collision', block stays in RAM (not evicted)."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import patch
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+        tokens = list(range(1, 17))
+
+        # Cache block (evict_only, NOT write-through)
+        block_id = kv_mgr.cache_block("coll_ev_hash", tokens, self._make_block_data(),
+                                      tiered_cache=tiered, ssd_policy="evict_only")
+        assert block_id is not None
+        kv_mgr.free_blocks([block_id])
+
+        # Mock save_block to return "collision"
+        original_save = ssd.save_block
+        ssd.save_block = lambda *a, **kw: "collision"
+        try:
+            evicted = tiered.evict_to_ssd(num_blocks=1)
+            # Block should NOT have been evicted (collision means keep in RAM)
+            assert len(evicted) == 0
+        finally:
+            ssd.save_block = original_save
+
+    def test_collision_bumps_last_accessed(self, tmp_path):
+        """When eviction gets 'collision', block.last_accessed is updated to prevent hot-loop."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+        tokens = list(range(1, 17))
+
+        block_id = kv_mgr.cache_block("bump_hash", tokens, self._make_block_data(),
+                                      tiered_cache=tiered, ssd_policy="evict_only")
+        assert block_id is not None
+        kv_mgr.free_blocks([block_id])
+
+        block = kv_mgr.pool.blocks[block_id]
+        old_last_accessed = block.last_accessed
+
+        # Mock save_block to return "collision"
+        original_save = ssd.save_block
+        ssd.save_block = lambda *a, **kw: "collision"
+        try:
+            time.sleep(0.01)  # Ensure time.time() advances
+            tiered.evict_to_ssd(num_blocks=1)
+            # last_accessed should have been bumped
+            assert block.last_accessed > old_last_accessed
+        finally:
+            ssd.save_block = original_save
+
+    def test_error_blocks_kept_in_ram(self, tmp_path):
+        """When save_block returns 'error', block stays in RAM."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+        tokens = list(range(1, 17))
+
+        block_id = kv_mgr.cache_block("err_ev_hash", tokens, self._make_block_data(),
+                                      tiered_cache=tiered, ssd_policy="evict_only")
+        assert block_id is not None
+        kv_mgr.free_blocks([block_id])
+
+        # Mock save_block to return "error"
+        original_save = ssd.save_block
+        ssd.save_block = lambda *a, **kw: "error"
+        try:
+            evicted = tiered.evict_to_ssd(num_blocks=1)
+            # Block should NOT have been evicted (error means keep in RAM)
+            assert len(evicted) == 0
+        finally:
+            ssd.save_block = original_save
+
+
+class TestP11EnqueueStatus:
+    """P1-1: Enqueue returns string status ('queued' | 'dedup' | 'closing')."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    def test_write_through_dedup_no_sync_fallback(self, tmp_path):
+        """Writer enqueue returns 'dedup' -> no sync fallback."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import MagicMock
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        mock_writer = MagicMock()
+        mock_writer.enqueue.return_value = "dedup"
+
+        tiered = TieredKVCache(kv_mgr, ssd, writer=mock_writer, durability="best_effort")
+        tiered.write_through("dedup_test", self._make_block_data())
+
+        # "dedup" means already pending — should NOT fall back to sync
+        assert not ssd.has_block("dedup_test")
+        # _save_to_ssd_with_durability should NOT have been called
+        assert tiered._sync_stats["tiered_sync_save_attempts"] == 0
+
+    def test_write_through_closing_triggers_sync(self, tmp_path):
+        """Writer enqueue returns 'closing' -> sync fallback happens."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import MagicMock
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        mock_writer = MagicMock()
+        mock_writer.enqueue.return_value = "closing"
+
+        tiered = TieredKVCache(kv_mgr, ssd, writer=mock_writer, durability="best_effort")
+        tiered.write_through("closing_test", self._make_block_data())
+
+        # "closing" means writer shutting down — should fall back to sync save
+        assert ssd.has_block("closing_test")
+        assert tiered._sync_stats["tiered_sync_save_attempts"] == 1
+
+    def test_write_through_queued_returns_immediately(self, tmp_path):
+        """Writer enqueue returns 'queued' -> no sync fallback."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import MagicMock
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        mock_writer = MagicMock()
+        mock_writer.enqueue.return_value = "queued"
+
+        tiered = TieredKVCache(kv_mgr, ssd, writer=mock_writer, durability="best_effort")
+        tiered.write_through("queued_test", self._make_block_data())
+
+        # "queued" means accepted — should NOT fall back to sync
+        assert not ssd.has_block("queued_test")
+        assert tiered._sync_stats["tiered_sync_save_attempts"] == 0
+
+
+class TestP12LockConsistency:
+    """P1-2: SSDCache lock consistency — save_index/load_index/num_blocks all lock."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    @pytest.mark.timeout(10)
+    def test_num_blocks_locked(self, tmp_path):
+        """Concurrent save_block + num_blocks reads should not raise."""
+        ssd = SSDCache(tmp_path)
+        errors = []
+
+        def do_saves():
+            for i in range(20):
+                try:
+                    ssd.save_block(f"lock_test_{i}", self._make_block_data())
+                except Exception as e:
+                    errors.append(e)
+
+        def do_reads():
+            for _ in range(50):
+                try:
+                    _ = ssd.num_blocks
+                except Exception as e:
+                    errors.append(e)
+
+        t1 = threading.Thread(target=do_saves)
+        t2 = threading.Thread(target=do_reads)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+        assert len(errors) == 0
+
+    @pytest.mark.timeout(10)
+    def test_save_index_load_index_no_deadlock(self, tmp_path):
+        """save_index() and load_index() concurrently should not deadlock."""
+        ssd = SSDCache(tmp_path)
+        ssd.save_block("idx_test", self._make_block_data())
+        errors = []
+        done = threading.Event()
+
+        def do_save_index():
+            for _ in range(20):
+                try:
+                    ssd.save_index()
+                except Exception as e:
+                    errors.append(e)
+            done.set()
+
+        def do_load_index():
+            for _ in range(20):
+                try:
+                    ssd.load_index()
+                except Exception as e:
+                    errors.append(e)
+
+        t1 = threading.Thread(target=do_save_index)
+        t2 = threading.Thread(target=do_load_index)
+        t1.start()
+        t2.start()
+        t1.join(timeout=8)
+        t2.join(timeout=8)
+        assert not t1.is_alive(), "save_index thread deadlocked"
+        assert not t2.is_alive(), "load_index thread deadlocked"
+        assert len(errors) == 0
+
+    @pytest.mark.timeout(10)
+    def test_concurrent_validate_flush_save(self, tmp_path):
+        """validate_index(), flush(), save_index() concurrently, no deadlock."""
+        ssd = SSDCache(tmp_path)
+        # Seed some data
+        for i in range(5):
+            ssd.save_block(f"conc_{i}", self._make_block_data())
+        errors = []
+
+        def do_validate():
+            for _ in range(10):
+                try:
+                    ssd.validate_index()
+                except Exception as e:
+                    errors.append(e)
+
+        def do_flush():
+            for _ in range(10):
+                try:
+                    ssd.flush()
+                except Exception as e:
+                    errors.append(e)
+
+        def do_save_index():
+            for _ in range(10):
+                try:
+                    ssd.save_index()
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [
+            threading.Thread(target=do_validate),
+            threading.Thread(target=do_flush),
+            threading.Thread(target=do_save_index),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=8)
+        for t in threads:
+            assert not t.is_alive(), f"Thread {t.name} deadlocked"
+        assert len(errors) == 0
+
+
+class TestP13FlushTimestamp:
+    """P1-3: _save_index() sets _last_flush_time after successful os.replace()."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    def test_save_index_updates_last_flush_time(self, tmp_path):
+        """save_index() should update _last_flush_time."""
+        ssd = SSDCache(tmp_path)
+        ssd.save_block("flush_ts_1", self._make_block_data())
+        old_flush = ssd._last_flush_time
+        time.sleep(0.01)  # Ensure monotonic clock advances
+        ssd.save_index()
+        assert ssd._last_flush_time > old_flush
+
+    def test_no_unnecessary_consecutive_flush(self, tmp_path):
+        """After a save_block triggers flush, _mark_dirty should NOT re-flush if time hasn't elapsed."""
+        ssd = SSDCache(tmp_path, flush_interval_s=9999.0)
+        ssd._flush_interval = 1000  # High mutation threshold
+        ssd.save_block("flush_guard_1", self._make_block_data())  # This triggers immediate flush
+
+        # Record the flush time
+        flush_time_after_save = ssd._last_flush_time
+
+        # _mark_dirty should NOT trigger flush (time hasn't elapsed, mutation count is low)
+        ssd._index_dirty = False
+        ssd._mutation_count = 0
+        ssd._mark_dirty()
+        # Time-based flush should NOT have occurred (9999s interval)
+        # Mutation-based flush should NOT have occurred (threshold=1000, count=1)
+        assert ssd._index_dirty is True  # Still dirty, not flushed
+        assert ssd._last_flush_time == flush_time_after_save
+
+
+class TestP21SyncObservability:
+    """P2-1: Sync observability — TieredKVCache._sync_stats with 5 counters."""
+
+    def _make_block_data(self, num_tokens: int = 16) -> list[dict[str, mx.array]]:
+        return [{"keys": mx.zeros((1, 4, num_tokens, 64)), "values": mx.zeros((1, 4, num_tokens, 64))}]
+
+    def test_tiered_sync_stats_exist(self, tmp_path):
+        """TieredKVCache should have _sync_stats dict with all 5 expected keys."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        expected_keys = {
+            "tiered_sync_save_attempts",
+            "tiered_sync_save_success",
+            "tiered_sync_retry_attempts",
+            "tiered_sync_save_fail",
+            "tiered_sync_save_collision",
+        }
+        assert expected_keys == set(tiered._sync_stats.keys())
+        assert all(v == 0 for v in tiered._sync_stats.values())
+
+    def test_sync_save_increments_attempts_and_success(self, tmp_path):
+        """_save_to_ssd_with_durability should increment attempts + success on 'saved'."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        result = tiered._save_to_ssd_with_durability("sync_stat_1", self._make_block_data())
+        assert result == "saved"
+        assert tiered._sync_stats["tiered_sync_save_attempts"] == 1
+        assert tiered._sync_stats["tiered_sync_save_success"] == 1
+
+    def test_sync_save_error_increments_fail(self, tmp_path):
+        """_save_to_ssd_with_durability should increment fail on 'error' (best_effort)."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd, durability="best_effort")
+
+        original_save = ssd.save_block
+        ssd.save_block = lambda *a, **kw: "error"
+        try:
+            result = tiered._save_to_ssd_with_durability("err_stat_1", self._make_block_data())
+            assert result == "error"
+            assert tiered._sync_stats["tiered_sync_save_attempts"] == 1
+            assert tiered._sync_stats["tiered_sync_save_fail"] == 1
+        finally:
+            ssd.save_block = original_save
+
+    def test_sync_save_collision_counted(self, tmp_path):
+        """_save_to_ssd_with_durability should increment collision counter."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        original_save = ssd.save_block
+        ssd.save_block = lambda *a, **kw: "collision"
+        try:
+            result = tiered._save_to_ssd_with_durability("coll_stat_1", self._make_block_data())
+            assert result == "collision"
+            assert tiered._sync_stats["tiered_sync_save_collision"] == 1
+        finally:
+            ssd.save_block = original_save
+
+    def test_get_sync_stats_returns_copy(self, tmp_path):
+        """get_sync_stats() should return a copy, not the original dict."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        stats = tiered.get_sync_stats()
+        stats["tiered_sync_save_attempts"] = 999
+        assert tiered._sync_stats["tiered_sync_save_attempts"] == 0
+
+    def test_scheduler_merges_sync_stats(self, tmp_path):
+        """Scheduler.get_cache_stats() should include tiered_sync_ keys."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.scheduler import Scheduler
+        from mlx_lm_server.config import ServerConfig
+
+        ssd = SSDCache(tmp_path)
+        kv_mgr = KVCacheManager(ServerConfig(num_blocks=32), ssd=ssd)
+        tiered = TieredKVCache(ram=kv_mgr, ssd=ssd)
+
+        # Perform a save so there's non-zero data
+        tiered._save_to_ssd_with_durability("sched_stat_1", self._make_block_data())
+
+        scheduler = Scheduler(
+            config=ServerConfig(),
+            kv_cache_manager=kv_mgr,
+            tiered_cache=tiered,
+        )
+
+        stats = scheduler.get_cache_stats()
+        # Verify sync stats are merged (via get_sync_stats)
+        assert "tiered_sync_save_attempts" in stats
+        assert stats["tiered_sync_save_attempts"] == 1
+        assert "tiered_sync_save_success" in stats
+        assert stats["tiered_sync_save_success"] == 1

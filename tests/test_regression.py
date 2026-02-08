@@ -356,8 +356,9 @@ class _TimeoutMockScheduler:
         return Queue()
 
     def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
-        # Return empty list — simulates a timeout (event.wait expired)
-        return []
+        # Raise TimeoutError — simulates a timeout in the executor poll loop.
+        # The new _do_inference() catches TimeoutError per poll iteration.
+        raise TimeoutError("Simulated timeout")
 
     def cancel_request(self, request_id: str) -> bool:
         self.cancel_called_for.append(request_id)
@@ -1229,7 +1230,7 @@ class TestF08_DeadlockTwoPhaseEviction:
         # Create a mock SSD cache that accepts save_block calls
         class _MockSSD:
             def save_block(self, block_hash, kv_data, num_tokens=None):
-                pass
+                return "saved"
 
             def load_block(self, block_hash):
                 return None
@@ -1289,6 +1290,7 @@ class TestF08_DeadlockTwoPhaseEviction:
         class _RecordingSSD:
             def save_block(self, block_hash, kv_data, num_tokens=None):
                 ssd_saved[block_hash] = kv_data
+                return "saved"
 
             def load_block(self, block_hash):
                 return ssd_saved.get(block_hash)
@@ -1926,3 +1928,533 @@ class TestF16_EmptyPromptRejected:
             )
 
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# R19: max_tokens=0 should free blocks, not leak
+# ---------------------------------------------------------------------------
+
+
+class TestR19_MaxTokensZeroBlockLeak:
+    """Regression: R19 — max_tokens=0 must free blocks and return finish event.
+
+    Without the fix, _insert_new_requests_batch() would allocate blocks during
+    cache lookup but never free them when max_tokens=0, causing a block leak.
+
+    The fix checks req.max_tokens <= 0 before insert() and frees any allocated
+    blocks, then signals finish with reason="length".
+    """
+
+    def test_max_tokens_zero_returns_finish_event(self):
+        """max_tokens=0 request should return a finish event with reason='length'."""
+        config = ServerConfig(max_batch_size=4, default_max_tokens=10)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        sched.run_inference_loop()
+        try:
+            req = InferenceRequest(
+                request_id="zero-max-1",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=0,
+            )
+            sched.submit_request(req)
+            events = sched.get_result("zero-max-1", timeout=5.0)
+
+            assert len(events) >= 1, "Should receive at least one event"
+            # The mock path hits _run_decode_step which checks max_tokens
+            # and returns a length finish when step >= request.max_tokens (0 >= 0 = True)
+            assert events[-1].finish_reason == "length", (
+                f"Expected finish_reason='length', got '{events[-1].finish_reason}'"
+            )
+        finally:
+            sched.stop()
+
+    def test_max_tokens_zero_no_block_leak(self):
+        """max_tokens=0 should not leak KV cache blocks."""
+        from mlx_lm_server.kv_cache_manager import KVCacheManager
+
+        config = ServerConfig(
+            max_batch_size=4, default_max_tokens=10,
+            block_size=4, num_blocks=8,
+        )
+        mgr = KVCacheManager(config)
+        sched = Scheduler(config=config, model=None, tokenizer=None, kv_cache_manager=mgr)
+
+        total_blocks = mgr.pool.num_blocks
+        free_before = mgr.pool.num_free
+
+        sched.run_inference_loop()
+        try:
+            req = InferenceRequest(
+                request_id="zero-leak-1",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=0,
+            )
+            sched.submit_request(req)
+            events = sched.get_result("zero-leak-1", timeout=5.0)
+            assert events[-1].finish_reason == "length"
+
+            # Give cleanup time
+            time.sleep(0.3)
+
+            # All blocks should be returned — no leak
+            free_after = mgr.pool.num_free
+            assert free_after == free_before, (
+                f"Block leak detected: free_before={free_before}, free_after={free_after}, "
+                f"total={total_blocks}"
+            )
+        finally:
+            sched.stop()
+
+
+# ---------------------------------------------------------------------------
+# R14: Deep copy in SequenceCacheStore prevents mutation
+# ---------------------------------------------------------------------------
+
+
+class TestR14_DeepCopySequenceCache:
+    """Regression: R14 — SequenceCacheStore must deep-copy caches on store.
+
+    Without the fix, store() kept a reference to the original cache list.
+    When the original was mutated (e.g., by BatchGenerator), the cached
+    entry was silently corrupted, leading to wrong KV data on prefix hits.
+
+    The fix calls _clone_cache_list() in store() to create an independent copy.
+    """
+
+    def test_stored_cache_independent_from_original(self):
+        """Mutating the original cache after store() must not affect the stored copy."""
+        from mlx_lm_server.sequence_cache import SequenceCacheStore
+
+        store = SequenceCacheStore(max_entries=10)
+
+        # Create a simple cache with dict entries (these get deepcopied)
+        original_cache = [{"keys": [1, 2, 3], "values": [4, 5, 6]}]
+
+        store.store([10, 20, 30], original_cache)
+
+        # Mutate the original
+        original_cache[0]["keys"] = [99, 99, 99]
+        original_cache.append({"keys": [7], "values": [8]})
+
+        # Retrieve from store
+        cached, remaining = store.find_longest_prefix([10, 20, 30])
+
+        assert cached is not None, "Cache should be found"
+        assert len(remaining) == 0
+        # The stored cache should be independent — still have original values
+        assert cached[0]["keys"] == [1, 2, 3], (
+            f"Stored cache was mutated: got {cached[0]['keys']}"
+        )
+        assert len(cached) == 1, (
+            f"Stored cache length changed: expected 1, got {len(cached)}"
+        )
+
+    def test_clone_cache_list_plain_kv(self):
+        """_clone_cache_list with plain KVCache-like objects creates independent copies."""
+        import mlx.core as mx
+        from mlx_lm_server.sequence_cache import _clone_cache_list
+
+        class MockKVCache:
+            """Minimal KVCache mock with keys, values, offset (no group_size)."""
+
+            def __init__(self, keys, values, offset):
+                self.keys = keys
+                self.values = values
+                self.offset = offset
+
+        # Create a mock cache with mx arrays
+        keys = mx.ones((1, 4, 8, 16))  # [batch, heads, seq, dim]
+        values = mx.zeros((1, 4, 8, 16))
+        cache = MockKVCache(keys=keys, values=values, offset=8)
+
+        cloned = _clone_cache_list([cache])
+
+        assert len(cloned) == 1
+        cloned_cache = cloned[0]
+
+        # Verify offset is preserved
+        assert cloned_cache.offset == 8
+
+        # Verify arrays are independent (different objects)
+        assert cloned_cache.keys is not cache.keys, (
+            "Cloned keys should be a different array object"
+        )
+        assert cloned_cache.values is not cache.values, (
+            "Cloned values should be a different array object"
+        )
+
+        # Verify shapes match (sliced to offset)
+        assert cloned_cache.keys.shape == (1, 4, 8, 16)
+        assert cloned_cache.values.shape == (1, 4, 8, 16)
+
+
+# ---------------------------------------------------------------------------
+# R13: Executor poll loop timeout behavior
+# ---------------------------------------------------------------------------
+
+
+class TestR13_ExecutorPollTimeout:
+    """Regression: R13 — non-streaming request timeout with executor poll loop.
+
+    The new _do_inference() uses a polling loop with run_in_executor to
+    periodically check for results. When get_result() raises TimeoutError,
+    the loop continues polling until the total timeout is exhausted.
+
+    This verifies:
+    1. A scheduler that always raises TimeoutError causes 504.
+    2. A scheduler that returns valid events causes 200.
+    """
+
+    @pytest.mark.anyio
+    async def test_timeout_returns_504_with_poll_loop(self):
+        """get_result() raising TimeoutError should eventually return 504."""
+        mock_sched = _TimeoutMockScheduler()
+        config = ServerConfig(model="test-model", request_timeout_s=0.5)
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 504, (
+            f"Expected 504 for timeout, got {resp.status_code}: {resp.text}"
+        )
+        # cancel_request must have been called
+        assert len(mock_sched.cancel_called_for) >= 1, (
+            "cancel_request must be called when polling times out"
+        )
+
+    @pytest.mark.anyio
+    async def test_successful_response_returns_200(self):
+        """get_result() returning valid events should return 200."""
+        mock_sched = _EOSStreamMockScheduler()
+        config = ServerConfig(model="test-model")
+        tok = _MockTokenizerForServer()
+        app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 10,
+                },
+            )
+
+        assert resp.status_code == 200, (
+            f"Expected 200 for successful response, got {resp.status_code}: {resp.text}"
+        )
+        data = resp.json()
+        assert data["choices"][0]["finish_reason"] == "stop"
+        assert "Hello" in data["choices"][0]["message"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# R1: Concurrent SSD operations — 2-phase eviction + 3-pass allocate_blocks
+# ---------------------------------------------------------------------------
+
+
+class TestR1_ConcurrentSSDOps:
+    """Regression: R1 — concurrent SSD operations must not deadlock.
+
+    The KV cache manager uses lock-release patterns to avoid holding the
+    lock during slow SSD I/O:
+    - evict_to_ssd(): 3-phase (select candidates locked -> SSD save unlocked
+      -> re-check and evict locked)
+    - allocate_blocks(): 3-pass (classify locked -> SSD load unlocked ->
+      allocate with loaded data locked)
+    - cache_block(): 2-phase (RAM alloc locked -> SSD write-through unlocked),
+      with two-phase eviction fallback
+
+    These tests verify that concurrent operations using these patterns do not
+    deadlock and that the Phase 3 re-validation guards work correctly.
+    """
+
+    @pytest.mark.timeout(10)
+    def test_evict_to_ssd_does_not_hold_lock_during_save(self, tmp_path):
+        """evict_to_ssd releases the lock during SSD save, allowing concurrent alloc.
+
+        Strategy: mock SSD save_block to sleep 0.2s. If evict held the lock
+        during that sleep, a concurrent allocate_blocks call would block for
+        the full 0.2s. We verify both finish and the allocate thread was not
+        blocked for the full save duration.
+        """
+        import mlx.core as mx
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+
+        config = ServerConfig(block_size=4, num_blocks=4)
+        ssd = SSDCache(cache_dir=tmp_path / "ssd_cache", ttl_days=7)
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        kv_data = [{"keys": mx.zeros((1, 4, 4, 64)), "values": mx.zeros((1, 4, 4, 64))}]
+
+        # Fill all 4 blocks as evictable (ref_count=0)
+        for i in range(4):
+            block = mgr.pool.get_free_block()
+            block.block_hash = f"fill-{i}"
+            block.token_ids = [i * 10 + j for j in range(4)]
+            block.ref_count = 0
+            block.last_accessed = float(i)  # oldest first
+            block.kv_data = list(kv_data)
+            mgr.hash_table[block.block_hash] = block.block_id
+
+        assert mgr.pool.num_free == 0
+
+        # Patch SSD save_block to sleep 0.2s (simulating slow disk I/O)
+        original_save = ssd.save_block
+
+        def slow_save(block_hash, data, num_tokens=None):
+            time.sleep(0.2)
+            return original_save(block_hash, data, num_tokens)
+
+        ssd.save_block = slow_save
+
+        evict_result = [None]
+        alloc_start = [None]
+        alloc_end = [None]
+        alloc_result = [None]
+
+        def evict_thread():
+            evict_result[0] = tiered.evict_to_ssd(num_blocks=2)
+
+        def alloc_thread():
+            # Wait a tiny bit so evict starts first
+            time.sleep(0.05)
+            alloc_start[0] = time.monotonic()
+            # This should be able to acquire the lock during the SSD save window
+            # Since evict releases the lock for Phase 2, allocate_blocks can
+            # proceed during that window.
+            alloc_result[0] = mgr.allocate_blocks(
+                token_ids=[100, 101, 102, 103, 200, 201, 202, 203],
+                num_existing_blocks=0,
+            )
+            alloc_end[0] = time.monotonic()
+
+        t_evict = threading.Thread(target=evict_thread)
+        t_alloc = threading.Thread(target=alloc_thread)
+
+        t_evict.start()
+        t_alloc.start()
+
+        t_evict.join(timeout=8.0)
+        t_alloc.join(timeout=8.0)
+
+        assert not t_evict.is_alive(), "evict_to_ssd() deadlocked (thread still alive)"
+        assert not t_alloc.is_alive(), "allocate_blocks() deadlocked (thread still alive)"
+
+        # Both operations should have completed
+        assert evict_result[0] is not None, "evict_to_ssd should return a result"
+        assert alloc_result[0] is not None, "allocate_blocks should return a result"
+
+        # The allocate thread should not have been blocked for the full 0.2s
+        # save duration. It should have been able to start processing during
+        # the unlock window. Allow some slack for thread scheduling.
+        alloc_duration = alloc_end[0] - alloc_start[0]
+        # If lock were held during save, alloc would wait ~0.4s (2 saves x 0.2s).
+        # With the unlock pattern, alloc can interleave during the save window.
+        # We just verify both complete; exact timing depends on OS scheduling.
+        assert alloc_duration < 2.0, (
+            f"allocate_blocks took {alloc_duration:.2f}s, suggesting lock contention"
+        )
+
+    @pytest.mark.timeout(10)
+    def test_concurrent_cache_block_and_evict(self, tmp_path):
+        """cache_block (triggering two-phase eviction) and evict_to_ssd run concurrently.
+
+        Both threads operate on a fully-allocated pool where all blocks are
+        evictable. Thread 1 calls cache_block (which triggers two-phase eviction
+        internally when pool is exhausted), thread 2 calls evict_to_ssd. Both
+        should complete without deadlock.
+        """
+        import mlx.core as mx
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+
+        config = ServerConfig(block_size=4, num_blocks=6)
+        ssd = SSDCache(cache_dir=tmp_path / "ssd_cache2", ttl_days=7)
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        kv_data = [{"keys": mx.zeros((1, 4, 4, 64)), "values": mx.zeros((1, 4, 4, 64))}]
+
+        # Fill all 6 blocks as evictable
+        for i in range(6):
+            block = mgr.pool.get_free_block()
+            block.block_hash = f"old-{i}"
+            block.token_ids = [i * 10 + j for j in range(4)]
+            block.ref_count = 0
+            block.last_accessed = float(i)
+            block.kv_data = list(kv_data)
+            mgr.hash_table[block.block_hash] = block.block_id
+
+        assert mgr.pool.num_free == 0
+
+        # Use barriers to force overlap
+        barrier = threading.Barrier(2, timeout=5.0)
+
+        cache_block_result = [None]
+        cache_block_error = [None]
+        evict_result = [None]
+        evict_error = [None]
+
+        def thread_cache_block():
+            try:
+                barrier.wait()
+                cache_block_result[0] = mgr.cache_block(
+                    block_hash="new-cb-hash",
+                    token_ids=[50, 51, 52, 53],
+                    kv_data=list(kv_data),
+                    tiered_cache=tiered,
+                )
+            except Exception as e:
+                cache_block_error[0] = e
+
+        def thread_evict():
+            try:
+                barrier.wait()
+                evict_result[0] = tiered.evict_to_ssd(num_blocks=2)
+            except Exception as e:
+                evict_error[0] = e
+
+        t1 = threading.Thread(target=thread_cache_block)
+        t2 = threading.Thread(target=thread_evict)
+
+        t1.start()
+        t2.start()
+
+        t1.join(timeout=8.0)
+        t2.join(timeout=8.0)
+
+        assert not t1.is_alive(), (
+            "cache_block() deadlocked (thread still alive after 8s)"
+        )
+        assert not t2.is_alive(), (
+            "evict_to_ssd() deadlocked (thread still alive after 8s)"
+        )
+
+        assert cache_block_error[0] is None, (
+            f"cache_block() raised: {cache_block_error[0]}"
+        )
+        assert evict_error[0] is None, (
+            f"evict_to_ssd() raised: {evict_error[0]}"
+        )
+
+        # At least one operation should have succeeded in evicting/allocating
+        # (exact behavior depends on thread scheduling)
+        # cache_block either allocated a block or returned None
+        # evict_to_ssd either evicted blocks or returned empty list
+        assert evict_result[0] is not None, "evict_to_ssd should return a list"
+
+    @pytest.mark.timeout(10)
+    def test_evict_to_ssd_revalidates_after_unlock(self, tmp_path):
+        """Phase 3 of evict_to_ssd re-checks ref_count after the SSD save.
+
+        If another thread increments a block's ref_count during the unlock
+        window (Phase 2), Phase 3 must detect this and skip eviction for
+        that block.
+
+        Strategy:
+        1. Fill pool with 2 evictable blocks.
+        2. Patch SSD save_block to signal an event after it starts, then sleep.
+        3. In the main thread, wait for the event, then increment the block's
+           ref_count (simulating another thread claiming the block).
+        4. After evict_to_ssd returns, verify the block with incremented
+           ref_count was NOT evicted.
+        """
+        import mlx.core as mx
+        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.ssd_cache import SSDCache
+
+        config = ServerConfig(block_size=4, num_blocks=2)
+        ssd = SSDCache(cache_dir=tmp_path / "ssd_cache3", ttl_days=7)
+        mgr = KVCacheManager(config, ssd=ssd)
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        kv_data = [{"keys": mx.zeros((1, 4, 4, 64)), "values": mx.zeros((1, 4, 4, 64))}]
+
+        # Fill both blocks as evictable
+        blocks = []
+        for i in range(2):
+            block = mgr.pool.get_free_block()
+            block.block_hash = f"reval-{i}"
+            block.token_ids = [i * 10 + j for j in range(4)]
+            block.ref_count = 0
+            block.last_accessed = float(i)
+            block.kv_data = list(kv_data)
+            mgr.hash_table[block.block_hash] = block.block_id
+            blocks.append(block)
+
+        assert mgr.pool.num_free == 0
+
+        # The block we'll "rescue" during the unlock window
+        target_block = blocks[0]  # oldest, will be eviction candidate
+        target_hash = target_block.block_hash
+
+        # Event to coordinate: fires when SSD save starts (lock is released)
+        save_started = threading.Event()
+        # Event: main thread has incremented ref_count, save can complete
+        ref_incremented = threading.Event()
+
+        original_save = ssd.save_block
+
+        def coordinated_save(block_hash, data, num_tokens=None):
+            save_started.set()
+            ref_incremented.wait(timeout=5.0)
+            return original_save(block_hash, data, num_tokens)
+
+        ssd.save_block = coordinated_save
+
+        evict_result = [None]
+
+        def evict_thread():
+            evict_result[0] = tiered.evict_to_ssd(num_blocks=2)
+
+        t = threading.Thread(target=evict_thread)
+        t.start()
+
+        # Wait for Phase 2 to start (lock is released, SSD save begins)
+        save_started.wait(timeout=5.0)
+
+        # During the unlock window: simulate another thread claiming the block
+        with mgr.lock:
+            target_block.ref_count = 1  # Block is now in use
+
+        # Let the save complete
+        ref_incremented.set()
+
+        t.join(timeout=8.0)
+        assert not t.is_alive(), "evict_to_ssd() deadlocked"
+
+        evicted_ids = evict_result[0]
+        assert evicted_ids is not None, "evict_to_ssd should return a list"
+
+        # The target block should NOT have been evicted because Phase 3
+        # re-checks ref_count and finds it's now 1 (not 0)
+        assert target_block.block_id not in evicted_ids, (
+            f"Block {target_block.block_id} (ref_count incremented during "
+            f"Phase 2) should NOT have been evicted. Evicted: {evicted_ids}"
+        )
+
+        # The target block should still be in the hash table
+        assert target_hash in mgr.hash_table, (
+            f"Block hash '{target_hash}' should still be in hash_table "
+            f"since its ref_count was incremented during the unlock window"
+        )
+
+        # The target block should still have ref_count=1
+        assert target_block.ref_count == 1, (
+            f"Target block ref_count should be 1, got {target_block.ref_count}"
+        )

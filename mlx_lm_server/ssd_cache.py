@@ -56,8 +56,8 @@ class SSDCache:
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load existing index if available
-        self.load_index()
+        # Load existing index if available (no contention in __init__)
+        self._load_index()
 
         # Stats counters (thread-safe reads via get_stats snapshot)
         self._stats: dict[str, int] = {
@@ -172,7 +172,7 @@ class SSDCache:
                 last_accessed=datetime.now(),
                 num_tokens=num_tokens,
             )
-            self.save_index()  # Immediate flush: new block must be indexed for durability
+            self._save_index()  # Immediate flush: new block must be indexed for durability
             self._stats["ssd_save_success"] += 1
 
             logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
@@ -205,7 +205,7 @@ class SSDCache:
             if not filepath.exists():
                 # Stale index entry — file was removed externally
                 del self.index[block_hash]
-                self.save_index()
+                self._save_index()
                 self._stats["ssd_stale_index_cleaned"] += 1
                 return None
 
@@ -220,7 +220,7 @@ class SSDCache:
                     e,
                 )
                 del self.index[block_hash]
-                self.save_index()
+                self._save_index()
                 self._stats["ssd_stale_index_cleaned"] += 1
                 return None
 
@@ -277,7 +277,7 @@ class SSDCache:
                 del self.index[block_hash]
 
             if to_prune:
-                self.save_index()
+                self._save_index()
 
             return len(to_prune)
 
@@ -290,22 +290,23 @@ class SSDCache:
         count_due = self._mutation_count >= self._flush_interval
         time_due = (now - self._last_flush_time) >= self._flush_interval_s
         if count_due or time_due:
-            self.save_index()
-            self._mutation_count = 0
-            self._index_dirty = False
-            self._last_flush_time = now
+            self._save_index()
+            # _save_index() resets _mutation_count, _index_dirty, _last_flush_time
 
     def flush(self) -> None:
         """Flush pending index changes to disk. Call during shutdown."""
         with self._lock:
             if self._index_dirty:
-                self.save_index()
-                self._mutation_count = 0
-                self._index_dirty = False
-                self._last_flush_time = time.monotonic()
+                self._save_index()
+                # _save_index() resets _mutation_count, _index_dirty, _last_flush_time
 
     def save_index(self) -> None:
-        """Persist the index to a JSON file in the cache directory.
+        """Persist the index to a JSON file in the cache directory (thread-safe)."""
+        with self._lock:
+            self._save_index()
+
+    def _save_index(self) -> None:
+        """Persist the index — caller must hold self._lock.
 
         Uses atomic write (write to temp file + os.replace) to prevent
         index corruption if the process crashes mid-write.
@@ -334,6 +335,9 @@ class SSDCache:
             with os.fdopen(tmp_fd, 'w') as f:
                 json.dump(serializable, f, indent=2)
             os.replace(tmp_path, str(index_path))
+            self._last_flush_time = time.monotonic()
+            self._mutation_count = 0
+            self._index_dirty = False
         except Exception:
             try:
                 os.unlink(tmp_path)
@@ -342,7 +346,12 @@ class SSDCache:
             raise
 
     def load_index(self) -> None:
-        """Load the index from the JSON file in the cache directory.
+        """Load the index from the JSON file (thread-safe)."""
+        with self._lock:
+            self._load_index()
+
+    def _load_index(self) -> None:
+        """Load the index — caller must hold self._lock.
 
         Handles both new format (with __metadata__ + blocks) and legacy
         format (flat dict of block entries). On hash_version mismatch,
@@ -402,7 +411,8 @@ class SSDCache:
     @property
     def num_blocks(self) -> int:
         """Number of blocks stored on SSD."""
-        return len(self.index)
+        with self._lock:
+            return len(self.index)
 
     def get_stats(self) -> dict[str, int]:
         """Return a snapshot of SSD cache statistics."""
@@ -443,6 +453,6 @@ class SSDCache:
                 logger.info("Cleaned missing index entry: %s", bh)
 
             if missing:
-                self.save_index()
+                self._save_index()
 
             return result

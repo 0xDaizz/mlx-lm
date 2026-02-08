@@ -74,6 +74,10 @@ def main() -> None:
     )
     scheduler.run_inference_loop()
 
+    # Ensure graceful shutdown even if uvicorn exits without lifespan cleanup
+    import atexit
+    atexit.register(scheduler.stop)
+
     # --- Build and run ---
     app = create_app(config=config, scheduler=scheduler, tokenizer=tokenizer)
     uvicorn.run(app, host=config.host, port=config.port)

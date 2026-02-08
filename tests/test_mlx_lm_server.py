@@ -601,14 +601,15 @@ async def test_max_tokens_clamped_to_minimum_1(client, mock_scheduler):
 
 
 class SlowMockScheduler(MockScheduler):
-    """Scheduler mock whose get_result blocks until timeout expires."""
+    """Scheduler mock whose get_result raises TimeoutError (simulating stalled inference)."""
 
     def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
-        """Block for longer than the timeout, then return empty (simulating timeout)."""
-        import time as _time
-        if timeout is not None:
-            _time.sleep(timeout + 0.1)
-        return []  # empty = timed out
+        """Raise TimeoutError — simulates a timeout in the executor poll loop.
+
+        The new _do_inference() calls get_result(timeout=poll_interval) in a loop
+        and catches TimeoutError per iteration until the total timeout is exhausted.
+        """
+        raise TimeoutError("Simulated timeout")
 
     def submit_request(self, request: InferenceRequest) -> None:
         self.submitted.append(request)

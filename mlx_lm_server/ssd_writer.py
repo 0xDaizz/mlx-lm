@@ -1,8 +1,8 @@
-"""Async SSD writer thread with inflight counter + sentinel shutdown.
+"""Async SSD writer thread with inflight counter + polling shutdown.
 
 Provides non-blocking SSD writes from the inference thread via a bounded queue.
 Three-level backpressure: put_nowait → put(50ms) → sync fallback.
-Deterministic shutdown via inflight counter + sentinel pattern.
+Deterministic shutdown via inflight counter + polling-based drain.
 """
 
 from __future__ import annotations
@@ -30,8 +30,9 @@ class SSDWriterThread:
     Shutdown protocol:
     1. stop() sets _closing=True under _life_lock
     2. Waits for all in-flight enqueues to complete (inflight counter)
-    3. Inserts sentinel (guaranteed last item in queue)
-    4. Worker sees sentinel → breaks → thread.join()
+    3. Best-effort sentinel enqueue (fast exit hint)
+    4. Worker polls queue with timeout; exits on _closing + drained OR sentinel
+    5. stop() joins the thread
     """
 
     def __init__(
@@ -49,12 +50,11 @@ class SSDWriterThread:
         self._max_retries = max_retries
 
         # Lifecycle
+        self._sentinel = object()
         self._closing = False
         self._inflight_enqueues = 0
         self._life_lock = threading.Lock()
         self._no_inflight = threading.Condition(self._life_lock)
-        self._sentinel = object()
-
         # Stats
         self._stats_lock = threading.Lock()
         self._stats: dict[str, int] = {
@@ -102,9 +102,15 @@ class SSDWriterThread:
         # "dedup" and "collision" are not failures — no action needed
 
     def _run(self) -> None:
-        """Worker loop: process queue items until sentinel."""
+        """Worker loop: process queue items until closing + drained."""
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                with self._life_lock:
+                    if self._closing and self._inflight_enqueues == 0 and self._queue.empty():
+                        break
+                continue
             if item is self._sentinel:
                 break
             block_hash, kv_data, num_tokens = item
@@ -112,8 +118,6 @@ class SSDWriterThread:
                 result = self._save_with_durability(block_hash, kv_data, num_tokens)
                 self._record_save_result(result, block_hash)
             except Exception:
-                # Unexpected exception (not normally reached since save_block
-                # catches I/O errors, but defensive against unforeseen cases)
                 self._inc("writer_save_fail")
                 logger.exception("SSD writer unexpected error: %s", block_hash)
             finally:
@@ -122,33 +126,36 @@ class SSDWriterThread:
 
     def enqueue(
         self, block_hash: str, kv_data, num_tokens: int | None = None
-    ) -> bool:
+    ) -> str:
         """Enqueue a block for async SSD write.
 
-        Returns False if writer is closing or block was deduped.
+        Returns:
+            "queued" if successfully enqueued or sync-fallback completed,
+            "dedup" if block is already pending,
+            "closing" if writer is shutting down.
         """
         with self._life_lock:
             if self._closing:
-                return False
+                return "closing"
             self._inflight_enqueues += 1
         try:
             with self._pending_lock:
                 if block_hash in self._pending:
                     self._inc("writer_enqueue_dedup_skip")
-                    return False
+                    return "dedup"
                 self._pending.add(block_hash)
             self._inc("writer_enqueue_total")
 
             # Level 0: non-blocking
             try:
                 self._queue.put_nowait((block_hash, kv_data, num_tokens))
-                return True
+                return "queued"
             except queue.Full:
                 pass
             # Level 1: short wait (50ms)
             try:
                 self._queue.put((block_hash, kv_data, num_tokens), timeout=0.05)
-                return True
+                return "queued"
             except queue.Full:
                 pass
             # Level 2: sync fallback
@@ -160,7 +167,7 @@ class SSDWriterThread:
                 self._record_save_result(result, block_hash)
             except Exception:
                 self._inc("writer_save_fail")
-            return True
+            return "queued"
         finally:
             with self._life_lock:
                 self._inflight_enqueues -= 1
@@ -168,7 +175,10 @@ class SSDWriterThread:
                     self._no_inflight.notify_all()
 
     def stop(self, drain_timeout: float = 5.0) -> bool:
-        """Graceful shutdown. Race-free: waits for in-flight, then sentinel.
+        """Graceful shutdown. Sets closing flag, waits for drain, joins thread.
+
+        The worker loop detects _closing + empty queue and exits without
+        needing a sentinel. Sentinel is still attempted as a fast-exit hint.
 
         Returns True if shutdown completed cleanly.
         """
@@ -179,20 +189,17 @@ class SSDWriterThread:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     logger.error("Timed out waiting for in-flight enqueues")
-                    return False
+                    break  # Don't return False — still try to join
                 self._no_inflight.wait(timeout=remaining)
 
-        # All in-flight enqueues done → sentinel is guaranteed last
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
+        # Best-effort sentinel (fast exit hint for worker)
         try:
-            self._queue.put(self._sentinel, timeout=remaining)
+            self._queue.put_nowait(self._sentinel)
         except queue.Full:
-            logger.error("Cannot enqueue sentinel: queue full after drain wait")
-            return False
+            pass  # Worker will exit via polling check
 
-        self._thread.join(timeout=max(0, deadline - time.monotonic()))
+        remaining = max(0, deadline - time.monotonic())
+        self._thread.join(timeout=remaining)
         ok = not self._thread.is_alive()
         if not ok:
             logger.error(

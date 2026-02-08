@@ -302,13 +302,10 @@ class KVCacheManager:
     ) -> list[int]:
         """Allocate blocks for a token sequence, reusing cached blocks.
 
-        For each block-sized chunk of tokens (starting after existing blocks):
-        1. Compute the block hash
-        2. If hash exists in hash_table and tokens match -> reuse (increment ref_count)
-        3. Otherwise -> allocate from free pool, register in hash_table
-
-        If the free pool is exhausted during allocation, attempts LRU eviction
-        to reclaim blocks. Raises BlockPoolExhaustedError if eviction also fails.
+        Uses 3-pass pattern to avoid holding lock during SSD I/O:
+        Pass 1 (locked): classify blocks as RAM-HIT / SSD-PROMOTE / MISS
+        Pass 2 (unlocked): load SSD data for promote candidates
+        Pass 3 (locked): allocate blocks with loaded data
 
         Args:
             token_ids: The full token sequence to allocate blocks for.
@@ -321,62 +318,102 @@ class KVCacheManager:
         """
         num_tokens = len(token_ids)
         num_full_blocks = num_tokens // self.block_size
+
+        # Pre-compute all block hashes (CPU-only, no lock needed)
+        block_info: list[tuple[list[int], str]] = []  # (block_tokens, block_hash)
+        prev_hash: str | None = None
+        for i in range(num_full_blocks):
+            start = i * self.block_size
+            end = start + self.block_size
+            if end > num_tokens:
+                break
+            block_tokens = token_ids[start:end]
+            block_hash = _compute_chain_hash(block_tokens, prev_hash)
+            block_info.append((list(block_tokens), block_hash))
+            prev_hash = block_hash
+
+        # Classification constants
+        RAM_HIT = "ram_hit"
+        SSD_PROMOTE = "ssd_promote"
+        MISS = "miss"
+        COLLISION = "collision"
+
+        # --- Pass 1 (locked): classify blocks ---
+        classifications: list[tuple[int, str, int | None]] = []
+        # (block_info_index, classification, block_id_for_ram_hits)
+        ssd_hashes_to_load: list[tuple[int, str]] = []  # (index, block_hash)
         allocated_block_ids: list[int] = []
-        # Track which blocks were freshly allocated (vs cache hits)
-        # so we can properly rollback on failure
         freshly_allocated: list[int] = []
 
         with self.lock:
-            # Build chain hash for prefix blocks (before num_existing_blocks)
-            prev_hash: str | None = None
-            for i in range(num_existing_blocks):
-                start = i * self.block_size
-                end = start + self.block_size
-                if end > num_tokens:
-                    break
-                chunk = token_ids[start:end]
-                prev_hash = _compute_chain_hash(chunk, prev_hash)
+            for idx in range(num_existing_blocks, len(block_info)):
+                block_tokens, block_hash = block_info[idx]
 
-            for i in range(num_existing_blocks, num_full_blocks):
-                start = i * self.block_size
-                end = start + self.block_size
-                block_tokens = token_ids[start:end]
-
-                block_hash = _compute_chain_hash(block_tokens, prev_hash)
-                is_collision = False
-
-                # Check if this block is already cached
+                # Check RAM cache
                 if block_hash in self.hash_table:
                     block_id = self.hash_table[block_hash]
                     block = self.pool.blocks[block_id]
 
                     # Collision verification
                     if block.token_ids == block_tokens:
+                        # RAM hit — process immediately
                         block.ref_count += 1
                         block.last_accessed = time.time()
                         allocated_block_ids.append(block_id)
                         self._stats["kv_lookup_hits"] += 1
                         logger.debug(
                             "Cache hit for block %d (hash=%s, ref_count=%d)",
-                            block_id,
-                            block_hash,
-                            block.ref_count,
+                            block_id, block_hash, block.ref_count,
                         )
-                        prev_hash = block_hash
+                        classifications.append((idx, RAM_HIT, block_id))
                         continue
                     else:
-                        # Hash collision with different tokens — treat as miss
-                        # but do NOT overwrite hash_table (would evict the
-                        # existing block's entry, corrupting the cache)
+                        # Hash collision
                         logger.warning(
                             "Hash collision during allocation for hash %s",
                             block_hash,
                         )
-                        is_collision = True
+                        classifications.append((idx, COLLISION, None))
+                        continue
 
-                # SSD promote: try loading block data from SSD before allocating fresh
-                if not is_collision and self.ssd is not None:
-                    raw_data = self.ssd.load_block(block_hash)
+                # Check SSD index (index-only, fast — no I/O)
+                if self.ssd is not None and self.ssd.has_block(block_hash):
+                    ssd_hashes_to_load.append((idx, block_hash))
+                    classifications.append((idx, SSD_PROMOTE, None))
+                    continue
+
+                # Cache miss
+                classifications.append((idx, MISS, None))
+
+        # --- Pass 2 (no lock): load SSD data ---
+        ssd_loaded: dict[int, list | dict | None] = {}  # idx -> raw_data
+        for idx, block_hash in ssd_hashes_to_load:
+            raw_data = self.ssd.load_block(block_hash) if self.ssd is not None else None
+            ssd_loaded[idx] = raw_data
+
+        # --- Pass 3 (locked): allocate blocks with loaded data ---
+        with self.lock:
+            for idx, classification, ram_block_id in classifications:
+                block_tokens, block_hash = block_info[idx]
+
+                if classification == RAM_HIT:
+                    # Already processed in Pass 1
+                    continue
+
+                if classification == SSD_PROMOTE:
+                    # Re-check: another thread may have added this block to RAM
+                    if block_hash in self.hash_table:
+                        block_id = self.hash_table[block_hash]
+                        block = self.pool.blocks[block_id]
+                        if block.token_ids == block_tokens:
+                            block.ref_count += 1
+                            block.last_accessed = time.time()
+                            allocated_block_ids.append(block_id)
+                            self._stats["kv_lookup_hits"] += 1
+                            continue
+                        # else: collision — fall through to MISS handling
+
+                    raw_data = ssd_loaded.get(idx)
                     if raw_data is not None:
                         # Normalize format: ensure list[dict]
                         if isinstance(raw_data, dict):
@@ -399,62 +436,51 @@ class KVCacheManager:
                                     "Block pool exhausted and no blocks eligible for eviction"
                                 )
                             block = self.pool.get_free_block()
+
                         block.block_hash = block_hash
-                        block.token_ids = list(block_tokens)
+                        block.token_ids = block_tokens
                         block.kv_data = raw_data
                         block.ref_count = 1
                         block.last_accessed = time.time()
                         self.hash_table[block_hash] = block.block_id
                         allocated_block_ids.append(block.block_id)
                         freshly_allocated.append(block.block_id)
-                        prev_hash = block_hash
                         self._stats["kv_promote_hits"] += 1
                         logger.debug(
                             "SSD promote for block %d (hash=%s)",
-                            block.block_id,
-                            block_hash,
+                            block.block_id, block_hash,
                         )
                         continue
+                    # SSD load returned None — fall through to MISS
 
-                # Cache miss — allocate a new block
+                # MISS or COLLISION or failed SSD promote
+                is_collision = (classification == COLLISION)
                 try:
                     block = self.pool.get_free_block()
                 except BlockPoolExhaustedError:
-                    # Try eviction before giving up (release lock temporarily
-                    # is not needed since _evict_lru_locked works under the
-                    # same lock)
                     evicted = self._evict_lru_locked(num_blocks=1)
                     if not evicted:
-                        # Roll back allocations made in this call:
-                        # - For cache hits: just decrement ref_count
-                        # - For freshly allocated: remove from hash_table
-                        #   and return to free pool
                         for bid in allocated_block_ids:
                             b = self.pool.blocks[bid]
                             if bid in freshly_allocated:
-                                # Fully undo the fresh allocation
                                 if b.block_hash is not None and b.block_hash in self.hash_table:
                                     del self.hash_table[b.block_hash]
                                 self.pool.return_block(bid)
                             else:
-                                # Cache hit — just decrement ref_count
                                 b.ref_count -= 1
                         raise BlockPoolExhaustedError(
                             "Block pool exhausted and no blocks eligible for eviction"
                         )
                     block = self.pool.get_free_block()
 
-                block.token_ids = list(block_tokens)  # Store a copy
+                block.token_ids = block_tokens
                 block.ref_count = 1
                 block.last_accessed = time.time()
                 allocated_block_ids.append(block.block_id)
-                freshly_allocated.append(block.block_id)  # ALL new allocations
+                freshly_allocated.append(block.block_id)
                 self._stats["kv_lookup_miss"] += 1
 
                 if is_collision:
-                    # Don't register in hash_table — would overwrite the
-                    # existing entry for a different token sequence.
-                    # Block is usable for this request but not cacheable.
                     block.block_hash = None
                     logger.debug(
                         "Allocated collision block %d (hash not registered)",
@@ -465,11 +491,8 @@ class KVCacheManager:
                     self.hash_table[block_hash] = block.block_id
                     logger.debug(
                         "Allocated new block %d (hash=%s)",
-                        block.block_id,
-                        block_hash,
+                        block.block_id, block_hash,
                     )
-
-                prev_hash = block_hash
 
         return allocated_block_ids
 
@@ -822,6 +845,15 @@ class TieredKVCache:
         self._writer = writer  # Optional SSDWriterThread for async writes
         self._durability = durability
         self._max_retries = max_retries
+        # Sync path stats
+        self._sync_stats_lock = threading.Lock()
+        self._sync_stats: dict[str, int] = {
+            "tiered_sync_save_attempts": 0,
+            "tiered_sync_save_success": 0,
+            "tiered_sync_retry_attempts": 0,
+            "tiered_sync_save_fail": 0,
+            "tiered_sync_save_collision": 0,
+        }
 
     def _save_to_ssd_with_durability(self, block_hash: str, kv_data, num_tokens: int | None = None) -> str:
         """Save to SSD with optional persistent retry.
@@ -831,18 +863,39 @@ class TieredKVCache:
         if self.ssd is None:
             return "error"
 
+        with self._sync_stats_lock:
+            self._sync_stats["tiered_sync_save_attempts"] += 1
         result = self.ssd.save_block(block_hash, kv_data, num_tokens)
-        if result != "error":
+        if result == "saved" or result == "dedup":
+            with self._sync_stats_lock:
+                self._sync_stats["tiered_sync_save_success"] += 1
+            return result
+        if result == "collision":
+            with self._sync_stats_lock:
+                self._sync_stats["tiered_sync_save_collision"] += 1
             return result
 
+        # result == "error"
         if self._durability != "persistent":
+            with self._sync_stats_lock:
+                self._sync_stats["tiered_sync_save_fail"] += 1
             return "error"
 
         for _ in range(self._max_retries):
+            with self._sync_stats_lock:
+                self._sync_stats["tiered_sync_retry_attempts"] += 1
             retry_result = self.ssd.save_block(block_hash, kv_data, num_tokens)
-            if retry_result != "error":
+            if retry_result == "saved" or retry_result == "dedup":
+                with self._sync_stats_lock:
+                    self._sync_stats["tiered_sync_save_success"] += 1
+                return retry_result
+            if retry_result == "collision":
+                with self._sync_stats_lock:
+                    self._sync_stats["tiered_sync_save_collision"] += 1
                 return retry_result
 
+        with self._sync_stats_lock:
+            self._sync_stats["tiered_sync_save_fail"] += 1
         logger.warning("Sync SSD persistent retry exhausted for %s", block_hash)
         return "error"
 
@@ -887,10 +940,13 @@ class TieredKVCache:
             num_tokens: Number of tokens in the block (optional, for SSD metadata).
         """
         if self._writer is not None:
-            enqueued = self._writer.enqueue(block_hash, kv_data, num_tokens)
-            if not enqueued:
-                logger.debug("Writer enqueue returned False for %s (closing or dedup), attempting sync save", block_hash)
+            status = self._writer.enqueue(block_hash, kv_data, num_tokens)
+            if status == "closing":
+                logger.debug("Writer closing for %s, attempting sync fallback", block_hash)
                 self._save_to_ssd_with_durability(block_hash, kv_data, num_tokens)
+            elif status == "dedup":
+                logger.debug("Writer dedup skip for %s", block_hash)
+            # "queued" — nothing to do
             return
         if self.ssd is not None:
             self._save_to_ssd_with_durability(block_hash, kv_data, num_tokens)
@@ -901,11 +957,18 @@ class TieredKVCache:
             return self._writer.get_stats()
         return {}
 
+    def get_sync_stats(self) -> dict[str, int]:
+        """Return a snapshot of sync durability statistics."""
+        with self._sync_stats_lock:
+            return dict(self._sync_stats)
+
     def evict_to_ssd(self, num_blocks: int = 1, exclude_ids: set[int] | None = None) -> list[int]:
         """Evict LRU blocks from RAM, saving them to SSD first.
 
-        For each block being evicted that has kv_data, the data is
-        persisted to SSD before the block is freed from RAM.
+        Uses 2-phase pattern to avoid holding ram.lock during SSD I/O:
+        Phase 1 (under lock): select candidates, extract data references
+        Phase 2 (no lock): save to SSD
+        Phase 3 (under lock): re-check and evict confirmed saves from RAM
 
         Args:
             num_blocks: Number of blocks to evict.
@@ -914,44 +977,68 @@ class TieredKVCache:
         Returns:
             List of evicted block_ids.
         """
+        # --- Phase 1: select candidates under lock ---
+        candidates_to_save: list[tuple[KVCacheBlock, str, list]] = []
+        direct_evict: list[KVCacheBlock] = []
+
         with self.ram.lock:
-            # Find eviction candidates
-            candidates: list[KVCacheBlock] = []
+            raw_candidates: list[KVCacheBlock] = []
             for block_hash, block_id in self.ram.hash_table.items():
                 block = self.ram.pool.blocks[block_id]
                 if block.ref_count == 0 and (exclude_ids is None or block.block_id not in exclude_ids):
-                    candidates.append(block)
+                    raw_candidates.append(block)
 
-            candidates.sort(key=lambda b: b.last_accessed)
+            raw_candidates.sort(key=lambda b: b.last_accessed)
 
-            evicted_ids: list[int] = []
-            for block in candidates[:num_blocks]:
-                # Save to SSD before evicting
+            for block in raw_candidates[:num_blocks]:
                 if (
                     self.ssd is not None
                     and block.kv_data is not None
                     and block.block_hash is not None
                 ):
-                    # Skip save if block already on SSD
-                    if self.ssd.has_block(block.block_hash):
-                        # Already persisted — just evict from RAM
-                        pass  # fall through to the eviction logic below
-                    else:
-                        result = self._save_to_ssd_with_durability(block.block_hash, block.kv_data)
-                        if result == "error":
-                            logger.warning(
-                                "SSD save failed for block %d, skipping eviction",
-                                block.block_id,
-                            )
-                            continue  # Skip eviction — keep block in RAM
+                    candidates_to_save.append((block, block.block_hash, block.kv_data))
+                else:
+                    direct_evict.append(block)
 
-                # Remove from hash table
-                if (
-                    block.block_hash is not None
-                    and block.block_hash in self.ram.hash_table
-                ):
+        # --- Phase 2: save to SSD WITHOUT holding ram.lock ---
+        save_results: dict[int, str] = {}
+        for block, block_hash, kv_data in candidates_to_save:
+            result = self._save_to_ssd_with_durability(block_hash, kv_data)
+            save_results[block.block_id] = result
+
+        # --- Phase 3: evict confirmed saves under lock ---
+        evicted_ids: list[int] = []
+        with self.ram.lock:
+            for block in direct_evict:
+                # Guard: block may have been evicted by another thread between phases
+                if block.block_hash is None:
+                    continue  # Already returned to free pool
+                if block.ref_count != 0:
+                    continue
+                if block.block_hash in self.ram.hash_table:
                     del self.ram.hash_table[block.block_hash]
-                # Return to free pool
+                self.ram.pool.return_block(block.block_id)
+                evicted_ids.append(block.block_id)
+
+            for block, orig_block_hash, kv_data in candidates_to_save:
+                result = save_results.get(block.block_id, "error")
+                if result not in ("saved", "dedup"):
+                    logger.warning(
+                        "SSD persist not confirmed (%s) for block %d; skip eviction",
+                        result, block.block_id,
+                    )
+                    if block.block_hash is not None:
+                        block.last_accessed = time.time()
+                    continue
+                # Guard: block may have been recycled by another thread
+                if block.block_hash is None:
+                    continue  # Already returned to free pool
+                if block.block_hash != orig_block_hash:
+                    continue  # Block recycled for different content
+                if block.ref_count != 0:
+                    continue
+                if block.block_hash in self.ram.hash_table:
+                    del self.ram.hash_table[block.block_hash]
                 self.ram.pool.return_block(block.block_id)
                 evicted_ids.append(block.block_id)
 

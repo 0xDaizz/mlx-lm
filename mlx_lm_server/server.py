@@ -332,17 +332,28 @@ def create_app(
             sched.submit_request(inf_req)
         except RuntimeError as e:
             raise HTTPException(status_code=429, detail=str(e))
-        try:
-            events = await asyncio.get_running_loop().run_in_executor(
-                None, lambda: sched.get_result(request_id, timeout=timeout)
-            )
-        except TimeoutError:
-            sched.cancel_request(request_id)
-            raise HTTPException(status_code=504, detail="Request timed out")
+
+        # Poll with short intervals to detect client disconnect.
+        # Between polls, asyncio.CancelledError can propagate if client disconnects.
+        loop = asyncio.get_running_loop()
+        poll_interval = 2.0
+        elapsed = 0.0
+        events = None
+        while elapsed < timeout:
+            remaining = timeout - elapsed
+            wait = min(poll_interval, remaining) if remaining > 0 else poll_interval
+            try:
+                events = await loop.run_in_executor(
+                    None, lambda t=wait: sched.get_result(request_id, timeout=t)
+                )
+                break  # Got result
+            except TimeoutError:
+                elapsed += wait
+                continue
 
         if not events:
             sched.cancel_request(request_id)
-            raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
+            raise HTTPException(status_code=504, detail="Request timed out")
 
         # Exclude EOS token from output if present (by token_id, not text)
         filtered_events = events
