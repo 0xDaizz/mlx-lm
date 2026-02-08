@@ -319,6 +319,7 @@ class KVCacheManager:
                 block.ref_count = 1
                 block.last_accessed = time.time()
                 allocated_block_ids.append(block.block_id)
+                freshly_allocated.append(block.block_id)  # ALL new allocations
 
                 if is_collision:
                     # Don't register in hash_table — would overwrite the
@@ -332,7 +333,6 @@ class KVCacheManager:
                 else:
                     block.block_hash = block_hash
                     self.hash_table[block_hash] = block.block_id
-                    freshly_allocated.append(block.block_id)
                     logger.debug(
                         "Allocated new block %d (hash=%s)",
                         block.block_id,
@@ -480,7 +480,7 @@ class KVCacheManager:
         with self.lock:
             # Already cached — nothing to do
             if block_hash in self.hash_table:
-                return self.hash_table[block_hash]
+                return None  # Already cached — caller should not free
 
             # Try to allocate a free block
             try:
@@ -665,7 +665,14 @@ class TieredKVCache:
                     and block.kv_data is not None
                     and block.block_hash is not None
                 ):
-                    self.ssd.save_block(block.block_hash, block.kv_data)
+                    try:
+                        self.ssd.save_block(block.block_hash, block.kv_data)
+                    except Exception as e:
+                        logger.warning(
+                            "SSD save failed for block %d, skipping eviction: %s",
+                            block.block_id, e,
+                        )
+                        continue  # Skip eviction — keep block in RAM
 
                 # Remove from hash table
                 if (

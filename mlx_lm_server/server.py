@@ -254,7 +254,7 @@ def create_app(
 
         # Exclude EOS token text from output if present
         filtered_events = events
-        if events and events[-1].finish_reason == "stop" and tok is not None:
+        if events and tok is not None:
             eos_token = getattr(tok, "eos_token", None)
             if eos_token is not None and events[-1].token_text == eos_token:
                 filtered_events = events[:-1]
@@ -504,41 +504,45 @@ def _stream_response(
     async def event_generator() -> AsyncIterator[str]:
         token_queue = scheduler.register_stream(inf_req.request_id)
         try:
-            scheduler.submit_request(inf_req)
-        except RuntimeError as e:
-            error_data = {"error": {"message": str(e), "type": "rate_limit_error"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            return
-
-        loop = asyncio.get_running_loop()
-
-        while True:
             try:
-                event: TokenEvent | None = await loop.run_in_executor(
-                    None, lambda: token_queue.get(timeout=request_timeout_s)
-                )
-            except queue.Empty:
-                scheduler.cancel_request(inf_req.request_id)
-                error_data = {"error": {"message": f"Stream timeout: no tokens received for {request_timeout_s} seconds", "type": "server_error"}}
+                scheduler.submit_request(inf_req)
+            except RuntimeError as e:
+                error_data = {"error": {"message": str(e), "type": "rate_limit_error"}}
                 yield f"data: {json.dumps(error_data)}\n\n"
-                break
-            if event is None:
-                break
+                return
 
-            # Filter EOS token text in streaming
-            token_text = event.token_text
-            if event.finish_reason == "stop" and tokenizer is not None:
-                eos_token = getattr(tokenizer, "eos_token", None)
-                if eos_token is not None and token_text == eos_token:
-                    token_text = ""
+            loop = asyncio.get_running_loop()
 
-            chunk = format_chunk(request_id, model_name, token_text, event.finish_reason)
-            yield f"data: {json.dumps(chunk)}\n\n"
+            while True:
+                try:
+                    event: TokenEvent | None = await loop.run_in_executor(
+                        None, lambda: token_queue.get(timeout=request_timeout_s)
+                    )
+                except queue.Empty:
+                    error_data = {"error": {"message": f"Stream timeout: no tokens received for {request_timeout_s} seconds", "type": "server_error"}}
+                    yield f"data: {json.dumps(error_data)}\n\n"
+                    break
+                if event is None:
+                    break
 
-            if event.finish_reason is not None:
-                break
+                # Filter EOS token text in streaming
+                token_text = event.token_text
+                if tokenizer is not None:
+                    eos_token = getattr(tokenizer, "eos_token", None)
+                    if eos_token is not None and token_text == eos_token:
+                        token_text = ""
 
-        yield "data: [DONE]\n\n"
+                chunk = format_chunk(request_id, model_name, token_text, event.finish_reason)
+                yield f"data: {json.dumps(chunk)}\n\n"
+
+                if event.finish_reason is not None:
+                    break
+
+            yield "data: [DONE]\n\n"
+        finally:
+            # Always cancel to clean up scheduler resources (stream queue, etc.)
+            # Safe to call even if request already finished — cancel is idempotent.
+            scheduler.cancel_request(inf_req.request_id)
 
     return StreamingResponse(
         event_generator(),

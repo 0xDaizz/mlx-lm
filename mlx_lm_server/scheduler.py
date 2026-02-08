@@ -613,7 +613,7 @@ class Scheduler:
             if seq is not None:
                 seq.is_finished = True
                 seq.finish_reason = "cancelled"
-            self._signal_finish(rid, finish_reason="cancelled")
+                self._signal_finish(rid, finish_reason="cancelled")
             with self._cancelled_lock:
                 self._cancelled.discard(rid)
 
@@ -682,6 +682,8 @@ class Scheduler:
                                 "Failed to reconstruct cache from blocks for %s: %s",
                                 req.request_id, e,
                             )
+                            self.kv_cache_manager.free_blocks(block_ids)
+                            seq.block_ids = []
                             cache = None
                             remaining_tokens = seq.token_ids
 
@@ -855,7 +857,12 @@ class Scheduler:
         if available > 0:
             new_requests = self.request_queue.pop_batch(available)
             for req in new_requests:
-                seq = self._init_sequence(req)
+                try:
+                    seq = self._init_sequence(req)
+                except Exception as e:
+                    logger.error("Failed to init sequence for %s: %s", req.request_id, e)
+                    self._signal_finish(req.request_id, finish_reason="error")
+                    continue
                 with self._active_lock:
                     self._active_sequences[req.request_id] = seq
                 if seq.num_computed_tokens < len(seq.token_ids):

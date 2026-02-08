@@ -201,6 +201,9 @@ class MockSchedulerForApp:
             "hit_rate": 0.0,
         }
 
+    def cancel_request(self, request_id: str) -> bool:
+        return request_id in {r.request_id for r in self.submitted}
+
     def shutdown(self) -> None:
         self.shutdown_called = True
 

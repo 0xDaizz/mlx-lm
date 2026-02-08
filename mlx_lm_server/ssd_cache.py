@@ -67,11 +67,23 @@ class SSDCache:
                     flat[f"layer_{i}_{key}"] = val
                 if num_tokens == 0 and "keys" in layer_dict:
                     num_tokens = layer_dict["keys"].shape[2]
-            mx.save_safetensors(str(filepath), flat)
         else:
             flat = kv_data
             num_tokens = kv_data["keys"].shape[2] if "keys" in kv_data else 0
-            mx.save_safetensors(str(filepath), flat)
+
+        # Atomic write: save to temp file, then rename
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
+        try:
+            os.close(tmp_fd)
+            os.unlink(tmp_path)  # mx.save_safetensors needs to create the file itself
+            mx.save_safetensors(tmp_path, flat)
+            os.replace(tmp_path, str(filepath))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
         self.index[block_hash] = SSDBlockMeta(
             block_hash=block_hash,
@@ -169,9 +181,12 @@ class SSDCache:
 
         for block_hash in to_prune:
             meta = self.index[block_hash]
-            if meta.filepath.exists():
-                meta.filepath.unlink()
-                logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
+            try:
+                if meta.filepath.exists():
+                    meta.filepath.unlink()
+                    logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
+            except OSError as e:
+                logger.warning("Failed to delete expired block file %s: %s", meta.filepath, e)
             del self.index[block_hash]
 
         if to_prune:

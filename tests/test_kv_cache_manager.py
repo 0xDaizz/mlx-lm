@@ -1093,7 +1093,7 @@ class TestCacheBlock:
         assert block_hash in mgr.hash_table
 
     def test_cache_block_duplicate_noop(self, tmp_path):
-        """cache_block() is a no-op for already-cached hashes."""
+        """cache_block() returns None for already-cached hashes (no-op)."""
         config = ServerConfig(block_size=4, num_blocks=8, ssd_cache_dir=tmp_path / "ssd")
         mgr = KVCacheManager(config)
 
@@ -1101,7 +1101,8 @@ class TestCacheBlock:
         bid1 = mgr.cache_block(block_hash, [1, 2, 3, 4], [{"keys": "k1"}])
         bid2 = mgr.cache_block(block_hash, [1, 2, 3, 4], [{"keys": "k2"}])
 
-        assert bid1 == bid2
+        assert bid1 is not None  # First call allocates
+        assert bid2 is None  # Duplicate returns None — caller should not free
         # Original data is preserved, not overwritten
         assert mgr.pool.blocks[bid1].kv_data == [{"keys": "k1"}]
 

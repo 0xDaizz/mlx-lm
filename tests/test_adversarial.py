@@ -909,6 +909,9 @@ class MockSchedulerForAdversarial:
     def get_cache_stats(self) -> dict[str, Any]:
         return {"total_blocks": 64, "used_blocks": 10, "free_blocks": 54}
 
+    def cancel_request(self, request_id: str) -> bool:
+        return request_id in {r.request_id for r in self.submitted}
+
     def shutdown(self) -> None:
         self.shutdown_called = True
 
