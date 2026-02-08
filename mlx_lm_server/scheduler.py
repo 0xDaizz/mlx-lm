@@ -497,6 +497,7 @@ class Scheduler:
                         prompt_cache, prompt_tokens,
                         self.kv_cache_manager.block_size,
                     )
+                    protected_ids: set[int] = set()
                     for bd in block_dicts:
                         bh = bd['block_hash']
                         with self.kv_cache_manager.lock:
@@ -505,9 +506,9 @@ class Scheduler:
                                     block = self.kv_cache_manager.pool.get_free_block()
                                 except Exception:
                                     if self._tiered_cache is not None:
-                                        self._tiered_cache.evict_to_ssd(num_blocks=1)
+                                        self._tiered_cache.evict_to_ssd(num_blocks=1, exclude_ids=protected_ids)
                                     else:
-                                        self.kv_cache_manager._evict_lru_locked(num_blocks=1)
+                                        self.kv_cache_manager._evict_lru_locked(num_blocks=1, exclude_ids=protected_ids)
                                     try:
                                         block = self.kv_cache_manager.pool.get_free_block()
                                     except Exception:
@@ -518,6 +519,7 @@ class Scheduler:
                                 block.last_accessed = time.time()
                                 block.kv_data = list(bd['kv_data_per_layer'])
                                 self.kv_cache_manager.hash_table[bh] = block.block_id
+                                protected_ids.add(block.block_id)
                 except Exception as e:
                     logger.debug("Failed to decompose cache to blocks: %s", e)
 
@@ -616,7 +618,7 @@ class Scheduler:
                                     block_data.append(block.kv_data)
                             if block_data:
                                 cache = reconstruct_cache_from_blocks(
-                                    [{'kv_data_per_layer': [d] if not isinstance(d, list) else d}
+                                    [{'kv_data_per_layer': d}
                                      for d in block_data],
                                     self.model,
                                 )
@@ -624,6 +626,7 @@ class Scheduler:
                                     "Block cache hit for %s: %d tokens cached",
                                     req.request_id, num_cached,
                                 )
+                                remaining_tokens = seq.token_ids[num_cached:]
                         except Exception as e:
                             logger.warning(
                                 "Failed to reconstruct cache from blocks for %s: %s",
@@ -655,10 +658,15 @@ class Scheduler:
                     self._signal_finish(req.request_id, finish_reason="length")
                     continue
 
+                # Handle edge case: full cache hit (remaining_tokens empty)
+                # Must pass at least the last token for logit generation
+                if not remaining_tokens:
+                    remaining_tokens = [seq.token_ids[-1]]
+
                 # Insert into BatchGenerator
                 try:
                     insert_kwargs = {
-                        "prompts": [seq.token_ids],
+                        "prompts": [remaining_tokens],
                         "max_tokens": [req.max_tokens],
                     }
                     if cache is not None:
@@ -815,8 +823,9 @@ class Scheduler:
         token_ids = list(request.prompt_tokens)
         num_cached = 0
 
-        # Check prefix cache if available
-        if self.kv_cache_manager is not None:
+        # Check prefix cache if available (mock path only — batch path
+        # does its own block-level lookup in _insert_new_requests_batch)
+        if self.kv_cache_manager is not None and self.model is None:
             num_cached = self.kv_cache_manager.find_cached_prefix(token_ids)
             logger.debug(
                 "Request %s: %d/%d tokens cached",

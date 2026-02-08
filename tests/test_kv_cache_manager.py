@@ -978,3 +978,78 @@ class TestTieredFullFlow:
 
         # 8. Verify blocks were returned to free pool
         assert mgr.num_free_blocks == 4
+
+
+# ---------------------------------------------------------------------------
+# Eviction Exclusion tests (exclude_ids parameter)
+# ---------------------------------------------------------------------------
+
+
+class TestEvictionExclusion:
+    """Tests for exclude_ids parameter in eviction."""
+
+    def test_eviction_excludes_protected(self):
+        """Blocks in exclude_ids survive eviction even with ref_count == 0."""
+        config = make_config(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+
+        # Allocate 3 blocks
+        tokens_a = [1, 2, 3, 4]
+        tokens_b = [5, 6, 7, 8]
+        tokens_c = [9, 10, 11, 12]
+
+        ids_a = mgr.allocate_blocks(tokens_a)
+        ids_b = mgr.allocate_blocks(tokens_b)
+        ids_c = mgr.allocate_blocks(tokens_c)
+
+        # Free all so they're evictable
+        mgr.free_blocks(ids_a)
+        mgr.free_blocks(ids_b)
+        mgr.free_blocks(ids_c)
+
+        # Make A oldest, B middle, C newest
+        mgr.pool.blocks[ids_a[0]].last_accessed = 100.0
+        mgr.pool.blocks[ids_b[0]].last_accessed = 200.0
+        mgr.pool.blocks[ids_c[0]].last_accessed = 300.0
+
+        # Protect block A from eviction
+        protected = {ids_a[0]}
+
+        # Evict 2 -- should skip A (protected), evict B and C instead
+        evicted = mgr.evict_lru(num_blocks=2, exclude_ids=protected)
+        assert len(evicted) == 2
+        assert ids_a[0] not in evicted
+        assert ids_b[0] in evicted
+        assert ids_c[0] in evicted
+
+        # Block A should still be in hash table
+        block_a = mgr.pool.blocks[ids_a[0]]
+        assert block_a.block_hash in mgr.hash_table
+
+    def test_eviction_excludes_with_tiered(self, tmp_path):
+        """TieredKVCache.evict_to_ssd respects exclude_ids."""
+        config = make_config(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens_a = [1, 2, 3, 4]
+        tokens_b = [5, 6, 7, 8]
+
+        ids_a = mgr.allocate_blocks(tokens_a)
+        ids_b = mgr.allocate_blocks(tokens_b)
+
+        mgr.free_blocks(ids_a)
+        mgr.free_blocks(ids_b)
+
+        mgr.pool.blocks[ids_a[0]].last_accessed = 100.0
+        mgr.pool.blocks[ids_b[0]].last_accessed = 200.0
+
+        # Protect block A
+        protected = {ids_a[0]}
+
+        # Evict 2 -- A is protected, only B should be evicted
+        evicted = tiered.evict_to_ssd(num_blocks=2, exclude_ids=protected)
+        assert len(evicted) == 1
+        assert ids_b[0] in evicted
+        assert ids_a[0] not in evicted

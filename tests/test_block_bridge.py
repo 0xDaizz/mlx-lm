@@ -246,3 +246,94 @@ class TestConcurrentDecomposeReconstruct:
             t.join(timeout=10)
 
         assert not errors
+
+
+# ---------------------------------------------------------------------------
+# QuantizedKVCache decompose/reconstruct tests
+# ---------------------------------------------------------------------------
+
+
+class TestQuantizedCacheSupport:
+    """Tests for QuantizedKVCache decompose/reconstruct."""
+
+    def test_quantized_decompose_roundtrip(self):
+        """QuantizedKVCache decompose -> reconstruct preserves data approximately."""
+        from mlx_lm.models.cache import QuantizedKVCache
+
+        block_size = 8
+        seq_len = 16
+        n_heads = 4
+        head_dim = 64  # Must be divisible by group_size (64)
+
+        # Create QuantizedKVCache layers and populate them
+        num_layers = 2
+        cache = []
+        for _ in range(num_layers):
+            qkv = QuantizedKVCache(group_size=64, bits=8)
+            # Feed data through update_and_fetch to populate
+            keys = mx.random.normal((1, n_heads, seq_len, head_dim))
+            values = mx.random.normal((1, n_heads, seq_len, head_dim))
+            qkv.update_and_fetch(keys, values)
+            cache.append(qkv)
+
+        token_ids = list(range(seq_len))
+        blocks = decompose_cache_to_blocks(cache, token_ids, block_size)
+
+        assert len(blocks) == 2
+        # Verify blocks contain dequantized (plain array) data, not tuples
+        for block in blocks:
+            for layer_data in block['kv_data_per_layer']:
+                assert isinstance(layer_data['keys'], mx.array)
+                assert isinstance(layer_data['values'], mx.array)
+                assert layer_data['keys'].shape == (1, n_heads, block_size, head_dim)
+
+    def test_quantized_decompose_creates_plain_kvcache(self):
+        """Reconstructed cache from quantized source is plain KVCache (has merge())."""
+        from mlx_lm.models.cache import QuantizedKVCache, KVCache as PlainKVCache
+
+        block_size = 8
+        seq_len = 16
+        n_heads = 4
+        head_dim = 64
+
+        num_layers = 2
+        cache = []
+        for _ in range(num_layers):
+            qkv = QuantizedKVCache(group_size=64, bits=8)
+            keys = mx.random.normal((1, n_heads, seq_len, head_dim))
+            values = mx.random.normal((1, n_heads, seq_len, head_dim))
+            qkv.update_and_fetch(keys, values)
+            cache.append(qkv)
+
+        token_ids = list(range(seq_len))
+        blocks = decompose_cache_to_blocks(cache, token_ids, block_size)
+
+        # Reconstruct -- should create plain KVCache, not QuantizedKVCache
+        reconstructed = reconstruct_cache_from_blocks(
+            [{'kv_data_per_layer': b['kv_data_per_layer']} for b in blocks],
+            model=None,
+        )
+
+        assert len(reconstructed) == num_layers
+        for layer in reconstructed:
+            assert isinstance(layer, PlainKVCache)
+            assert hasattr(layer, 'merge')  # KVCache has merge, QuantizedKVCache doesn't
+            assert not layer.empty()
+            assert layer.offset == seq_len
+
+    def test_plain_cache_reconstruct_no_model(self):
+        """reconstruct_cache_from_blocks works with model=None (plain KVCache)."""
+        block_size = 8
+        seq_len = 16
+        cache = _make_mock_cache(num_layers=2, seq_len=seq_len)
+        token_ids = list(range(seq_len))
+
+        blocks = decompose_cache_to_blocks(cache, token_ids, block_size)
+        reconstructed = reconstruct_cache_from_blocks(
+            [{'kv_data_per_layer': b['kv_data_per_layer']} for b in blocks],
+            model=None,
+        )
+
+        assert len(reconstructed) == 2
+        for layer in reconstructed:
+            assert layer.offset == seq_len

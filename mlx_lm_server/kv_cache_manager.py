@@ -324,7 +324,7 @@ class KVCacheManager:
                     "Freed block %d (ref_count now %d)", block_id, block.ref_count
                 )
 
-    def evict_lru(self, num_blocks: int = 1) -> list[int]:
+    def evict_lru(self, num_blocks: int = 1, exclude_ids: set[int] | None = None) -> list[int]:
         """Evict least-recently-used blocks with ref_count == 0.
 
         Finds blocks that are no longer referenced by any active sequence,
@@ -334,19 +334,21 @@ class KVCacheManager:
 
         Args:
             num_blocks: Maximum number of blocks to evict.
+            exclude_ids: Block IDs to exclude from eviction (e.g. freshly stored blocks).
 
         Returns:
             List of evicted block_ids. May be shorter than num_blocks if
             fewer eligible blocks exist.
         """
         with self.lock:
-            return self._evict_lru_locked(num_blocks)
+            return self._evict_lru_locked(num_blocks, exclude_ids=exclude_ids)
 
-    def _evict_lru_locked(self, num_blocks: int = 1) -> list[int]:
+    def _evict_lru_locked(self, num_blocks: int = 1, exclude_ids: set[int] | None = None) -> list[int]:
         """Internal eviction logic — caller must hold self.lock.
 
         Args:
             num_blocks: Maximum number of blocks to evict.
+            exclude_ids: Block IDs to exclude from eviction (e.g. freshly stored blocks).
 
         Returns:
             List of evicted block_ids.
@@ -355,7 +357,7 @@ class KVCacheManager:
         candidates: list[KVCacheBlock] = []
         for block_hash, block_id in self.hash_table.items():
             block = self.pool.blocks[block_id]
-            if block.ref_count == 0:
+            if block.ref_count == 0 and (exclude_ids is None or block.block_id not in exclude_ids):
                 candidates.append(block)
 
         # Sort by last_accessed ascending (oldest first = LRU)
@@ -396,6 +398,16 @@ class KVCacheManager:
 # ---------------------------------------------------------------------------
 # MLX KV Cache Adapter (P1.7 - P1.10)
 # ---------------------------------------------------------------------------
+
+
+def _is_quantized_kv(kv) -> bool:
+    """Check if KV data is in quantized tuple format (data, scales, biases)."""
+    return isinstance(kv, tuple) and len(kv) == 3
+
+
+def _dequantize_kv(kv_tuple, group_size: int, bits: int) -> mx.array:
+    """Dequantize a (data, scales, biases) tuple back to float array."""
+    return mx.dequantize(*kv_tuple, group_size=group_size, bits=bits)
 
 
 def extract_block(
@@ -495,7 +507,7 @@ class TieredKVCache:
 
         return None
 
-    def evict_to_ssd(self, num_blocks: int = 1) -> list[int]:
+    def evict_to_ssd(self, num_blocks: int = 1, exclude_ids: set[int] | None = None) -> list[int]:
         """Evict LRU blocks from RAM, saving them to SSD first.
 
         For each block being evicted that has kv_data, the data is
@@ -503,6 +515,7 @@ class TieredKVCache:
 
         Args:
             num_blocks: Number of blocks to evict.
+            exclude_ids: Block IDs to exclude from eviction (e.g. freshly stored blocks).
 
         Returns:
             List of evicted block_ids.
@@ -512,7 +525,7 @@ class TieredKVCache:
             candidates: list[KVCacheBlock] = []
             for block_hash, block_id in self.ram.hash_table.items():
                 block = self.ram.pool.blocks[block_id]
-                if block.ref_count == 0:
+                if block.ref_count == 0 and (exclude_ids is None or block.block_id not in exclude_ids):
                     candidates.append(block)
 
             candidates.sort(key=lambda b: b.last_accessed)
@@ -592,6 +605,12 @@ def decompose_cache_to_blocks(
             if state is None or len(state) < 2:
                 continue
             keys, values = state[0], state[1]
+            # Handle QuantizedKVCache: state returns tuple-of-tuples
+            if _is_quantized_kv(keys):
+                group_size = getattr(cache_layer, 'group_size', 64)
+                bits = getattr(cache_layer, 'bits', 8)
+                keys = _dequantize_kv(keys, group_size, bits)
+                values = _dequantize_kv(values, group_size, bits)
             block_data = extract_block(keys, values, start, block_size)
             kv_data_per_layer.append(block_data)
 
@@ -606,18 +625,21 @@ def decompose_cache_to_blocks(
 
 def reconstruct_cache_from_blocks(
     blocks: list[dict],
-    model,
+    model=None,
 ) -> list:
     """Reconstruct a List[KVCache] from block-level data.
 
-    Creates fresh KVCache objects per layer, injects the block data
-    by concatenating K/V tensors from all blocks for each layer.
+    Creates plain KVCache objects per layer (not QuantizedKVCache), injects
+    the block data by concatenating K/V tensors from all blocks for each layer.
+
+    Plain KVCache is required because QuantizedKVCache lacks merge() which
+    is needed by BatchGenerator's _merge_caches().
 
     Args:
         blocks: List of dicts from decompose_cache_to_blocks().
             Each dict has 'kv_data_per_layer' (list of per-layer K/V dicts).
-        model: The model, used to create fresh KVCache objects via
-            make_prompt_cache().
+        model: Unused (kept for backwards compatibility). Plain KVCache objects
+            are created directly without needing the model.
 
     Returns:
         List of KVCache objects ready for BatchGenerator.insert(caches=...).
@@ -625,14 +647,13 @@ def reconstruct_cache_from_blocks(
     if not blocks:
         return []
 
-    try:
-        from mlx_lm.models.cache import make_prompt_cache
-    except ImportError:
-        raise ImportError("mlx_lm.models.cache.make_prompt_cache is required")
+    from mlx_lm.models.cache import KVCache as PlainKVCache
 
-    # Create fresh caches
-    cache = make_prompt_cache(model)
-    num_layers = len(cache)
+    # Determine number of layers from first block
+    num_layers = len(blocks[0]['kv_data_per_layer']) if blocks else 0
+
+    # Create plain KVCache objects (not QuantizedKVCache)
+    cache = [PlainKVCache() for _ in range(num_layers)]
 
     # For each layer, collect K/V blocks and concatenate
     for layer_idx in range(num_layers):
@@ -647,14 +668,7 @@ def reconstruct_cache_from_blocks(
         # Concatenate all blocks for this layer
         reconstructed = inject_blocks(layer_blocks)
 
-        # Update the cache layer with reconstructed data
-        total_seq_len = reconstructed['keys'].shape[2]
-        cache_layer = cache[layer_idx]
-
-        # Set the cache state - KVCache.update() expects keys and values
-        # We directly update the internal state
-        cache_layer.keys = reconstructed['keys']
-        cache_layer.values = reconstructed['values']
-        cache_layer.offset = total_seq_len
+        # Use .state setter which sets keys, values, AND offset automatically
+        cache[layer_idx].state = (reconstructed['keys'], reconstructed['values'])
 
     return cache

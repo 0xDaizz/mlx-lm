@@ -594,3 +594,56 @@ class TestContinuousBatching:
             assert t1[-1].finish_reason == "stop"
         finally:
             s.stop()
+
+
+# ---------------------------------------------------------------------------
+# Remaining tokens fix tests
+# ---------------------------------------------------------------------------
+
+
+class TestRemainingTokens:
+    """Tests for remaining_tokens fix in batch path."""
+
+    def test_init_sequence_no_prefix_check_batch(self):
+        """find_cached_prefix is NOT called in _init_sequence when model is set."""
+        from unittest.mock import MagicMock
+
+        config = _make_config()
+        mock_cache_mgr = MagicMock()
+        mock_cache_mgr.find_cached_prefix = MagicMock(return_value=4)
+
+        s = Scheduler(
+            config=config,
+            model="fake_model",  # Non-None triggers batch path
+            tokenizer=None,
+            kv_cache_manager=mock_cache_mgr,
+        )
+
+        req = _make_request("r1", prompt_tokens=list(range(16)))
+        seq = s._init_sequence(req)
+
+        # With model set, _init_sequence should NOT call find_cached_prefix
+        mock_cache_mgr.find_cached_prefix.assert_not_called()
+        # num_computed_tokens should be 0 (no prefix check in batch path)
+        assert seq.num_computed_tokens == 0
+
+    def test_init_sequence_prefix_check_mock_path(self):
+        """find_cached_prefix IS called in _init_sequence when model is None."""
+        from unittest.mock import MagicMock
+
+        config = _make_config()
+        mock_cache_mgr = MagicMock()
+        mock_cache_mgr.find_cached_prefix = MagicMock(return_value=4)
+
+        s = Scheduler(
+            config=config,
+            model=None,
+            tokenizer=None,
+            kv_cache_manager=mock_cache_mgr,
+        )
+
+        req = _make_request("r1", prompt_tokens=list(range(16)))
+        seq = s._init_sequence(req)
+
+        mock_cache_mgr.find_cached_prefix.assert_called_once()
+        assert seq.num_computed_tokens == 4

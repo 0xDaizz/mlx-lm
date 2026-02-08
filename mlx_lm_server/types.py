@@ -40,7 +40,7 @@ class KVCacheBlock:
     token_ids: list[int] = field(default_factory=list)
     ref_count: int = 0
     last_accessed: float = field(default_factory=time.time)
-    kv_data: dict | None = None  # Per-layer K/V tensors
+    kv_data: list[dict] | None = None  # Per-layer K/V data: list of {'keys': mx.array, 'values': mx.array}
 
 
 @dataclass
