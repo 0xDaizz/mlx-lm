@@ -460,3 +460,122 @@ class TestSSDWriterThread:
         finally:
             ssd.save_block = original_save
             writer.stop()
+
+    def test_persistent_retry_in_sync_fallback(self, tmp_path):
+        """Persistent retry should apply in queue-full sync fallback path."""
+        from mlx_lm_server.ssd_writer import SSDWriterThread
+        ssd = self._make_cache(tmp_path)
+        writer = SSDWriterThread(ssd, queue_size=1, durability="persistent", max_retries=3)
+
+        fail_count = [0]
+        original_save = ssd.save_block
+        def failing_save(*args, **kwargs):
+            fail_count[0] += 1
+            if fail_count[0] <= 2:
+                return "error"
+            return original_save(*args, **kwargs)
+
+        # Block the worker so queue fills up
+        blocker = threading.Event()
+        def blocked_save(*args, **kwargs):
+            blocker.wait(timeout=5)
+            return original_save(*args, **kwargs)
+
+        ssd.save_block = blocked_save
+        try:
+            # Worker picks up fill_0 and blocks on blocker.wait() — queue is now empty
+            writer.enqueue("fill_0", self._make_block_data())
+            time.sleep(0.05)
+            # fill_1 sits in the queue (size=1) — queue is now full
+            writer.enqueue("fill_1", self._make_block_data())
+            time.sleep(0.05)
+            # Now queue is full. Next enqueue will exhaust Level 0 + Level 1, hit sync fallback
+            # Switch to failing save for the fallback
+            ssd.save_block = failing_save
+            writer.enqueue("fallback_retry", self._make_block_data())
+            time.sleep(0.3)
+            stats = writer.get_stats()
+            # Should have retried in fallback
+            assert stats["writer_retry_attempts"] >= 1
+            assert stats["writer_save_success"] >= 1
+            assert stats["writer_retry_final_fail"] == 0
+        finally:
+            blocker.set()
+            ssd.save_block = original_save
+            writer.stop()
+
+    def test_persistent_retry_exhaustion_in_fallback(self, tmp_path):
+        """When all retries fail in fallback, should count as final fail."""
+        from mlx_lm_server.ssd_writer import SSDWriterThread
+        ssd = self._make_cache(tmp_path)
+        writer = SSDWriterThread(ssd, queue_size=1, durability="persistent", max_retries=2)
+
+        original_save = ssd.save_block
+        def always_fail(*args, **kwargs):
+            return "error"
+
+        blocker = threading.Event()
+        def blocked_save(*args, **kwargs):
+            blocker.wait(timeout=5)
+            return original_save(*args, **kwargs)
+
+        ssd.save_block = blocked_save
+        try:
+            # Worker picks up fill_1 and blocks — queue empty
+            writer.enqueue("fill_1", self._make_block_data())
+            time.sleep(0.05)
+            # fill_2 sits in queue (size=1) — queue full
+            writer.enqueue("fill_2", self._make_block_data())
+            time.sleep(0.05)
+            # Next enqueue hits sync fallback
+            ssd.save_block = always_fail
+            writer.enqueue("exhaust_retry", self._make_block_data())
+            time.sleep(0.3)
+            stats = writer.get_stats()
+            assert stats["writer_retry_attempts"] == 2  # max_retries
+            assert stats["writer_retry_final_fail"] >= 1
+            assert stats["writer_save_fail"] >= 1
+        finally:
+            blocker.set()
+            ssd.save_block = original_save
+            writer.stop()
+
+
+class TestSchedulerWriterInjection:
+    """C: Verify ssd_writer is injected via constructor."""
+
+    def test_scheduler_accepts_ssd_writer_param(self):
+        """Scheduler should accept ssd_writer as constructor arg."""
+        from mlx_lm_server.scheduler import Scheduler
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import MagicMock
+
+        mock_writer = MagicMock()
+        scheduler = Scheduler(
+            config=ServerConfig(),
+            ssd_writer=mock_writer,
+        )
+        assert scheduler._ssd_writer is mock_writer
+
+    def test_scheduler_stop_calls_writer_stop(self):
+        """Scheduler.stop() should call writer.stop() when injected."""
+        from mlx_lm_server.scheduler import Scheduler
+        from mlx_lm_server.config import ServerConfig
+        from unittest.mock import MagicMock
+
+        mock_writer = MagicMock()
+        mock_writer.stop.return_value = True
+        scheduler = Scheduler(
+            config=ServerConfig(),
+            ssd_writer=mock_writer,
+        )
+        scheduler.stop()
+        mock_writer.stop.assert_called_once_with(drain_timeout=5.0)
+
+    def test_scheduler_none_writer_default(self):
+        """Scheduler with no ssd_writer should have None."""
+        from mlx_lm_server.scheduler import Scheduler
+        from mlx_lm_server.config import ServerConfig
+
+        scheduler = Scheduler(config=ServerConfig())
+        assert scheduler._ssd_writer is None

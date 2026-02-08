@@ -718,6 +718,18 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--ssd-cache-dir", type=str, default=None)
     parser.add_argument("--ssd-ttl-days", type=int, default=7)
     parser.add_argument("--no-ssd", action="store_true", default=False)
+    parser.add_argument("--ssd-policy", type=str,
+                        choices=["evict_only", "write_through"],
+                        default="evict_only")
+    parser.add_argument("--ssd-durability", type=str,
+                        choices=["best_effort", "persistent"],
+                        default="best_effort")
+    parser.add_argument("--ssd-async-writes",
+                        action=argparse.BooleanOptionalAction,
+                        default=True)
+    parser.add_argument("--ssd-writer-queue-size", type=int, default=512)
+    parser.add_argument("--ssd-persistent-max-retries", type=int, default=3)
+    parser.add_argument("--ssd-flush-interval-s", type=float, default=1.0)
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--prefill-batch-size", type=int, default=4)
     parser.add_argument("--max-queue-size", type=int, default=128)
@@ -731,6 +743,13 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
 
     parsed = parser.parse_args(args)
 
+    if parsed.ssd_writer_queue_size < 1:
+        parser.error("--ssd-writer-queue-size must be >= 1")
+    if parsed.ssd_persistent_max_retries < 0:
+        parser.error("--ssd-persistent-max-retries must be >= 0")
+    if parsed.ssd_flush_interval_s <= 0:
+        parser.error("--ssd-flush-interval-s must be > 0")
+
     kwargs: dict[str, Any] = {
         "model": parsed.model,
         "host": parsed.host,
@@ -741,6 +760,12 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "kv_group_size": parsed.kv_group_size,
         "ssd_ttl_days": parsed.ssd_ttl_days,
         "ssd_enabled": not parsed.no_ssd,
+        "ssd_policy": parsed.ssd_policy,
+        "ssd_durability": parsed.ssd_durability,
+        "ssd_async_writes": parsed.ssd_async_writes,
+        "ssd_writer_queue_size": parsed.ssd_writer_queue_size,
+        "ssd_persistent_max_retries": parsed.ssd_persistent_max_retries,
+        "ssd_flush_interval_s": parsed.ssd_flush_interval_s,
         "max_batch_size": parsed.max_batch_size,
         "prefill_batch_size": parsed.prefill_batch_size,
         "max_queue_size": parsed.max_queue_size,

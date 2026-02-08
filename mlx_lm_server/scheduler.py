@@ -126,6 +126,7 @@ class Scheduler:
         model: The mlx-lm model (or None for testing).
         tokenizer: The tokenizer (or None for testing).
         kv_cache_manager: Optional KVCacheManager for prefix caching.
+        ssd_writer: Optional SSDWriterThread for async write-through.
     """
 
     def __init__(
@@ -135,6 +136,7 @@ class Scheduler:
         tokenizer=None,
         kv_cache_manager=None,
         tiered_cache=None,
+        ssd_writer=None,
     ) -> None:
         self.config = config
         self.model = model
@@ -180,7 +182,7 @@ class Scheduler:
 
         # Tiered cache (RAM + SSD) — injected via constructor or tests
         self._tiered_cache: Any = tiered_cache
-        self._ssd_writer = None  # Set externally when write-through is enabled
+        self._ssd_writer = ssd_writer
 
         # SSD pruning counter (prune every N inference steps)
         self._ssd_prune_interval: int = 1000

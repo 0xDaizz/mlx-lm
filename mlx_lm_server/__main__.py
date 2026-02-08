@@ -60,9 +60,8 @@ def main() -> None:
         tokenizer=tokenizer,
         kv_cache_manager=kv_cache_manager,
         tiered_cache=tiered_cache,
+        ssd_writer=ssd_writer,
     )
-    if ssd_writer is not None:
-        scheduler._ssd_writer = ssd_writer
     scheduler.run_inference_loop()
 
     # --- Build and run ---
