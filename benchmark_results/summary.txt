@@ -4,3 +4,16 @@ Part:  all
 Date:  2026-02-08 14:17:34
 ============================================================
 
+Part 1 (Variation): 34/36 combinations succeeded
+Part 2 (Comparison): completed
+  cache_on_vs_off: OK
+  trie_scaling: OK
+  heap_eviction: OK
+  prefill_skip: OK
+Part 3 (Correctness): ALL PASSED
+  token_completeness: PASS
+  stream_vs_nonstream: PASS
+  cache_consistency: PASS
+  concurrent_isolation: PASS
+
+Total time: 120.2s

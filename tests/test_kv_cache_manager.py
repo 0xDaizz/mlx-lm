@@ -1088,7 +1088,7 @@ class TestCacheBlock:
         block = mgr.pool.blocks[block_id]
         assert block.block_hash == block_hash
         assert block.token_ids == [1, 2, 3, 4]
-        assert block.ref_count == 0
+        assert block.ref_count == 1
         assert block.kv_data == [{"keys": "k", "values": "v"}]
         assert block_hash in mgr.hash_table
 
@@ -1113,8 +1113,12 @@ class TestCacheBlock:
         # Fill all blocks
         h1 = mgr.compute_block_hash([], [1, 2, 3, 4])
         h2 = mgr.compute_block_hash([1, 2, 3, 4], [5, 6, 7, 8])
-        mgr.cache_block(h1, [1, 2, 3, 4], [{"keys": "k1"}])
-        mgr.cache_block(h2, [5, 6, 7, 8], [{"keys": "k2"}])
+        bid1 = mgr.cache_block(h1, [1, 2, 3, 4], [{"keys": "k1"}])
+        bid2 = mgr.cache_block(h2, [5, 6, 7, 8], [{"keys": "k2"}])
+
+        # Release protection refs so blocks become evictable
+        mgr.free_blocks([bid1])
+        mgr.free_blocks([bid2])
 
         assert mgr.pool.num_free == 0
 
@@ -1139,3 +1143,185 @@ class TestCacheBlock:
         bid = mgr.cache_block(h2, [5, 6, 7, 8], [{"keys": "k2"}])
 
         assert bid is None
+
+
+# ---------------------------------------------------------------------------
+# H2 fix — cache_block ref_count protection
+# ---------------------------------------------------------------------------
+
+
+class TestCacheBlockRefCount:
+    """Tests for cache_block() ref_count=1 protection against immediate eviction."""
+
+    def test_cache_block_sets_ref_count_one(self):
+        """Freshly cached blocks should have ref_count=1 to prevent immediate eviction."""
+        config = make_config(num_blocks=8, block_size=4)
+        mgr = KVCacheManager(config)
+        block_id = mgr.cache_block(
+            block_hash="test_hash",
+            token_ids=[1, 2, 3, 4],
+            kv_data=[{"keys": [1.0], "values": [2.0]}],
+        )
+        assert block_id is not None
+        block = mgr.pool.blocks[block_id]
+        assert block.ref_count == 1, "Freshly cached block should have ref_count=1"
+
+    def test_cache_block_not_immediately_evictable(self):
+        """Freshly cached blocks should NOT be evictable."""
+        config = make_config(num_blocks=4, block_size=4)
+        mgr = KVCacheManager(config)
+        # Fill all blocks with cached data
+        for i in range(4):
+            bid = mgr.cache_block(
+                block_hash=f"hash_{i}",
+                token_ids=[i * 4 + j for j in range(4)],
+                kv_data=[{"keys": [float(i)], "values": [float(i)]}],
+            )
+            assert bid is not None
+        # All blocks have ref_count=1, so eviction should fail (no evictable blocks)
+        evicted = mgr.evict_lru(1)
+        assert len(evicted) == 0, "Should not evict blocks with ref_count=1"
+
+    def test_cache_block_evictable_after_free(self):
+        """After free_blocks(), cached block should become evictable."""
+        config = make_config(num_blocks=4, block_size=4)
+        mgr = KVCacheManager(config)
+        block_id = mgr.cache_block(
+            block_hash="test_hash",
+            token_ids=[1, 2, 3, 4],
+            kv_data=[{"keys": [1.0], "values": [2.0]}],
+        )
+        assert block_id is not None
+        # Free the block — ref_count drops to 0, pushed to eviction heap
+        mgr.free_blocks([block_id])
+        block = mgr.pool.blocks[block_id]
+        assert block.ref_count == 0
+        # Now it should be evictable
+        evicted = mgr.evict_lru(1)
+        assert len(evicted) == 1
+        assert evicted[0] == block_id
+
+
+# ---------------------------------------------------------------------------
+# H3 fix — Eviction Heap Rebuild (stale heap entry accumulation)
+# ---------------------------------------------------------------------------
+
+
+class TestEvictionHeapRebuild:
+    """Tests for the heap rebuild mechanism that prevents stale entry accumulation."""
+
+    def test_heap_rebuild_removes_stale_entries(self):
+        """Heap rebuild should remove stale entries and keep valid ones."""
+        config = make_config(num_blocks=8, block_size=4)
+        mgr = KVCacheManager(config)
+
+        # Allocate and free blocks to create heap entries
+        tokens_a = [1, 2, 3, 4]
+        tokens_b = [5, 6, 7, 8]
+        tokens_c = [9, 10, 11, 12]
+        tokens_d = [13, 14, 15, 16]
+
+        ids_a = mgr.allocate_blocks(tokens_a)
+        ids_b = mgr.allocate_blocks(tokens_b)
+        ids_c = mgr.allocate_blocks(tokens_c)
+        ids_d = mgr.allocate_blocks(tokens_d)
+
+        block_ids = ids_a + ids_b + ids_c + ids_d
+        mgr.free_blocks(block_ids)  # All ref_count=0, pushed to heap
+
+        # Update last_accessed on some blocks to create stale entries
+        import heapq
+
+        for bid in block_ids[:2]:
+            mgr.pool.blocks[bid].last_accessed = time.time() + 100
+            # Push new entry — old one becomes stale
+            heapq.heappush(mgr._eviction_heap, (mgr.pool.blocks[bid].last_accessed, bid))
+
+        old_heap_size = len(mgr._eviction_heap)
+        assert old_heap_size >= 6  # 4 original + 2 updated
+
+        # Force rebuild
+        mgr._rebuild_eviction_heap()
+
+        # After rebuild, only 4 entries (one per block with ref_count=0)
+        assert len(mgr._eviction_heap) == 4
+
+    def test_heap_auto_rebuild_on_threshold(self):
+        """Heap should auto-rebuild when stale ratio exceeds threshold."""
+        config = make_config(num_blocks=16, block_size=4)
+        mgr = KVCacheManager(config)
+
+        # Allocate and free 4 blocks
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+        block_ids = mgr.allocate_blocks(tokens)
+        mgr.free_blocks(block_ids)
+
+        # Artificially inflate _heap_pushes to trigger rebuild
+        mgr._heap_pushes = 1000  # Way above threshold
+
+        # Eviction should trigger rebuild and still work correctly
+        evicted = mgr.evict_lru(1)
+        assert len(evicted) == 1
+        # After rebuild, _heap_pushes should have been reset (then incremented
+        # only by the re-push of excluded blocks, if any)
+        assert mgr._heap_pushes <= len(mgr._eviction_heap)
+
+    def test_heap_pushes_incremented_on_free(self):
+        """_heap_pushes counter increments when blocks are freed."""
+        config = make_config(num_blocks=8, block_size=4)
+        mgr = KVCacheManager(config)
+
+        assert mgr._heap_pushes == 0
+
+        ids = mgr.allocate_blocks([1, 2, 3, 4])
+        assert mgr._heap_pushes == 0  # No pushes yet (allocation doesn't push)
+
+        mgr.free_blocks(ids)
+        assert mgr._heap_pushes == 1  # One block freed -> one push
+
+        # Allocate and free more
+        ids2 = mgr.allocate_blocks([5, 6, 7, 8, 9, 10, 11, 12])
+        mgr.free_blocks(ids2)
+        assert mgr._heap_pushes == 3  # 1 + 2 more blocks freed
+
+    def test_rebuild_resets_pushes_counter(self):
+        """_rebuild_eviction_heap resets _heap_pushes to 0."""
+        config = make_config(num_blocks=8, block_size=4)
+        mgr = KVCacheManager(config)
+
+        ids = mgr.allocate_blocks([1, 2, 3, 4])
+        mgr.free_blocks(ids)
+        assert mgr._heap_pushes == 1
+
+        mgr._rebuild_eviction_heap()
+        assert mgr._heap_pushes == 0
+
+    def test_rebuild_preserves_eviction_correctness(self):
+        """After rebuild, eviction still picks the oldest block."""
+        config = make_config(num_blocks=8, block_size=4)
+        mgr = KVCacheManager(config)
+
+        tokens_a = [1, 2, 3, 4]
+        tokens_b = [5, 6, 7, 8]
+        tokens_c = [9, 10, 11, 12]
+
+        ids_a = mgr.allocate_blocks(tokens_a)
+        ids_b = mgr.allocate_blocks(tokens_b)
+        ids_c = mgr.allocate_blocks(tokens_c)
+
+        mgr.free_blocks(ids_a)
+        mgr.free_blocks(ids_b)
+        mgr.free_blocks(ids_c)
+
+        # Set explicit timestamps
+        mgr.pool.blocks[ids_a[0]].last_accessed = 100.0
+        mgr.pool.blocks[ids_b[0]].last_accessed = 200.0
+        mgr.pool.blocks[ids_c[0]].last_accessed = 300.0
+
+        # Force rebuild to clean up timestamps in heap
+        mgr._rebuild_eviction_heap()
+
+        # Evict 1 — should still pick the oldest (A at 100.0)
+        evicted = mgr.evict_lru(1)
+        assert len(evicted) == 1
+        assert evicted[0] == ids_a[0]

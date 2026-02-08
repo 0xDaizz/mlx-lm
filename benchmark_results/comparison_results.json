@@ -1,8 +1,8 @@
 {
   "cache_on_vs_off": {
     "prompt_tokens": 200,
-    "cache_on_cold_ttft_ms": 418.7634580011945,
-    "cache_on_warm_ttft_ms": 157.0978339877911,
+    "cache_on_cold_ttft_ms": 402.9813329980243,
+    "cache_on_warm_ttft_ms": 139.2942920065252,
     "cache_on_stats": {
       "active_sequences": 0,
       "queued_requests": 0,
@@ -22,35 +22,35 @@
       "cache_hit_rate": 0.5,
       "cache_effectiveness": 0.48
     },
-    "cache_off_cold_ttft_ms": 422.1814590127906,
-    "cache_off_warm_ttft_ms": 90.88941701338626,
-    "warm_ttft_speedup": 0.5785529609558446
+    "cache_off_cold_ttft_ms": 408.692750002956,
+    "cache_off_warm_ttft_ms": 82.05795800313354,
+    "warm_ttft_speedup": 0.589097778674876
   },
   "trie_scaling": {
     "100": {
       "entries": 100,
       "lookups": 1000,
-      "total_time_s": 0.00386550000985153,
-      "avg_lookup_us": 3.8655000098515298,
+      "total_time_s": 0.0039434999926015735,
+      "avg_lookup_us": 3.9434999926015735,
       "query_length": 100
     },
     "500": {
       "entries": 500,
       "lookups": 1000,
-      "total_time_s": 0.0026525830035097897,
-      "avg_lookup_us": 2.6525830035097897,
+      "total_time_s": 0.0026838329940801486,
+      "avg_lookup_us": 2.6838329940801486,
       "query_length": 100
     },
     "1000": {
       "entries": 1000,
       "lookups": 1000,
-      "total_time_s": 0.002573207995737903,
-      "avg_lookup_us": 2.573207995737903,
+      "total_time_s": 0.002590000003692694,
+      "avg_lookup_us": 2.590000003692694,
       "query_length": 100
     },
     "scaling_analysis": {
       "entry_ratio": 10.0,
-      "time_ratio": 0.6656856782252957,
+      "time_ratio": 0.6567769769371904,
       "is_sublinear": true,
       "note": "Entries grew 10x but time grew 0.7x. Confirms O(M) trie behavior."
     }
@@ -59,31 +59,31 @@
     "64": {
       "num_blocks": 64,
       "evictions": 64,
-      "total_time_s": 7.72500061430037e-05,
-      "avg_eviction_us": 1.2070313459844328
+      "total_time_s": 5.9707992477342486e-05,
+      "avg_eviction_us": 0.9329373824584763
     },
     "256": {
       "num_blocks": 256,
       "evictions": 100,
-      "total_time_s": 0.00010416700388304889,
-      "avg_eviction_us": 1.041670038830489
+      "total_time_s": 9.825000597629696e-05,
+      "avg_eviction_us": 0.9825000597629696
     },
     "1024": {
       "num_blocks": 1024,
       "evictions": 100,
-      "total_time_s": 0.00013104200479574502,
-      "avg_eviction_us": 1.3104200479574502
+      "total_time_s": 0.00011870800517499447,
+      "avg_eviction_us": 1.1870800517499447
     },
     "4096": {
       "num_blocks": 4096,
       "evictions": 100,
-      "total_time_s": 0.00015858399274293333,
-      "avg_eviction_us": 1.5858399274293333
+      "total_time_s": 0.00016170799790415913,
+      "avg_eviction_us": 1.6170799790415913
     },
     "scaling_analysis": {
       "size_ratio": 64.0,
-      "time_ratio": 1.313834916305302,
-      "note": "Pool grew 64x, eviction time grew 1.3x. O(log N) heap confirmed."
+      "time_ratio": 1.7333210239472476,
+      "note": "Pool grew 64x, eviction time grew 1.7x. O(log N) heap confirmed."
     }
   },
   "prefill_skip": {

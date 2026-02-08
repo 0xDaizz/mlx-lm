@@ -149,6 +149,18 @@ class KVCacheManager:
         self.hash_table: dict[str, int] = {}  # block_hash -> block_id
         self.lock = threading.Lock()
         self._eviction_heap: list[tuple[float, int]] = []  # (last_accessed, block_id)
+        self._heap_pushes: int = 0  # Total pushes since last rebuild
+
+    def _rebuild_eviction_heap(self) -> None:
+        """Rebuild eviction heap, removing stale entries. Must hold self.lock."""
+        new_heap = []
+        for block_hash, block_id in self.hash_table.items():
+            block = self.pool.blocks[block_id]
+            if block.ref_count == 0:
+                new_heap.append((block.last_accessed, block_id))
+        heapq.heapify(new_heap)
+        self._eviction_heap = new_heap
+        self._heap_pushes = 0
 
     def compute_block_hash(
         self, prefix_tokens: list[int], block_tokens: list[int]
@@ -246,6 +258,7 @@ class KVCacheManager:
                 block_tokens = token_ids[start:end]
 
                 block_hash = compute_block_hash(prefix, block_tokens)
+                is_collision = False
 
                 # Check if this block is already cached
                 if block_hash in self.hash_table:
@@ -266,10 +279,13 @@ class KVCacheManager:
                         continue
                     else:
                         # Hash collision with different tokens — treat as miss
+                        # but do NOT overwrite hash_table (would evict the
+                        # existing block's entry, corrupting the cache)
                         logger.warning(
                             "Hash collision during allocation for hash %s",
                             block_hash,
                         )
+                        is_collision = True
 
                 # Cache miss — allocate a new block
                 try:
@@ -299,18 +315,29 @@ class KVCacheManager:
                         )
                     block = self.pool.get_free_block()
 
-                block.block_hash = block_hash
                 block.token_ids = list(block_tokens)  # Store a copy
                 block.ref_count = 1
                 block.last_accessed = time.time()
-                self.hash_table[block_hash] = block.block_id
                 allocated_block_ids.append(block.block_id)
-                freshly_allocated.append(block.block_id)
-                logger.debug(
-                    "Allocated new block %d (hash=%s)",
-                    block.block_id,
-                    block_hash,
-                )
+
+                if is_collision:
+                    # Don't register in hash_table — would overwrite the
+                    # existing entry for a different token sequence.
+                    # Block is usable for this request but not cacheable.
+                    block.block_hash = None
+                    logger.debug(
+                        "Allocated collision block %d (hash not registered)",
+                        block.block_id,
+                    )
+                else:
+                    block.block_hash = block_hash
+                    self.hash_table[block_hash] = block.block_id
+                    freshly_allocated.append(block.block_id)
+                    logger.debug(
+                        "Allocated new block %d (hash=%s)",
+                        block.block_id,
+                        block_hash,
+                    )
 
         return allocated_block_ids
 
@@ -337,6 +364,7 @@ class KVCacheManager:
                 block.ref_count -= 1
                 if block.ref_count == 0:
                     heapq.heappush(self._eviction_heap, (block.last_accessed, block_id))
+                    self._heap_pushes += 1
                 logger.debug(
                     "Freed block %d (ref_count now %d)", block_id, block.ref_count
                 )
@@ -375,6 +403,10 @@ class KVCacheManager:
         """
         evicted_ids: list[int] = []
 
+        # Rebuild heap if stale entries likely dominate
+        if self._heap_pushes > max(len(self.hash_table) * 2, 100):
+            self._rebuild_eviction_heap()
+
         while len(evicted_ids) < num_blocks and self._eviction_heap:
             ts, block_id = heapq.heappop(self._eviction_heap)
             block = self.pool.blocks[block_id]
@@ -389,6 +421,7 @@ class KVCacheManager:
             if exclude_ids is not None and block_id in exclude_ids:
                 # Re-push excluded blocks so they can be evicted later
                 heapq.heappush(self._eviction_heap, (ts, block_id))
+                self._heap_pushes += 1
                 continue
 
             # Evict this block
@@ -465,11 +498,10 @@ class KVCacheManager:
 
             block.block_hash = block_hash
             block.token_ids = list(token_ids)
-            block.ref_count = 0
+            block.ref_count = 1
             block.last_accessed = time.time()
             block.kv_data = list(kv_data)
             self.hash_table[block_hash] = block.block_id
-            heapq.heappush(self._eviction_heap, (block.last_accessed, block.block_id))
             return block.block_id
 
     # --- Convenience / introspection methods ---

@@ -196,6 +196,7 @@ class Scheduler:
             "total_cached_tokens": 0,
             "total_requests": 0,
         }
+        self._stats_lock = threading.Lock()
 
         # Initialize BatchGenerator if model is available
         if self.model is not None and BatchGenerator is not None:
@@ -203,6 +204,11 @@ class Scheduler:
             self._sequence_cache = SequenceCacheStore(
                 max_entries=config.sequence_cache_size
             )
+
+    def _inc_stat(self, key: str, value: int = 1) -> None:
+        """Thread-safe increment of a stats counter."""
+        with self._stats_lock:
+            self._stats[key] += value
 
     def _create_batch_generator(self) -> None:
         """Create or recreate the BatchGenerator instance."""
@@ -234,15 +240,28 @@ class Scheduler:
         The request is added to the queue and the inference loop is notified.
         Only creates _results/_results_ready entries for non-streaming requests
         to prevent resource leaks (streaming requests use register_stream instead).
-        """
-        self.request_queue.add(request)
-        self._stats["total_requests"] += 1
 
-        # Set up result storage only for non-streaming requests
-        if not getattr(request, "stream", False):
+        If request_queue.add() fails, any result buffers are cleaned up to
+        prevent memory leaks.
+        """
+        # Set up result storage BEFORE adding to queue (so cleanup paths can find it)
+        is_streaming = getattr(request, "stream", False)
+        if not is_streaming:
             with self._results_lock:
                 self._results[request.request_id] = []
                 self._results_ready[request.request_id] = threading.Event()
+
+        try:
+            self.request_queue.add(request)
+        except Exception:
+            # Clean up result buffers on queue failure
+            if not is_streaming:
+                with self._results_lock:
+                    self._results.pop(request.request_id, None)
+                    self._results_ready.pop(request.request_id, None)
+            raise
+
+        self._inc_stat("total_requests")
 
         self._new_request_event.set()
         logger.debug("Submitted request %s", request.request_id)
@@ -284,20 +303,25 @@ class Scheduler:
         be cleaned up at the next schedule step.
 
         Returns True if the request was found.
+
+        Lock ordering: _active_lock FIRST, then _cancelled_lock — matches
+        schedule_step() to prevent circular-wait deadlock.
         """
-        # Try removing from queue first
+        # Try removing from queue first (no lock needed for this)
         if self.request_queue.cancel(request_id):
             self._signal_finish(request_id, finish_reason="cancelled")
+            self._cleanup_result_buffers(request_id)
             return True
 
-        # Mark as cancelled if active
-        with self._cancelled_lock:
-            self._cancelled.add(request_id)
-
+        # Use consistent lock ordering: _active_lock FIRST, then _cancelled_lock
         with self._active_lock:
+            with self._cancelled_lock:
+                self._cancelled.add(request_id)
             if request_id in self._active_sequences:
                 return True
 
+        # Request not found in queue or active — clean up any stale buffers
+        self._cleanup_result_buffers(request_id)
         return False
 
     # --- Inference Loop ---
@@ -486,7 +510,7 @@ class Scheduler:
             if finish_reason is not None:
                 seq.is_finished = True
                 seq.finish_reason = finish_reason
-                self._stats["requests_completed"] += 1
+                self._inc_stat("requests_completed")
                 # Save prompt cache for sequence cache store and block decomposition
                 if r.prompt_cache is not None:
                     try:
@@ -543,6 +567,9 @@ class Scheduler:
                         )
                         if block_id is not None:
                             protected_ids.add(block_id)
+                            # Release the protection ref — block is now in hash_table
+                            # and will be pushed to eviction heap by free_blocks()
+                            self.kv_cache_manager.free_blocks([block_id])
                 except Exception as e:
                     logger.debug("Failed to decompose cache to blocks: %s", e)
 
@@ -647,8 +674,8 @@ class Scheduler:
                                     "Block cache hit for %s: %d tokens cached",
                                     req.request_id, num_cached,
                                 )
-                                self._stats["cache_hits_block"] += 1
-                                self._stats["total_cached_tokens"] += num_cached
+                                self._inc_stat("cache_hits_block")
+                                self._inc_stat("total_cached_tokens", num_cached)
                                 remaining_tokens = seq.token_ids[num_cached:]
                         except Exception as e:
                             logger.warning(
@@ -665,8 +692,8 @@ class Scheduler:
                         cache = cached
                         remaining_tokens = remaining
                         num_seq_cached = len(seq.token_ids) - len(remaining)
-                        self._stats["cache_hits_sequence"] += 1
-                        self._stats["total_cached_tokens"] += num_seq_cached
+                        self._inc_stat("cache_hits_sequence")
+                        self._inc_stat("total_cached_tokens", num_seq_cached)
                         logger.debug(
                             "Sequence cache hit for %s: %d tokens cached",
                             req.request_id,
@@ -675,7 +702,7 @@ class Scheduler:
 
                 # Track cache miss (neither block nor sequence cache hit)
                 if cache is None:
-                    self._stats["cache_misses"] += 1
+                    self._inc_stat("cache_misses")
 
                 # Create sampler
                 sampler = None
@@ -690,7 +717,7 @@ class Scheduler:
                     continue
 
                 # Track prefill tokens (tokens that need actual computation)
-                self._stats["total_prefill_tokens"] += len(remaining_tokens)
+                self._inc_stat("total_prefill_tokens", len(remaining_tokens))
 
                 # Handle edge case: full cache hit (remaining_tokens empty)
                 # Must pass at least the last token for logit generation
@@ -760,7 +787,7 @@ class Scheduler:
                 if not seq.is_finished:
                     seq.is_finished = True
                     seq.finish_reason = "error"
-                    self._stats["requests_errored"] += 1
+                    self._inc_stat("requests_errored")
                     self._signal_finish(seq.request_id, finish_reason="error")
         self._cleanup_finished_batch()
 
@@ -784,7 +811,7 @@ class Scheduler:
                 if not seq.is_finished:
                     seq.is_finished = True
                     seq.finish_reason = "error"
-                    self._stats["requests_errored"] += 1
+                    self._inc_stat("requests_errored")
                     self._signal_finish(seq.request_id, finish_reason="error")
         self._cleanup_finished()
 
@@ -889,8 +916,8 @@ class Scheduler:
             # Track prefill vs cached tokens (mock path)
             num_cached = seq.num_computed_tokens
             num_prefill = len(seq.token_ids) - num_cached
-            self._stats["total_prefill_tokens"] += num_prefill
-            self._stats["total_cached_tokens"] += num_cached
+            self._inc_stat("total_prefill_tokens", num_prefill)
+            self._inc_stat("total_cached_tokens", num_cached)
             # Mock mode: mark all prompt tokens as computed (prefill complete)
             seq.num_computed_tokens = len(seq.token_ids)
             logger.debug(
@@ -1039,7 +1066,7 @@ class Scheduler:
     def _emit_tokens(self, events: list[TokenEvent]) -> None:
         """Deliver token events to streams and result buffers."""
         for event in events:
-            self._stats["tokens_generated"] += 1
+            self._inc_stat("tokens_generated")
             rid = event.request_id
 
             # Deliver to stream if registered
@@ -1059,6 +1086,16 @@ class Scheduler:
                         ready = self._results_ready.get(rid)
                         if ready is not None:
                             ready.set()
+
+    def _cleanup_result_buffers(self, request_id: str) -> None:
+        """Remove result buffers for a request to prevent memory leaks.
+
+        Called after a request is cancelled or finishes abnormally and
+        no caller will retrieve the results via get_result().
+        """
+        with self._results_lock:
+            self._results.pop(request_id, None)
+            self._results_ready.pop(request_id, None)
 
     def _signal_finish(self, request_id: str, finish_reason: str) -> None:
         """Signal that a request has finished (for queue-cancelled requests)."""
@@ -1092,7 +1129,7 @@ class Scheduler:
                 seq = self._active_sequences.pop(rid)
                 # Track completed (non-error) requests
                 if seq.finish_reason != "error":
-                    self._stats["requests_completed"] += 1
+                    self._inc_stat("requests_completed")
                 # Free KV cache blocks if manager is available
                 if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)
@@ -1126,24 +1163,22 @@ class Scheduler:
             stats["used_blocks"] = self.kv_cache_manager.num_used_blocks
             stats["free_blocks"] = self.kv_cache_manager.num_free_blocks
             stats["cached_blocks"] = self.kv_cache_manager.num_cached_blocks
-        # Add effectiveness counters
-        stats.update(self._stats)
-        total_lookups = (
-            self._stats["cache_hits_block"]
-            + self._stats["cache_hits_sequence"]
-            + self._stats["cache_misses"]
-        )
+        # Add effectiveness counters (snapshot under lock for consistency)
+        with self._stats_lock:
+            stats.update(self._stats)
+            total_lookups = (
+                self._stats["cache_hits_block"]
+                + self._stats["cache_hits_sequence"]
+                + self._stats["cache_misses"]
+            )
+            hits = self._stats["cache_hits_block"] + self._stats["cache_hits_sequence"]
+            cached = self._stats["total_cached_tokens"]
+            prefill = self._stats["total_prefill_tokens"]
         stats["cache_hit_rate"] = (
-            (self._stats["cache_hits_block"] + self._stats["cache_hits_sequence"])
-            / total_lookups
-            if total_lookups > 0
-            else 0.0
+            hits / total_lookups if total_lookups > 0 else 0.0
         )
         stats["cache_effectiveness"] = (
-            self._stats["total_cached_tokens"]
-            / (self._stats["total_cached_tokens"] + self._stats["total_prefill_tokens"])
-            if (self._stats["total_cached_tokens"] + self._stats["total_prefill_tokens"]) > 0
-            else 0.0
+            cached / (cached + prefill) if (cached + prefill) > 0 else 0.0
         )
         return stats
 

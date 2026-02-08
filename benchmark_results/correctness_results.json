@@ -38,27 +38,27 @@
     "max_tokens": 32,
     "num_prompts": 4,
     "outputs": {
-      "prompt_0": {
-        "prompt_text": "Explain the process of photosynthesis in plants. H",
-        "output_text": "What is the role of chlorophyll in this process? What are the two main stages of photosynthesis, and what happens in each stage? How does the",
-        "token_count": 32,
-        "finish_reason": "length"
-      },
       "prompt_1": {
         "prompt_text": "Describe the history of the Roman Empire from its ",
         "output_text": "1000 words\n\nThe Roman Empire, a civilization that would come to dominate the ancient world, began as a small city-state in the 8",
         "token_count": 32,
         "finish_reason": "length"
       },
-      "prompt_3": {
-        "prompt_text": "How does a modern CPU execute instructions? Descri",
-        "output_text": "Also, explain the role of the control unit, the difference between RISC and CISC architectures, and the concept of cache memory. Additionally, explain the difference",
+      "prompt_0": {
+        "prompt_text": "Explain the process of photosynthesis in plants. H",
+        "output_text": "What is the role of chlorophyll in this process? What are the two main stages of photosynthesis, and what happens in each stage? How does the",
         "token_count": 32,
         "finish_reason": "length"
       },
       "prompt_2": {
         "prompt_text": "What are the fundamental principles of quantum mec",
         "output_text": "Also, explain the concept of entanglement and its implications. Additionally, explain the Schr\u00f6dinger equation and its role in quantum mechanics. Finally, explain",
+        "token_count": 32,
+        "finish_reason": "length"
+      },
+      "prompt_3": {
+        "prompt_text": "How does a modern CPU execute instructions? Descri",
+        "output_text": "Also, explain the role of the control unit, the difference between RISC and CISC architectures, and the concept of cache memory. Additionally, explain the difference",
         "token_count": 32,
         "finish_reason": "length"
       }

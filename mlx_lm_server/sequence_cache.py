@@ -72,6 +72,9 @@ class SequenceCacheStore:
             - cache_copy: Deep copy of cached List[KVCache], or None on miss
             - remaining_tokens: Tokens not covered by the cache
         """
+        # Phase 1: under lock — find best match, grab reference
+        cache_ref = None
+        best_key_len = 0
         with self._lock:
             node = self._root
             best_node: _TrieNode | None = None
@@ -98,23 +101,25 @@ class SequenceCacheStore:
             # Refresh LRU order
             assert best_node.token_key is not None
             self._lru_order.move_to_end(best_node.token_key)
-
-            cache_copy = copy.deepcopy(best_node.cache_value)
+            cache_ref = best_node.cache_value  # Just grab reference, don't copy yet
             best_key_len = len(best_node.token_key)
 
-            if best_key_len > len(tokens):
-                # Cached sequence is longer than query -- trim excess
-                excess = best_key_len - len(tokens)
-                if can_trim_prompt_cache is not None and trim_prompt_cache is not None:
-                    if can_trim_prompt_cache(cache_copy):
-                        trim_prompt_cache(cache_copy, excess)
-                return cache_copy, []
-            elif best_key_len == len(tokens):
-                return cache_copy, []
-            else:
-                # Cached sequence is shorter -- return remaining tokens
-                remaining = list(tokens[best_key_len:])
-                return cache_copy, remaining
+        # Phase 2: outside lock — expensive deepcopy
+        cache_copy = copy.deepcopy(cache_ref)
+
+        if best_key_len > len(tokens):
+            # Cached sequence is longer than query -- trim excess
+            excess = best_key_len - len(tokens)
+            if can_trim_prompt_cache is not None and trim_prompt_cache is not None:
+                if can_trim_prompt_cache(cache_copy):
+                    trim_prompt_cache(cache_copy, excess)
+            return cache_copy, []
+        elif best_key_len == len(tokens):
+            return cache_copy, []
+        else:
+            # Cached sequence is shorter -- return remaining tokens
+            remaining = list(tokens[best_key_len:])
+            return cache_copy, remaining
 
     def store(self, tokens: list[int], prompt_cache: list) -> None:
         """Store a sequence-level KV cache.
