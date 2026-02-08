@@ -634,6 +634,7 @@ def short_timeout_config(tmp_path):
         max_batch_size=2,
         max_queue_size=8,
         request_timeout_s=0.1,  # 100ms — very short for fast tests
+        first_token_timeout_s=0.1,  # Also short for first token
     )
 
 

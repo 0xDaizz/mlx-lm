@@ -834,10 +834,12 @@ class TestSSDRoundTrip:
         assert index_path.exists(), "SSD index.json file does not exist"
         import json
         index_data = json.loads(index_path.read_text())
-        assert expected_hash_0 in index_data, (
+        # New format: blocks nested under "blocks" key
+        blocks_data = index_data.get("blocks", index_data)
+        assert expected_hash_0 in blocks_data, (
             "Block 0 hash not in persisted index.json"
         )
-        assert expected_hash_1 in index_data, (
+        assert expected_hash_1 in blocks_data, (
             "Block 1 hash not in persisted index.json"
         )
 

@@ -48,6 +48,7 @@ class ServerConfig:
     # Request limits
     max_prompt_tokens: int = 32768  # Max prompt length in tokens
     request_timeout_s: float = 120.0  # Timeout for inference requests
+    first_token_timeout_s: float = 300.0  # Timeout for first token (prefill included)
 
     # Distributed
     use_distributed: bool = False

@@ -27,6 +27,32 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Encoding helpers
+# ---------------------------------------------------------------------------
+
+
+def _safe_encode(tokenizer: Any, text: str) -> list[int]:
+    """Encode text, suppressing special tokens if the tokenizer supports it."""
+    try:
+        return tokenizer.encode(text, add_special_tokens=False)
+    except TypeError:
+        return tokenizer.encode(text)
+
+
+def _get_eos_token_ids(tokenizer: Any) -> set[int]:
+    """Safely extract EOS token ID set from a tokenizer."""
+    eos_ids = getattr(tokenizer, "eos_token_ids", None)
+    if isinstance(eos_ids, (set, frozenset, list)):
+        return set(eos_ids)
+    if isinstance(eos_ids, int):
+        return {eos_ids}
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_id is not None:
+        return {eos_id}
+    return set()
+
+
+# ---------------------------------------------------------------------------
 # Scheduler protocol — anything providing these methods can serve as scheduler
 # ---------------------------------------------------------------------------
 
@@ -306,20 +332,23 @@ def create_app(
             sched.submit_request(inf_req)
         except RuntimeError as e:
             raise HTTPException(status_code=429, detail=str(e))
-        events = await asyncio.get_running_loop().run_in_executor(
-            None, lambda: sched.get_result(request_id, timeout=timeout)
-        )
+        try:
+            events = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: sched.get_result(request_id, timeout=timeout)
+            )
+        except TimeoutError:
+            sched.cancel_request(request_id)
+            raise HTTPException(status_code=504, detail="Request timed out")
 
         if not events:
             sched.cancel_request(request_id)
             raise HTTPException(status_code=504, detail="Request timed out waiting for inference")
 
-        # Exclude EOS token text from output if present
+        # Exclude EOS token from output if present (by token_id, not text)
         filtered_events = events
-        if events and tok is not None:
-            eos_token = getattr(tok, "eos_token", None)
-            if eos_token is not None and events[-1].token_text == eos_token:
-                filtered_events = events[:-1]
+        eos_ids = _get_eos_token_ids(tok) if tok else set()
+        if events and eos_ids and events[-1].token_id in eos_ids:
+            filtered_events = events[:-1]
         completion_text = "".join(e.token_text for e in filtered_events)
         finish_reason = events[-1].finish_reason if events else "stop"
 
@@ -350,8 +379,8 @@ def create_app(
         if tok is None:
             raise HTTPException(status_code=500, detail="Tokenizer not loaded")
 
-        prompt_text = _format_chat_messages(body.messages, tok)
-        prompt_tokens: list[int] = tok.encode(prompt_text)
+        result = _format_chat_messages(body.messages, tok, tokenize=True)
+        prompt_tokens: list[int] = result if isinstance(result, list) else _safe_encode(tok, result)
         request_id = _make_request_id()
 
         params = _validate_and_prepare_request(
@@ -375,6 +404,7 @@ def create_app(
                 request_id, len(prompt_tokens), tok,
                 format_chunk=_format_chat_chunk,
                 request_timeout_s=app.state.config.request_timeout_s,
+                first_token_timeout_s=app.state.config.first_token_timeout_s,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_chat_response)
@@ -413,6 +443,7 @@ def create_app(
                 request_id, len(prompt_tokens), tok,
                 format_chunk=_format_completion_chunk,
                 request_timeout_s=app.state.config.request_timeout_s,
+                first_token_timeout_s=app.state.config.first_token_timeout_s,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_completion_response)
@@ -445,18 +476,24 @@ def create_app(
 # ---------------------------------------------------------------------------
 
 
-def _format_chat_messages(messages: list[ChatMessage], tokenizer: Any) -> str:
-    """Convert chat messages to a prompt string.
+def _format_chat_messages(
+    messages: list[ChatMessage], tokenizer: Any, tokenize: bool = False
+) -> str | list[int]:
+    """Convert chat messages to a prompt string or token list.
 
-    Tries to use the tokenizer's ``apply_chat_template`` if available,
-    otherwise falls back to a simple concatenation.
+    When *tokenize* is True, tries to get a ``list[int]`` directly from the
+    tokenizer's ``apply_chat_template``.  If the tokenizer returns a ``str``
+    instead (e.g. SimpleTokenizer), the caller should fall back to
+    ``_safe_encode``.
+
+    Returns either ``str`` or ``list[int]``.
     """
     msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
 
     if hasattr(tokenizer, "apply_chat_template"):
         try:
             return tokenizer.apply_chat_template(
-                msg_dicts, tokenize=False, add_generation_prompt=True
+                msg_dicts, tokenize=tokenize, add_generation_prompt=True
             )
         except Exception as e:
             logger.warning("apply_chat_template failed: %s, using fallback format", e)
@@ -548,6 +585,7 @@ def _stream_response(
     tokenizer: Any = None,
     format_chunk=None,
     request_timeout_s: float = 120.0,
+    first_token_timeout_s: float | None = None,
 ) -> StreamingResponse:
     """Unified SSE streaming for both chat and completion endpoints.
 
@@ -555,6 +593,8 @@ def _stream_response(
         format_chunk: Callable(request_id, model_name, token_text, finish_reason) -> dict
             Creates the SSE chunk payload. Differs between chat and completion formats.
         request_timeout_s: Per-token timeout in seconds for the stream queue.
+        first_token_timeout_s: Timeout for the first token (prefill). If None,
+            uses *request_timeout_s* for all tokens.
     """
     async def event_generator() -> AsyncIterator[str]:
         token_queue = scheduler.register_stream(inf_req.request_id)
@@ -567,31 +607,82 @@ def _stream_response(
                 return
 
             loop = asyncio.get_running_loop()
+            eos_ids = _get_eos_token_ids(tokenizer) if tokenizer else set()
+            stop_sequences = inf_req.stop_sequences or []
+            max_stop_len = max((len(s) for s in stop_sequences), default=0)
+            text_buffer = ""
+            first_token = True
 
             while True:
+                # C3: use longer timeout for first token (prefill)
+                timeout = (
+                    first_token_timeout_s if first_token and first_token_timeout_s is not None
+                    else request_timeout_s
+                )
                 try:
                     event: TokenEvent | None = await loop.run_in_executor(
-                        None, lambda: token_queue.get(timeout=request_timeout_s)
+                        None, lambda t=timeout: token_queue.get(timeout=t)
                     )
                 except queue.Empty:
-                    error_data = {"error": {"message": f"Stream timeout: no tokens received for {request_timeout_s} seconds", "type": "server_error"}}
+                    error_data = {"error": {"message": f"Stream timeout: no tokens received for {timeout} seconds", "type": "server_error"}}
                     yield f"data: {json.dumps(error_data)}\n\n"
                     break
                 if event is None:
                     break
+                first_token = False
 
-                # Filter EOS token text in streaming
+                # C2: Filter EOS token by token_id instead of text comparison
                 token_text = event.token_text
-                if tokenizer is not None:
-                    eos_token = getattr(tokenizer, "eos_token", None)
-                    if eos_token is not None and token_text == eos_token:
-                        token_text = ""
+                if eos_ids and event.token_id in eos_ids:
+                    token_text = ""
 
-                chunk = format_chunk(request_id, model_name, token_text, event.finish_reason)
-                yield f"data: {json.dumps(chunk)}\n\n"
+                # C1: Stop sequence buffering
+                if max_stop_len > 0:
+                    # Buffer mode: accumulate text and check for stop sequences
+                    text_buffer += token_text
 
-                if event.finish_reason is not None:
-                    break
+                    # Check for stop sequence match in buffer
+                    stop_found = False
+                    for stop_seq in stop_sequences:
+                        idx = text_buffer.find(stop_seq)
+                        if idx != -1:
+                            safe_text = text_buffer[:idx]
+                            if safe_text:
+                                yield f"data: {json.dumps(format_chunk(request_id, model_name, safe_text, None))}\n\n"
+                            yield f"data: {json.dumps(format_chunk(request_id, model_name, '', 'stop'))}\n\n"
+                            stop_found = True
+                            scheduler.cancel_request(request_id)
+                            break
+
+                    if stop_found:
+                        break
+
+                    if event.finish_reason is not None:
+                        # Natural end: flush remaining buffer with final stop check
+                        final_text = text_buffer
+                        for stop_seq in stop_sequences:
+                            idx = final_text.find(stop_seq)
+                            if idx != -1:
+                                final_text = final_text[:idx]
+                                break
+                        if final_text:
+                            yield f"data: {json.dumps(format_chunk(request_id, model_name, final_text, None))}\n\n"
+                        yield f"data: {json.dumps(format_chunk(request_id, model_name, '', event.finish_reason))}\n\n"
+                        break
+
+                    # Flush safe prefix (keep max_stop_len - 1 chars buffered)
+                    if len(text_buffer) > max_stop_len - 1:
+                        safe_len = len(text_buffer) - (max_stop_len - 1)
+                        safe_text = text_buffer[:safe_len]
+                        text_buffer = text_buffer[safe_len:]
+                        yield f"data: {json.dumps(format_chunk(request_id, model_name, safe_text, None))}\n\n"
+                else:
+                    # No stop sequences: original behavior (zero overhead)
+                    chunk = format_chunk(request_id, model_name, token_text, event.finish_reason)
+                    yield f"data: {json.dumps(chunk)}\n\n"
+
+                    if event.finish_reason is not None:
+                        break
 
             yield "data: [DONE]\n\n"
         finally:
@@ -636,6 +727,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--sequence-cache-size", type=int, default=50)
     parser.add_argument("--max-prompt-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout-s", type=float, default=120.0)
+    parser.add_argument("--first-token-timeout-s", type=float, default=300.0)
 
     parsed = parser.parse_args(args)
 
@@ -657,6 +749,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "sequence_cache_size": parsed.sequence_cache_size,
         "max_prompt_tokens": parsed.max_prompt_tokens,
         "request_timeout_s": parsed.request_timeout_s,
+        "first_token_timeout_s": parsed.first_token_timeout_s,
     }
 
     if parsed.adapter_path is not None:

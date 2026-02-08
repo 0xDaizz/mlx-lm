@@ -1550,8 +1550,8 @@ class TestDA_F3_SchedulerThreadDies:
 
     def test_da_f3_get_result_timeout_when_loop_not_started(self):
         """If the inference loop is never started, get_result with a
-        timeout should return (not hang forever). The result may be
-        empty since no tokens were generated."""
+        timeout should raise TimeoutError (not hang forever or return
+        partial results)."""
         config = _make_scheduler_config(max_batch_size=2)
         s = Scheduler(config=config, model=None, tokenizer=None)
 
@@ -1563,11 +1563,11 @@ class TestDA_F3_SchedulerThreadDies:
         # Submit request but don't start the loop
         s.submit_request(_make_request("r1", max_tokens=5))
 
-        # get_result with timeout should return (not hang)
-        tokens = s.get_result("r1", timeout=0.5)
-        # With no loop running, the event times out and we get empty list
-        assert isinstance(tokens, list)
-        assert len(tokens) == 0, "No tokens should be produced without loop"
+        # get_result with timeout should raise TimeoutError (B1 fix)
+        with pytest.raises(TimeoutError) as exc_info:
+            s.get_result("r1", timeout=0.5)
+        assert "r1" in str(exc_info.value)
+        assert "timed out" in str(exc_info.value)
 
     def test_da_f3_loop_stops_mid_generation(self):
         """If the loop is stopped while a request is being processed,

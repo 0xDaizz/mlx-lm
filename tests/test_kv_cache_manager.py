@@ -26,6 +26,7 @@ from mlx_lm_server.kv_cache_manager import (
     BlockPoolExhaustedError,
     KVCacheManager,
     TieredKVCache,
+    _compute_chain_hash,
     compute_block_hash,
     extract_block,
     inject_blocks,
@@ -1326,3 +1327,90 @@ class TestEvictionHeapRebuild:
         evicted = mgr.evict_lru(1)
         assert len(evicted) == 1
         assert evicted[0] == ids_a[0]
+
+
+# ---------------------------------------------------------------------------
+# F1 — Chain Hash (O(n) compute_block_hash)
+# ---------------------------------------------------------------------------
+
+
+class TestChainHash:
+    """Tests for _compute_chain_hash and the legacy wrapper."""
+
+    def test_chain_hash_determinism(self):
+        """Same inputs produce the same chain hash."""
+        h1 = _compute_chain_hash([1, 2, 3, 4], None)
+        h2 = _compute_chain_hash([1, 2, 3, 4], None)
+        assert h1 == h2
+
+    def test_chain_hash_prev_hash_matters(self):
+        """Different prev_hash produces different chain hash."""
+        h1 = _compute_chain_hash([1, 2, 3, 4], None)
+        h2 = _compute_chain_hash([1, 2, 3, 4], "abc123")
+        assert h1 != h2
+
+    def test_chain_hash_different_tokens(self):
+        """Different tokens produce different hashes."""
+        h1 = _compute_chain_hash([1, 2, 3, 4], None)
+        h2 = _compute_chain_hash([5, 6, 7, 8], None)
+        assert h1 != h2
+
+    def test_chain_hash_empty_tokens(self):
+        """Empty token list produces a valid hash."""
+        h = _compute_chain_hash([], None)
+        assert isinstance(h, str)
+        assert len(h) > 0
+
+    def test_legacy_wrapper_consistency(self):
+        """compute_block_hash produces consistent results across calls."""
+        h1 = compute_block_hash([1, 2, 3, 4], [5, 6, 7, 8])
+        h2 = compute_block_hash([1, 2, 3, 4], [5, 6, 7, 8])
+        assert h1 == h2
+
+    def test_legacy_wrapper_empty_block_tokens(self):
+        """compute_block_hash handles empty block_tokens with sentinel."""
+        h1 = compute_block_hash([1, 2, 3], [])
+        h2 = compute_block_hash([4, 5, 6], [])
+        # Both return the same sentinel hash (prefix-independent)
+        assert h1 == h2
+
+    def test_legacy_wrapper_boundary_distinction(self):
+        """Different prefix/block boundaries produce different hashes."""
+        h1 = compute_block_hash([1, 2, 3], [4])
+        h2 = compute_block_hash([1, 2], [3, 4])
+        assert h1 != h2
+
+    def test_chain_equals_legacy_for_aligned_prefix(self):
+        """Chain hash via wrapper matches manual chain for aligned blocks."""
+        block_size = 4
+        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
+        prefix = tokens[:block_size]
+        block = tokens[block_size:]
+
+        legacy = compute_block_hash(prefix, block)
+        prev = _compute_chain_hash(prefix, None)
+        chain = _compute_chain_hash(block, prev)
+        assert legacy == chain
+
+    def test_internal_callers_match_wrapper(self):
+        """find_cached_prefix and allocate_blocks use chain hash consistently."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        tokens = [10, 20, 30, 40, 50, 60, 70, 80]
+
+        # Allocate via allocate_blocks (uses chain hash internally)
+        ids = mgr.allocate_blocks(tokens)
+        assert len(ids) == 2
+
+        # find_cached_prefix should find them (also uses chain hash)
+        cached = mgr.find_cached_prefix(tokens)
+        assert cached == 8
+
+        # Verify hashes match what compute_block_hash produces
+        block0 = mgr.pool.blocks[ids[0]]
+        expected_h0 = compute_block_hash([], tokens[:4])
+        assert block0.block_hash == expected_h0
+
+        block1 = mgr.pool.blocks[ids[1]]
+        expected_h1 = compute_block_hash(tokens[:4], tokens[4:8])
+        assert block1.block_hash == expected_h1

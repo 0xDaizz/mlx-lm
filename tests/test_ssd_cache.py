@@ -17,7 +17,7 @@ from pathlib import Path
 import mlx.core as mx
 import pytest
 
-from mlx_lm_server.ssd_cache import SSDCache
+from mlx_lm_server.ssd_cache import CURRENT_HASH_VERSION, SSDCache
 
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,10 @@ class TestIndexPersistence:
         assert index_path.exists()
 
         data = json.loads(index_path.read_text())
-        assert "hash_999" in data
+        # New format: blocks under "blocks" key, metadata under "__metadata__"
+        assert "__metadata__" in data
+        assert "blocks" in data
+        assert "hash_999" in data["blocks"]
 
     def test_index_empty_on_fresh_start(self, tmp_path: Path):
         """New cache with no index file starts empty."""
@@ -258,3 +261,149 @@ class TestIndexPersistence:
 
         cache = SSDCache(cache_dir=cache_dir)
         assert cache.num_blocks == 0
+
+
+# ---------------------------------------------------------------------------
+# E3 — Index metadata + hash_version
+# ---------------------------------------------------------------------------
+
+
+class TestIndexMetadata:
+    """Tests for SSD index metadata (E3)."""
+
+    def test_index_contains_metadata(self, tmp_path: Path):
+        """Saved index includes __metadata__ with version info."""
+        cache = SSDCache(cache_dir=tmp_path / "cache")
+        kv_data = make_kv_data()
+        cache.save_block("hash_meta_test", kv_data)
+
+        index_path = cache.cache_dir / "index.json"
+        data = json.loads(index_path.read_text())
+
+        assert "__metadata__" in data
+        meta = data["__metadata__"]
+        assert meta["index_version"] == 1
+        assert meta["hash_version"] == CURRENT_HASH_VERSION
+        assert "created_at" in meta
+
+    def test_hash_version_mismatch_invalidates(self, tmp_path: Path):
+        """Index with different hash_version is invalidated on load."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir(parents=True)
+
+        # Write an index with wrong hash_version
+        index_data = {
+            "__metadata__": {
+                "index_version": 1,
+                "hash_version": 999,  # Wrong version
+                "created_at": "2026-01-01T00:00:00",
+            },
+            "blocks": {
+                "test_hash": {
+                    "block_hash": "test_hash",
+                    "filepath": str(cache_dir / "block_test.safetensors"),
+                    "last_accessed": "2026-01-01T00:00:00",
+                    "num_tokens": 4,
+                }
+            },
+        }
+        (cache_dir / "index.json").write_text(json.dumps(index_data))
+
+        cache = SSDCache(cache_dir=cache_dir)
+        assert cache.num_blocks == 0  # Invalidated
+
+    def test_legacy_format_loaded(self, tmp_path: Path):
+        """Legacy index (no __metadata__) is loaded as blocks."""
+        cache_dir = tmp_path / "cache"
+        cache_dir.mkdir(parents=True)
+
+        # Write legacy format (flat dict of blocks)
+        legacy_data = {
+            "legacy_hash": {
+                "block_hash": "legacy_hash",
+                "filepath": str(cache_dir / "block_legacy.safetensors"),
+                "last_accessed": "2026-01-01T00:00:00",
+                "num_tokens": 4,
+            }
+        }
+        (cache_dir / "index.json").write_text(json.dumps(legacy_data))
+
+        # Create the file so it's valid
+        import mlx.core as mx
+        kv = {"keys": mx.zeros((1, 1, 4, 4)), "values": mx.zeros((1, 1, 4, 4))}
+        mx.save_safetensors(str(cache_dir / "block_legacy.safetensors"), kv)
+
+        cache = SSDCache(cache_dir=cache_dir)
+        assert cache.num_blocks == 1
+        assert "legacy_hash" in cache.index
+
+
+# ---------------------------------------------------------------------------
+# F2 — Batch flush
+# ---------------------------------------------------------------------------
+
+
+class TestBatchFlush:
+    """Tests for SSD index batch flush (F2)."""
+
+    def test_mark_dirty_defers_flush(self, tmp_path: Path):
+        """_mark_dirty defers index write until flush_interval."""
+        cache = SSDCache(cache_dir=tmp_path / "cache")
+        cache._flush_interval = 5
+
+        # Save blocks (each calls save_index immediately, but load_block uses _mark_dirty)
+        kv_data = make_kv_data()
+        for i in range(3):
+            cache.save_block(f"hash_{i}", kv_data)
+
+        # Load blocks — these use _mark_dirty for access time updates
+        for i in range(3):
+            cache.load_block(f"hash_{i}")
+
+        # After 3 loads: _mutation_count=3, dirty=True, not flushed
+        assert cache._index_dirty is True
+        assert cache._mutation_count == 3
+
+    def test_flush_writes_index(self, tmp_path: Path):
+        """flush() writes pending index changes to disk."""
+        cache = SSDCache(cache_dir=tmp_path / "cache")
+        cache._flush_interval = 100  # High interval to prevent auto-flush
+
+        kv_data = make_kv_data()
+        cache.save_block("flush_test", kv_data)
+
+        # Manually set dirty state
+        cache._index_dirty = True
+        cache._mutation_count = 5
+
+        cache.flush()
+
+        assert cache._index_dirty is False
+        assert cache._mutation_count == 0
+
+    def test_flush_noop_when_clean(self, tmp_path: Path):
+        """flush() is a no-op when index is not dirty."""
+        cache = SSDCache(cache_dir=tmp_path / "cache")
+        assert cache._index_dirty is False
+
+        # Should not raise or do anything
+        cache.flush()
+        assert cache._index_dirty is False
+
+    def test_auto_flush_at_interval(self, tmp_path: Path):
+        """Index is automatically flushed after _flush_interval mutations."""
+        cache = SSDCache(cache_dir=tmp_path / "cache")
+        cache._flush_interval = 3
+
+        kv_data = make_kv_data()
+        # Save 3 blocks (immediate write) then load them (_mark_dirty)
+        for i in range(3):
+            cache.save_block(f"auto_hash_{i}", kv_data)
+
+        # Load 3 blocks — at 3rd load, auto-flush should trigger
+        for i in range(3):
+            cache.load_block(f"auto_hash_{i}")
+
+        # After exactly 3 mark_dirty calls with interval=3, should be flushed
+        assert cache._index_dirty is False
+        assert cache._mutation_count == 0

@@ -24,6 +24,8 @@ from mlx_lm_server.types import SSDBlockMeta
 
 logger = logging.getLogger(__name__)
 
+CURRENT_HASH_VERSION = 1
+
 
 class SSDCache:
     """SSD-backed KV cache for persisting evicted blocks.
@@ -43,6 +45,11 @@ class SSDCache:
         self.cache_dir = Path(cache_dir)
         self.ttl_days = ttl_days
         self.index: dict[str, SSDBlockMeta] = {}
+
+        # Batch flush state: defer save_index() until flush interval
+        self._index_dirty = False
+        self._mutation_count = 0
+        self._flush_interval = 10
 
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -96,7 +103,7 @@ class SSDCache:
             last_accessed=datetime.now(),
             num_tokens=num_tokens,
         )
-        self.save_index()
+        self.save_index()  # Immediate flush: new block must be indexed for durability
 
         logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
 
@@ -168,7 +175,7 @@ class SSDCache:
 
         # Update access time
         meta.last_accessed = datetime.now()
-        self.save_index()
+        self._mark_dirty()
 
         logger.debug("Loaded block %s from SSD: %s", block_hash, filepath)
         return result
@@ -199,21 +206,48 @@ class SSDCache:
 
         return len(to_prune)
 
+    def _mark_dirty(self) -> None:
+        """Mark index as dirty; flush to disk after _flush_interval mutations."""
+        self._mutation_count += 1
+        if self._mutation_count >= self._flush_interval:
+            self.save_index()
+            self._mutation_count = 0
+            self._index_dirty = False
+        else:
+            self._index_dirty = True
+
+    def flush(self) -> None:
+        """Flush pending index changes to disk. Call during shutdown."""
+        if self._index_dirty:
+            self.save_index()
+            self._mutation_count = 0
+            self._index_dirty = False
+
     def save_index(self) -> None:
         """Persist the index to a JSON file in the cache directory.
 
         Uses atomic write (write to temp file + os.replace) to prevent
         index corruption if the process crashes mid-write.
+
+        Index format includes __metadata__ for version tracking (E3).
         """
         index_path = self.cache_dir / "index.json"
-        serializable = {}
+        blocks_serializable = {}
         for bh, meta in self.index.items():
-            serializable[str(bh)] = {
+            blocks_serializable[str(bh)] = {
                 "block_hash": meta.block_hash,
                 "filepath": str(meta.filepath),
                 "last_accessed": meta.last_accessed.isoformat(),
                 "num_tokens": meta.num_tokens,
             }
+        serializable = {
+            "__metadata__": {
+                "index_version": 1,
+                "hash_version": CURRENT_HASH_VERSION,
+                "created_at": datetime.now().isoformat(),
+            },
+            "blocks": blocks_serializable,
+        }
         tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.tmp')
         try:
             with os.fdopen(tmp_fd, 'w') as f:
@@ -227,7 +261,12 @@ class SSDCache:
             raise
 
     def load_index(self) -> None:
-        """Load the index from the JSON file in the cache directory."""
+        """Load the index from the JSON file in the cache directory.
+
+        Handles both new format (with __metadata__ + blocks) and legacy
+        format (flat dict of block entries). On hash_version mismatch,
+        invalidates the index and returns empty.
+        """
         index_path = self.cache_dir / "index.json"
         if not index_path.exists():
             self.index = {}
@@ -235,8 +274,27 @@ class SSDCache:
 
         try:
             data = json.loads(index_path.read_text())
+
+            # Detect new vs legacy format
+            if "__metadata__" in data and "blocks" in data:
+                metadata = data["__metadata__"]
+                stored_hash_version = metadata.get("hash_version", 0)
+                if stored_hash_version != CURRENT_HASH_VERSION:
+                    logger.warning(
+                        "SSD index hash_version mismatch (stored=%s, current=%s) "
+                        "— invalidating cache",
+                        stored_hash_version,
+                        CURRENT_HASH_VERSION,
+                    )
+                    self.index = {}
+                    return
+                block_entries = data["blocks"]
+            else:
+                # Legacy format: entire dict is block entries
+                block_entries = data
+
             self.index = {}
-            for bh_str, entry in data.items():
+            for bh_str, entry in block_entries.items():
                 bh = bh_str
                 self.index[bh] = SSDBlockMeta(
                     block_hash=entry["block_hash"],

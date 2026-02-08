@@ -626,3 +626,494 @@ class TestErrorHandling:
                     pass
 
         assert error_found, "Expected an SSE error event for queue full during streaming"
+
+
+# ===========================================================================
+# TestA1: Chat tokenize special token dedup
+# ===========================================================================
+
+
+class TestA1ChatTokenize:
+    """A1: _format_chat_messages with tokenize=True, _safe_encode fallback."""
+
+    def test_format_chat_messages_tokenize_false_returns_str(self, tokenizer):
+        """tokenize=False always returns a string."""
+        from mlx_lm_server.server import _format_chat_messages, ChatMessage
+        msgs = [ChatMessage(role="user", content="Hi")]
+        result = _format_chat_messages(msgs, tokenizer, tokenize=False)
+        assert isinstance(result, str)
+
+    def test_format_chat_messages_tokenize_true_with_simple_tokenizer(self, tokenizer):
+        """SimpleTokenizer.apply_chat_template ignores tokenize=True, returns str."""
+        from mlx_lm_server.server import _format_chat_messages, ChatMessage
+        msgs = [ChatMessage(role="user", content="Hi")]
+        result = _format_chat_messages(msgs, tokenizer, tokenize=True)
+        # SimpleTokenizer always returns str (doesn't support tokenize=True)
+        assert isinstance(result, str)
+
+    def test_format_chat_messages_tokenize_true_with_tokenizer_returning_list(self):
+        """When tokenizer returns list[int] for tokenize=True, use directly."""
+        from mlx_lm_server.server import _format_chat_messages, ChatMessage
+
+        class TokenizingTokenizer:
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                if tokenize:
+                    return [1, 2, 3, 4, 5]  # token ids
+                return "user: Hi\nassistant:"
+
+        msgs = [ChatMessage(role="user", content="Hi")]
+        result = _format_chat_messages(msgs, TokenizingTokenizer(), tokenize=True)
+        assert isinstance(result, list)
+        assert result == [1, 2, 3, 4, 5]
+
+    def test_safe_encode_with_add_special_tokens_support(self):
+        """_safe_encode uses add_special_tokens=False when supported."""
+        from mlx_lm_server.server import _safe_encode
+
+        class FullTokenizer:
+            def encode(self, text, add_special_tokens=True):
+                if add_special_tokens:
+                    return [999] + [ord(c) for c in text]  # BOS + text
+                return [ord(c) for c in text]  # no BOS
+
+        tok = FullTokenizer()
+        result = _safe_encode(tok, "Hi")
+        assert 999 not in result  # No BOS token
+        assert result == [72, 105]
+
+    def test_safe_encode_fallback_on_type_error(self, tokenizer):
+        """_safe_encode falls back to encode() when TypeError is raised."""
+        from mlx_lm_server.server import _safe_encode
+        # SimpleTokenizer.encode() doesn't accept add_special_tokens
+        result = _safe_encode(tokenizer, "Hi")
+        assert result == [72, 105]  # ord('H'), ord('i')
+
+    @pytest.mark.anyio
+    async def test_chat_endpoint_uses_safe_encode(self, client):
+        """Chat completions endpoint still works correctly with A1 changes."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 50,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["message"]["content"] == "Hello, world!"
+
+
+# ===========================================================================
+# TestB1Server: TimeoutError handling
+# ===========================================================================
+
+
+class TestB1ServerTimeout:
+    """B1: _do_inference handles TimeoutError from get_result."""
+
+    @pytest.mark.anyio
+    async def test_timeout_error_returns_504(self, config, tokenizer):
+        """get_result() raising TimeoutError should yield 504."""
+
+        class TimeoutScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.cancelled = []
+
+            def get_result(self, request_id, timeout=None):
+                raise TimeoutError(f"Request {request_id} timed out after {timeout}s")
+
+            def cancel_request(self, request_id):
+                self.cancelled.append(request_id)
+                return True
+
+        sched = TimeoutScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                },
+            )
+        assert resp.status_code == 504
+        data = resp.json()
+        assert "timed out" in data["error"]["message"].lower()
+        # Verify cancel was called
+        assert len(sched.cancelled) == 1
+
+
+# ===========================================================================
+# TestC1: Streaming stop sequence buffering
+# ===========================================================================
+
+
+class TestC1StreamingStopBuffer:
+    """C1: Stop sequence buffering in _stream_response."""
+
+    @pytest.mark.anyio
+    async def test_multi_token_stop_boundary(self, config, tokenizer):
+        """Stop sequence spanning multiple tokens is properly caught."""
+
+        class StopScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.response_tokens = ["He", "ll", "ST", "OP", "after"]
+                self.cancelled = []
+
+            def submit_request(self, request):
+                self.submitted.append(request)
+                if request.request_id in self.streams:
+                    q = self.streams[request.request_id]
+                    for i, tok_text in enumerate(self.response_tokens):
+                        is_last = i == len(self.response_tokens) - 1
+                        q.put(TokenEvent(
+                            request_id=request.request_id,
+                            token_id=i,
+                            token_text=tok_text,
+                            finish_reason="stop" if is_last else None,
+                        ))
+                    q.put(None)
+
+            def cancel_request(self, request_id):
+                self.cancelled.append(request_id)
+                return True
+
+        sched = StopScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                    "stream": True,
+                    "stop": ["STOP"],
+                },
+            )
+        assert resp.status_code == 200
+        chunks, has_done = _parse_sse_body(resp.text)
+        # Collect all text
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        assert "STOP" not in all_text, f"Stop sequence should not appear in output: {all_text!r}"
+        assert "after" not in all_text, f"Text after stop should not appear: {all_text!r}"
+        assert all_text == "Hell", f"Expected 'Hell' before stop, got {all_text!r}"
+        # Last meaningful chunk should have finish_reason="stop"
+        finish_chunks = [c for c in chunks if c["choices"][0]["finish_reason"] == "stop"]
+        assert len(finish_chunks) == 1
+
+    @pytest.mark.anyio
+    async def test_earliest_stop_wins(self, config, tokenizer):
+        """When multiple stop candidates, earliest match wins."""
+
+        class EarliestStopScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.response_tokens = ["ab", "cE", "ND", "IN", "Gx"]
+                self.cancelled = []
+
+            def submit_request(self, request):
+                self.submitted.append(request)
+                if request.request_id in self.streams:
+                    q = self.streams[request.request_id]
+                    for i, tok_text in enumerate(self.response_tokens):
+                        is_last = i == len(self.response_tokens) - 1
+                        q.put(TokenEvent(
+                            request_id=request.request_id,
+                            token_id=i,
+                            token_text=tok_text,
+                            finish_reason="stop" if is_last else None,
+                        ))
+                    q.put(None)
+
+            def cancel_request(self, request_id):
+                self.cancelled.append(request_id)
+                return True
+
+        sched = EarliestStopScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                    "stream": True,
+                    "stop": ["END", "ENDING"],
+                },
+            )
+        chunks, _ = _parse_sse_body(resp.text)
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        # "abcENDINGx" — "END" appears first at position 3
+        assert "END" not in all_text
+        assert all_text == "abc", f"Expected 'abc' before 'END', got {all_text!r}"
+
+    @pytest.mark.anyio
+    async def test_unicode_stop_boundary(self, config, tokenizer):
+        """Unicode multi-byte stop sequence across token boundaries."""
+
+        class UnicodeStopScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.response_tokens = ["abc", "\u505c", "\u6b62", "xyz"]
+                self.cancelled = []
+
+            def submit_request(self, request):
+                self.submitted.append(request)
+                if request.request_id in self.streams:
+                    q = self.streams[request.request_id]
+                    for i, tok_text in enumerate(self.response_tokens):
+                        is_last = i == len(self.response_tokens) - 1
+                        q.put(TokenEvent(
+                            request_id=request.request_id,
+                            token_id=i,
+                            token_text=tok_text,
+                            finish_reason="stop" if is_last else None,
+                        ))
+                    q.put(None)
+
+            def cancel_request(self, request_id):
+                self.cancelled.append(request_id)
+                return True
+
+        sched = UnicodeStopScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                    "stream": True,
+                    "stop": ["\u505c\u6b62"],  # "停止"
+                },
+            )
+        chunks, _ = _parse_sse_body(resp.text)
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        assert "\u505c\u6b62" not in all_text
+        assert all_text == "abc", f"Expected 'abc' before stop, got {all_text!r}"
+
+    @pytest.mark.anyio
+    async def test_no_stop_sequences_zero_overhead(self, client):
+        """Without stop sequences, streaming works identically to before."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 50,
+                "stream": True,
+            },
+        )
+        chunks, has_done = _parse_sse_body(resp.text)
+        assert len(chunks) == 4
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        assert all_text == "Hello, world!"
+
+
+# ===========================================================================
+# TestC2: EOS filtering by token_id
+# ===========================================================================
+
+
+class TestC2EosTokenId:
+    """C2: EOS detection uses token_id instead of text comparison."""
+
+    def test_get_eos_token_ids_from_set(self):
+        """Tokenizer with eos_token_ids as set."""
+        from mlx_lm_server.server import _get_eos_token_ids
+
+        class Tok:
+            eos_token_ids = {1, 2}
+        assert _get_eos_token_ids(Tok()) == {1, 2}
+
+    def test_get_eos_token_ids_from_list(self):
+        """Tokenizer with eos_token_ids as list."""
+        from mlx_lm_server.server import _get_eos_token_ids
+
+        class Tok:
+            eos_token_ids = [3, 4]
+        assert _get_eos_token_ids(Tok()) == {3, 4}
+
+    def test_get_eos_token_ids_from_int(self):
+        """Tokenizer with eos_token_ids as single int."""
+        from mlx_lm_server.server import _get_eos_token_ids
+
+        class Tok:
+            eos_token_ids = 5
+        assert _get_eos_token_ids(Tok()) == {5}
+
+    def test_get_eos_token_ids_fallback_to_eos_token_id(self):
+        """Tokenizer with eos_token_id (singular) but no eos_token_ids."""
+        from mlx_lm_server.server import _get_eos_token_ids
+
+        class Tok:
+            eos_token_id = 42
+        assert _get_eos_token_ids(Tok()) == {42}
+
+    def test_get_eos_token_ids_empty_when_nothing(self):
+        """Tokenizer without any EOS info returns empty set."""
+        from mlx_lm_server.server import _get_eos_token_ids
+
+        class Tok:
+            pass
+        assert _get_eos_token_ids(Tok()) == set()
+
+    @pytest.mark.anyio
+    async def test_eos_filtered_by_token_id_non_streaming(self, config):
+        """Non-streaming: EOS token is filtered by token_id, not text."""
+
+        class EosTokenizer:
+            eos_token_id = 99
+            eos_token = "</s>"
+
+            def encode(self, text):
+                return [ord(c) for c in text]
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                return "user: Hi\nassistant:"
+
+        class EosScheduler(MockSchedulerForApp):
+            def get_result(self, request_id, timeout=None):
+                return [
+                    TokenEvent(request_id=request_id, token_id=1, token_text="Hello"),
+                    TokenEvent(request_id=request_id, token_id=99, token_text="</s>", finish_reason="stop"),
+                ]
+
+        sched = EosScheduler()
+        tok = EosTokenizer()
+        app = create_app(config=config, scheduler=sched, tokenizer=tok)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                },
+            )
+        data = resp.json()
+        assert data["choices"][0]["message"]["content"] == "Hello"
+
+    @pytest.mark.anyio
+    async def test_eos_filtered_by_token_id_streaming(self, config):
+        """Streaming: EOS token text replaced with '' when token_id matches."""
+
+        class EosTokenizer:
+            eos_token_id = 99
+
+            def encode(self, text):
+                return [ord(c) for c in text]
+
+            def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
+                return "user: Hi\nassistant:"
+
+        class EosStreamScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.response_tokens = [
+                    (1, "Hello"),
+                    (99, "</s>"),
+                ]
+
+            def submit_request(self, request):
+                self.submitted.append(request)
+                if request.request_id in self.streams:
+                    q = self.streams[request.request_id]
+                    for i, (tid, text) in enumerate(self.response_tokens):
+                        is_last = i == len(self.response_tokens) - 1
+                        q.put(TokenEvent(
+                            request_id=request.request_id,
+                            token_id=tid,
+                            token_text=text,
+                            finish_reason="stop" if is_last else None,
+                        ))
+                    q.put(None)
+
+        sched = EosStreamScheduler()
+        tok = EosTokenizer()
+        app = create_app(config=config, scheduler=sched, tokenizer=tok)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                    "stream": True,
+                },
+            )
+        chunks, _ = _parse_sse_body(resp.text)
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        assert "</s>" not in all_text
+        assert all_text == "Hello"
+
+
+# ===========================================================================
+# TestC3: First token timeout
+# ===========================================================================
+
+
+class TestC3FirstTokenTimeout:
+    """C3: first_token_timeout_s config and behavior."""
+
+    def test_config_default(self):
+        """ServerConfig has first_token_timeout_s=300.0 by default."""
+        cfg = ServerConfig()
+        assert cfg.first_token_timeout_s == 300.0
+
+    def test_cli_parsing(self):
+        """CLI --first-token-timeout-s is parsed correctly."""
+        from mlx_lm_server.server import parse_args
+        cfg = parse_args(["--first-token-timeout-s", "600"])
+        assert cfg.first_token_timeout_s == 600.0
+
+    @pytest.mark.anyio
+    async def test_first_token_uses_longer_timeout(self, tokenizer):
+        """First token uses first_token_timeout_s, not request_timeout_s."""
+        from mlx_lm_server.server import create_app
+
+        # Track which timeout was used for each get() call
+        timeouts_used = []
+
+        class TimeoutTrackingScheduler(MockSchedulerForApp):
+            def register_stream(self, request_id):
+                q = Queue()
+                self.streams[request_id] = q
+                original_get = q.get
+
+                def tracking_get(timeout=None):
+                    timeouts_used.append(timeout)
+                    return original_get(timeout=timeout)
+
+                q.get = tracking_get
+                return q
+
+        sched = TimeoutTrackingScheduler()
+        cfg = ServerConfig(
+            model="test-model",
+            request_timeout_s=10.0,
+            first_token_timeout_s=60.0,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                    "stream": True,
+                },
+            )
+        assert resp.status_code == 200
+        # First get() should use first_token_timeout_s=60
+        assert len(timeouts_used) >= 2
+        assert timeouts_used[0] == 60.0, f"First token timeout should be 60.0, got {timeouts_used[0]}"
+        # Subsequent get() calls should use request_timeout_s=10
+        for t in timeouts_used[1:]:
+            assert t == 10.0, f"Subsequent timeout should be 10.0, got {t}"

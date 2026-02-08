@@ -21,12 +21,18 @@ def main() -> None:
     tiered_cache = None
 
     try:
-        from mlx_lm_server.kv_cache_manager import KVCacheManager, TieredKVCache
+        from mlx_lm_server.kv_cache_manager import (
+            KVCacheManager, TieredKVCache, compute_model_fingerprint,
+        )
         from mlx_lm_server.ssd_cache import SSDCache
 
         kv_cache_manager = KVCacheManager(config)
         if config.ssd_enabled:
-            ssd_cache = SSDCache(config.ssd_cache_dir, config.ssd_ttl_days)
+            fingerprint = compute_model_fingerprint(
+                config.model, model, config.kv_bits, config.kv_group_size,
+            )
+            ssd_dir = config.ssd_cache_dir / fingerprint
+            ssd_cache = SSDCache(ssd_dir, config.ssd_ttl_days)
             tiered_cache = TieredKVCache(kv_cache_manager, ssd_cache)
     except ImportError:
         pass
@@ -39,10 +45,8 @@ def main() -> None:
         model=model,
         tokenizer=tokenizer,
         kv_cache_manager=kv_cache_manager,
+        tiered_cache=tiered_cache,
     )
-    # Wire tiered cache into scheduler for SSD eviction/pruning
-    if tiered_cache is not None:
-        scheduler._tiered_cache = tiered_cache
     scheduler.run_inference_loop()
 
     # --- Build and run ---

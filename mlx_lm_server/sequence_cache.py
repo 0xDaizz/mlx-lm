@@ -36,6 +36,31 @@ class _TrieNode:
         self.token_key: tuple[int, ...] | None = None  # Full key for LRU tracking
 
 
+def _clone_cache_list(cache_list: list) -> list:
+    """Create an independent copy of a KV cache list.
+
+    Plain KVCache objects (with keys/values mx.arrays and no group_size)
+    get a fast slice-based clone. Everything else (QuantizedKVCache,
+    CacheList, dict, etc.) falls back to copy.deepcopy.
+    """
+    cloned = []
+    for obj in cache_list:
+        # Plain KVCache fast path: has keys/values/offset, no group_size
+        if (hasattr(obj, 'keys') and hasattr(obj, 'values')
+                and hasattr(obj, 'offset') and not hasattr(obj, 'group_size')):
+            new_obj = type(obj).__new__(type(obj))
+            new_obj.keys = obj.keys[:, :, :obj.offset, :]
+            new_obj.values = obj.values[:, :, :obj.offset, :]
+            new_obj.offset = obj.offset
+            if hasattr(obj, 'step'):
+                new_obj.step = obj.step
+            cloned.append(new_obj)
+        else:
+            # QuantizedKVCache, CacheList, dict, etc. — deepcopy fallback
+            cloned.append(copy.deepcopy(obj))
+    return cloned
+
+
 class SequenceCacheStore:
     """Thread-safe LRU cache for sequence-level KV caches.
 
@@ -104,11 +129,13 @@ class SequenceCacheStore:
             cache_ref = best_node.cache_value  # Just grab reference, don't copy yet
             best_key_len = len(best_node.token_key)
 
-        # Phase 2: outside lock — expensive deepcopy
-        cache_copy = copy.deepcopy(cache_ref)
+        # Phase 2: outside lock — clone cache (fast path for plain KVCache)
+        cache_copy = _clone_cache_list(cache_ref)
 
         if best_key_len > len(tokens):
-            # Cached sequence is longer than query -- trim excess
+            # UNREACHABLE: trie stores cache_value only on leaf nodes —
+            # best_key_len <= len(tokens) always holds
+            # Kept as defensive code
             excess = best_key_len - len(tokens)
             if can_trim_prompt_cache is not None and trim_prompt_cache is not None:
                 if can_trim_prompt_cache(cache_copy):

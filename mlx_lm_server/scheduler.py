@@ -134,6 +134,7 @@ class Scheduler:
         model=None,
         tokenizer=None,
         kv_cache_manager=None,
+        tiered_cache=None,
     ) -> None:
         self.config = config
         self.model = model
@@ -177,12 +178,20 @@ class Scheduler:
         self._request_id_to_uid: dict[str, int] = {}
         self._sequence_cache: SequenceCacheStore | None = None
 
-        # Tiered cache (RAM + SSD) — set by __main__.py or tests
-        self._tiered_cache: Any = None
+        # Tiered cache (RAM + SSD) — injected via constructor or tests
+        self._tiered_cache: Any = tiered_cache
 
         # SSD pruning counter (prune every N inference steps)
         self._ssd_prune_interval: int = 1000
         self._ssd_prune_counter: int = 0
+
+        # Track UIDs inserted without cache for early prefill save (G2)
+        # After the first decode step, prefill KV data may be available in
+        # the BatchGenerator's internal caches for these sequences.
+        # TODO: Implement _save_prefill_caches() once BatchGenerator exposes
+        # a public API for accessing per-sequence KV data mid-generation.
+        # Currently BatchGenerator._caches is private and format-dependent.
+        self._pending_cache_saves: set[int] = set()
 
         # Cache effectiveness counters
         self._stats: dict[str, int] = {
@@ -279,16 +288,21 @@ class Scheduler:
         return q
 
     def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
-        """Blocking get for non-streaming request results.
+        """Wait for and return generation results.
 
-        Waits until the request finishes, then returns all TokenEvents.
+        API Contract:
+        - Normal: blocks until finished, returns list[TokenEvent]
+        - Timeout: raises TimeoutError — caller MUST call cancel_request() to free resources
+        - After cancel: may raise KeyError (already cleaned up) or return [cancelled_event]
+        - Recommended pattern: on TimeoutError → cancel_request() → do NOT call get_result() again
         """
         with self._results_lock:
             event = self._results_ready.get(request_id)
         if event is None:
             raise KeyError(f"Unknown request_id: {request_id}")
 
-        event.wait(timeout=timeout)
+        if not event.wait(timeout=timeout):
+            raise TimeoutError(f"Request {request_id} timed out after {timeout}s")
 
         with self._results_lock:
             tokens = self._results.pop(request_id, [])
@@ -322,6 +336,8 @@ class Scheduler:
 
         # Request not found in queue or active — clean up any stale buffers
         self._cleanup_result_buffers(request_id)
+        with self._streams_lock:
+            self._streams.pop(request_id, None)
         return False
 
     # --- Inference Loop ---
@@ -349,7 +365,12 @@ class Scheduler:
         self._new_request_event.set()  # Wake up the loop
         if self._inference_thread is not None:
             self._inference_thread.join(timeout=5.0)
-            self._inference_thread = None
+            if self._inference_thread.is_alive():
+                logger.warning(
+                    "Inference thread did not stop within 5s — may be stuck in model inference"
+                )
+            else:
+                self._inference_thread = None
         if self._batch_generator is not None:
             try:
                 self._batch_generator.close()
@@ -546,8 +567,21 @@ class Scheduler:
             prompt_tokens = seq.token_ids[:len(seq.token_ids) - len(seq.output_tokens)]
 
             # Store in sequence-level cache
+            # A2: prompt_cache includes generated tokens' KV — trim before storing
             if self._sequence_cache is not None:
-                self._sequence_cache.store(prompt_tokens, prompt_cache)
+                can_store = True
+                num_generated = len(seq.output_tokens)
+                if num_generated > 0 and prompt_cache is not None:
+                    if can_trim_prompt_cache is not None and can_trim_prompt_cache(prompt_cache):
+                        trim_prompt_cache(prompt_cache, num_generated)
+                    else:
+                        logger.warning(
+                            "Skip sequence-cache store: non-trimmable cache type for %s",
+                            rid,
+                        )
+                        can_store = False
+                if can_store:
+                    self._sequence_cache.store(prompt_tokens, prompt_cache)
 
             # Decompose into block-level cache for finer-grained sharing
             if self.kv_cache_manager is not None:
@@ -608,12 +642,14 @@ class Scheduler:
             uid = self._request_id_to_uid.pop(rid, None)
             if uid is not None:
                 self._uid_to_request_id.pop(uid, None)
+                self._pending_cache_saves.discard(uid)
             with self._active_lock:
                 seq = self._active_sequences.pop(rid, None)
             if seq is not None:
                 seq.is_finished = True
                 seq.finish_reason = "cancelled"
                 self._signal_finish(rid, finish_reason="cancelled")
+                self._cleanup_result_buffers(rid)
             with self._cancelled_lock:
                 self._cancelled.discard(rid)
 
@@ -657,15 +693,36 @@ class Scheduler:
                             seq.token_ids[:num_cached]
                         )
                         seq.block_ids = block_ids
-                        # Try to reconstruct cache from blocks
+                        # D1+G1: Validate all blocks before reconstruction
                         try:
                             block_data = []
-                            block_size = self.kv_cache_manager.block_size
-                            for i in range(len(block_ids)):
-                                block = self.kv_cache_manager.pool.blocks[block_ids[i]]
+                            all_blocks_valid = True
+                            for bid in block_ids:
+                                block = self.kv_cache_manager.pool.blocks[bid]
                                 if block.kv_data is not None:
                                     block_data.append(block.kv_data)
-                            if block_data:
+                                else:
+                                    # G1: Try SSD promote if tiered cache available
+                                    promoted = False
+                                    if block.block_hash and self._tiered_cache:
+                                        if hasattr(self._tiered_cache, 'ssd') and self._tiered_cache.ssd is not None:
+                                            try:
+                                                raw_data = self._tiered_cache.ssd.load_block(block.block_hash)
+                                                if raw_data is not None:
+                                                    # Normalize: load_block may return list[dict] or dict
+                                                    if isinstance(raw_data, dict):
+                                                        raw_data = [raw_data]
+                                                    block.kv_data = raw_data
+                                                    block.last_accessed = time.time()
+                                                    block_data.append(raw_data)
+                                                    promoted = True
+                                            except Exception as e:
+                                                logger.debug("SSD promote failed for block %s: %s", block.block_hash, e)
+                                    if not promoted:
+                                        all_blocks_valid = False
+                                        break
+
+                            if all_blocks_valid and block_data:
                                 cache = reconstruct_cache_from_blocks(
                                     [{'kv_data_per_layer': d}
                                      for d in block_data],
@@ -678,6 +735,16 @@ class Scheduler:
                                 self._inc_stat("cache_hits_block")
                                 self._inc_stat("total_cached_tokens", num_cached)
                                 remaining_tokens = seq.token_ids[num_cached:]
+                            else:
+                                # Partial/incomplete blocks — fall back to uncached path
+                                logger.warning(
+                                    "Partial block data for %s — falling back to uncached",
+                                    req.request_id,
+                                )
+                                self.kv_cache_manager.free_blocks(block_ids)
+                                seq.block_ids = []
+                                cache = None
+                                remaining_tokens = seq.token_ids
                         except Exception as e:
                             logger.warning(
                                 "Failed to reconstruct cache from blocks for %s: %s",
@@ -722,10 +789,22 @@ class Scheduler:
                 # Track prefill tokens (tokens that need actual computation)
                 self._inc_stat("total_prefill_tokens", len(remaining_tokens))
 
-                # Handle edge case: full cache hit (remaining_tokens empty)
-                # Must pass at least the last token for logit generation
+                # A3: Handle full cache hit — trim cache by 1 to avoid last-token duplication
                 if not remaining_tokens:
                     remaining_tokens = [seq.token_ids[-1]]
+                    if cache is not None:
+                        if can_trim_prompt_cache is not None and can_trim_prompt_cache(cache):
+                            trim_prompt_cache(cache, 1)
+                        else:
+                            # Non-trimmable cache — fall back to uncached path
+                            logger.debug(
+                                "Full cache hit but non-trimmable — falling back to uncached path"
+                            )
+                            if self.kv_cache_manager is not None and seq.block_ids:
+                                self.kv_cache_manager.free_blocks(seq.block_ids)
+                            seq.block_ids = []
+                            cache = None
+                            remaining_tokens = seq.token_ids
 
                 # Insert into BatchGenerator
                 try:
@@ -743,6 +822,9 @@ class Scheduler:
                     self._uid_to_request_id[uid] = req.request_id
                     self._request_id_to_uid[req.request_id] = uid
                     seq._batch_uid = uid
+                    # G2: Track cache-miss inserts for early prefill save
+                    if cache is None:
+                        self._pending_cache_saves.add(uid)
                     # Register in _active_sequences AFTER insert() succeeds
                     # and UID is assigned (Bug 3 / Issue 4 fix).
                     with self._active_lock:
@@ -782,6 +864,7 @@ class Scheduler:
                 uid = self._request_id_to_uid.pop(rid, None)
                 if uid is not None:
                     self._uid_to_request_id.pop(uid, None)
+                    self._pending_cache_saves.discard(uid)
                 # Free KV cache blocks if manager is available
                 if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)

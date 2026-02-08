@@ -94,17 +94,33 @@ class BlockPool:
         return len(self.free_queue)
 
 
+def _compute_chain_hash(block_tokens: list[int], prev_hash: str | None = None) -> str:
+    """Compute a chain hash for a single block, given the previous block's hash.
+
+    O(block_size) per call. When chained across N blocks, total cost is O(N *
+    block_size) = O(total_tokens), compared to the old O(N^2 * block_size)
+    approach that re-hashed the full prefix for every block.
+
+    Args:
+        block_tokens: Token IDs in this block.
+        prev_hash: Hex digest of the preceding block (None for the first block).
+
+    Returns:
+        Hex digest string identifying this block in its chain context.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    h.update((prev_hash or "").encode('ascii'))
+    for tok in block_tokens:
+        h.update(struct.pack("<i", tok))
+    return h.hexdigest()
+
+
 def compute_block_hash(prefix_tokens: list[int], block_tokens: list[int]) -> str:
     """Compute a deterministic hash for a KV cache block.
 
-    Uses blake2b for cross-process determinism (Python's hash() is randomized
-    per process via PYTHONHASHSEED).
-
-    The hash is derived from the full token context: all tokens that came
-    before this block (prefix) concatenated with the tokens in this block.
-    A separator sentinel is inserted between prefix and block tokens to
-    distinguish boundary positions. This ensures that the same token sequence
-    always maps to the same hash, enabling automatic prefix caching.
+    Legacy wrapper that builds the chain hash incrementally over prefix
+    blocks, then computes the final hash for block_tokens. Existing callers
+    and tests continue to work without changes.
 
     Args:
         prefix_tokens: All tokens preceding this block.
@@ -113,13 +129,49 @@ def compute_block_hash(prefix_tokens: list[int], block_tokens: list[int]) -> str
     Returns:
         Hex digest string uniquely identifying this block's content in context.
     """
+    if not block_tokens:
+        logger.warning(
+            "compute_block_hash called with empty block_tokens — returning sentinel hash"
+        )
+        return _compute_chain_hash([], None)
+
+    block_size = len(block_tokens)
+    prev_hash = None
+    for i in range(0, len(prefix_tokens), block_size):
+        chunk = prefix_tokens[i:i + block_size]
+        if len(chunk) == block_size:
+            prev_hash = _compute_chain_hash(chunk, prev_hash)
+    return _compute_chain_hash(block_tokens, prev_hash)
+
+
+def compute_model_fingerprint(
+    model_name: str, model, kv_bits: int, kv_group_size: int
+) -> str:
+    """Compute a fingerprint for a model+quantization combination.
+
+    Used to namespace SSD cache directories so that different models
+    or quantization settings do not share cached KV blocks.
+
+    Args:
+        model_name: Model identifier string (e.g. "mlx-community/Qwen3-4B-4bit").
+        model: The loaded model object (used to extract config dimensions).
+        kv_bits: KV cache quantization bit-width.
+        kv_group_size: KV cache quantization group size.
+
+    Returns:
+        Hex digest string (32 chars) uniquely identifying this configuration.
+    """
     h = hashlib.blake2b(digest_size=16)
-    for tok in prefix_tokens:
-        h.update(struct.pack("<i", tok))
-    # Separator to distinguish prefix boundary
-    h.update(b"\xff\xff\xff\xff")
-    for tok in block_tokens:
-        h.update(struct.pack("<i", tok))
+    h.update(model_name.encode("utf-8"))
+    h.update(struct.pack("<ii", kv_bits, kv_group_size))
+    if hasattr(model, "config"):
+        cfg = model.config
+        h.update(struct.pack(
+            "<iii",
+            getattr(cfg, "num_hidden_layers", 0),
+            getattr(cfg, "num_key_value_heads", 0),
+            getattr(cfg, "hidden_size", 0),
+        ))
     return h.hexdigest()
 
 
@@ -192,13 +244,13 @@ class KVCacheManager:
         cached_tokens = 0
 
         with self.lock:
+            prev_hash: str | None = None
             for i in range(num_full_blocks):
                 start = i * self.block_size
                 end = start + self.block_size
-                prefix = token_ids[:start]
                 block_tokens = token_ids[start:end]
 
-                block_hash = compute_block_hash(prefix, block_tokens)
+                block_hash = _compute_chain_hash(block_tokens, prev_hash)
 
                 if block_hash not in self.hash_table:
                     break
@@ -217,6 +269,7 @@ class KVCacheManager:
                     )
                     break
 
+                prev_hash = block_hash
                 cached_tokens = end
 
         return cached_tokens
@@ -251,13 +304,22 @@ class KVCacheManager:
         freshly_allocated: list[int] = []
 
         with self.lock:
+            # Build chain hash for prefix blocks (before num_existing_blocks)
+            prev_hash: str | None = None
+            for i in range(num_existing_blocks):
+                start = i * self.block_size
+                end = start + self.block_size
+                if end > num_tokens:
+                    break
+                chunk = token_ids[start:end]
+                prev_hash = _compute_chain_hash(chunk, prev_hash)
+
             for i in range(num_existing_blocks, num_full_blocks):
                 start = i * self.block_size
                 end = start + self.block_size
-                prefix = token_ids[:start]
                 block_tokens = token_ids[start:end]
 
-                block_hash = compute_block_hash(prefix, block_tokens)
+                block_hash = _compute_chain_hash(block_tokens, prev_hash)
                 is_collision = False
 
                 # Check if this block is already cached
@@ -276,6 +338,7 @@ class KVCacheManager:
                             block_hash,
                             block.ref_count,
                         )
+                        prev_hash = block_hash
                         continue
                     else:
                         # Hash collision with different tokens — treat as miss
@@ -338,6 +401,8 @@ class KVCacheManager:
                         block.block_id,
                         block_hash,
                     )
+
+                prev_hash = block_hash
 
         return allocated_block_ids
 
@@ -767,13 +832,13 @@ def decompose_cache_to_blocks(
     num_full_blocks = num_tokens // block_size
     blocks = []
 
+    prev_hash: str | None = None
     for i in range(num_full_blocks):
         start = i * block_size
         end = start + block_size
-        prefix = token_ids[:start]
         block_tokens = token_ids[start:end]
 
-        block_hash = compute_block_hash(prefix, block_tokens)
+        block_hash = _compute_chain_hash(block_tokens, prev_hash)
 
         # Extract KV data from each layer
         kv_data_per_layer = []
@@ -799,6 +864,7 @@ def decompose_cache_to_blocks(
             'token_ids': list(block_tokens),
             'kv_data_per_layer': kv_data_per_layer,
         })
+        prev_hash = block_hash
 
     return blocks
 

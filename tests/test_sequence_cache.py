@@ -1,10 +1,11 @@
 """Tests for SequenceCacheStore (P6.7)."""
 
+import copy
 import threading
 
 import pytest
 
-from mlx_lm_server.sequence_cache import SequenceCacheStore
+from mlx_lm_server.sequence_cache import SequenceCacheStore, _clone_cache_list
 
 
 class TestSequenceCacheStore:
@@ -182,5 +183,133 @@ class TestSequenceCacheStore:
         store.store([], [{"empty": True}])
 
         result, remaining = store.find_longest_prefix([])
+        assert result is not None
+        assert remaining == []
+
+
+# ---------------------------------------------------------------------------
+# D2 — _clone_cache_list (fast clone for plain KVCache)
+# ---------------------------------------------------------------------------
+
+
+class _FakePlainKVCache:
+    """Mock plain KVCache with keys/values/offset (no group_size)."""
+
+    def __init__(self, keys, values, offset, step=None):
+        self.keys = keys
+        self.values = values
+        self.offset = offset
+        if step is not None:
+            self.step = step
+
+
+class _FakeQuantizedKVCache:
+    """Mock QuantizedKVCache with group_size attribute."""
+
+    def __init__(self, data):
+        self.keys = data
+        self.values = data
+        self.offset = 4
+        self.group_size = 64
+
+
+class TestCloneCacheList:
+    """Tests for _clone_cache_list (D2)."""
+
+    def test_plain_kvcache_fast_path(self):
+        """Plain KVCache objects are cloned via slice, not deepcopy."""
+        import mlx.core as mx
+        keys = mx.zeros((1, 2, 8, 4))
+        values = mx.ones((1, 2, 8, 4))
+        obj = _FakePlainKVCache(keys, values, offset=6)
+
+        cloned = _clone_cache_list([obj])
+        assert len(cloned) == 1
+        c = cloned[0]
+        # Should be sliced to offset
+        assert c.keys.shape == (1, 2, 6, 4)
+        assert c.values.shape == (1, 2, 6, 4)
+        assert c.offset == 6
+
+    def test_plain_kvcache_step_copied(self):
+        """Step attribute is copied for plain KVCache."""
+        import mlx.core as mx
+        keys = mx.zeros((1, 2, 8, 4))
+        values = mx.ones((1, 2, 8, 4))
+        obj = _FakePlainKVCache(keys, values, offset=4, step=2)
+
+        cloned = _clone_cache_list([obj])
+        assert hasattr(cloned[0], 'step')
+        assert cloned[0].step == 2
+
+    def test_quantized_kvcache_deepcopy_fallback(self):
+        """QuantizedKVCache falls back to deepcopy."""
+        obj = _FakeQuantizedKVCache(data="test_data")
+        cloned = _clone_cache_list([obj])
+        assert len(cloned) == 1
+        assert cloned[0] is not obj
+        assert hasattr(cloned[0], 'group_size')
+
+    def test_dict_deepcopy_fallback(self):
+        """Dict objects fall back to deepcopy."""
+        obj = {"keys": [1, 2, 3], "values": [4, 5, 6]}
+        cloned = _clone_cache_list([obj])
+        assert cloned[0] is not obj
+        assert cloned[0] == obj
+        # Mutation isolation
+        cloned[0]["keys"].append(99)
+        assert obj["keys"] == [1, 2, 3]
+
+    def test_mixed_list(self):
+        """Mixed list of plain KVCache and dicts is handled correctly."""
+        import mlx.core as mx
+        plain = _FakePlainKVCache(
+            mx.zeros((1, 2, 8, 4)), mx.ones((1, 2, 8, 4)), offset=4
+        )
+        dict_obj = {"keys": [1, 2], "values": [3, 4]}
+
+        cloned = _clone_cache_list([plain, dict_obj])
+        assert len(cloned) == 2
+        assert cloned[0].keys.shape == (1, 2, 4, 4)  # Sliced
+        assert cloned[1] is not dict_obj  # Deepcopied
+
+    def test_clone_independence(self):
+        """Cloned plain KVCache is independent from original."""
+        import mlx.core as mx
+        keys = mx.zeros((1, 2, 8, 4))
+        values = mx.ones((1, 2, 8, 4))
+        obj = _FakePlainKVCache(keys, values, offset=4)
+
+        cloned = _clone_cache_list([obj])
+        # Original and clone should be different objects
+        assert cloned[0] is not obj
+        assert cloned[0].keys is not obj.keys
+
+
+# ---------------------------------------------------------------------------
+# F3 — Dead code annotation verification
+# ---------------------------------------------------------------------------
+
+
+class TestDeadCodeBranch:
+    """Verify the unreachable branch in find_longest_prefix (F3)."""
+
+    def test_longer_cache_branch_unreachable(self):
+        """Stored cache at [A,B,C,D], query [A,B] — should be a miss,
+        not a partial match, because trie stores cache_value only on leaf."""
+        store = SequenceCacheStore(max_entries=10)
+        store.store([1, 2, 3, 4], [{"full": True}])
+
+        # Query shorter than stored — trie only has leaf at depth 4
+        result, remaining = store.find_longest_prefix([1, 2])
+        assert result is None  # No partial match possible
+        assert remaining == [1, 2]
+
+    def test_exact_match_does_not_trigger_longer_branch(self):
+        """Exact match: best_key_len == len(tokens), not > len(tokens)."""
+        store = SequenceCacheStore(max_entries=10)
+        store.store([1, 2, 3], [{"exact": True}])
+
+        result, remaining = store.find_longest_prefix([1, 2, 3])
         assert result is not None
         assert remaining == []
