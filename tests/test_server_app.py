@@ -1913,3 +1913,114 @@ class TestRateLimitAndHealth:
             "2",
         ])
         assert cfg.distributed_mode == "ring"
+
+
+# ===========================================================================
+# TestMiddlewareOrdering — P0-1: Middleware order + concurrency TOCTOU fix
+# ===========================================================================
+
+
+class TestMiddlewareOrdering:
+    """P0-1: Middleware registration order and concurrency TOCTOU fix."""
+
+    @pytest.mark.anyio
+    async def test_unauthenticated_request_does_not_consume_semaphore(self, tokenizer, tmp_path):
+        """With max_concurrent_requests=1 and api_key set, an unauthenticated request
+        should return 401 without consuming a semaphore slot, so a subsequent
+        authenticated request should succeed (not 429)."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_concurrent_requests=1,
+            api_key="test-secret-key",
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Send unauthenticated request — should get 401, NOT consume semaphore
+            resp_unauth = await ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            )
+            assert resp_unauth.status_code == 401, (
+                f"Expected 401 for unauthenticated request, got {resp_unauth.status_code}"
+            )
+
+            # Now send authenticated request — should succeed (not 429)
+            resp_auth = await ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+                headers={"Authorization": "Bearer test-secret-key"},
+            )
+            assert resp_auth.status_code == 200, (
+                f"Expected 200 for authenticated request, got {resp_auth.status_code}. "
+                "If 429, the unauthenticated request consumed a semaphore slot."
+            )
+
+    @pytest.mark.anyio
+    async def test_concurrency_limit_rejects_atomically(self, tokenizer, tmp_path):
+        """Flood requests to verify concurrency limiter uses atomic acquire_nowait
+        (no TOCTOU gap between check and acquire). With max_concurrent_requests=1,
+        exactly one request should proceed and the rest should get 429 immediately
+        without blocking on acquire."""
+        import asyncio
+
+        release_event = asyncio.Event()
+
+        class SlowScheduler(MockSchedulerForApp):
+            def get_result(self, request_id, timeout=None):
+                import time
+                for _ in range(200):  # up to 2 seconds
+                    if release_event.is_set():
+                        break
+                    time.sleep(0.01)
+                return super().get_result(request_id, timeout)
+
+        sched = SlowScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_concurrent_requests=1,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Start one slow request to fill the semaphore
+            task_slow = asyncio.create_task(ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            ))
+            await asyncio.sleep(0.05)
+
+            # Fire 5 concurrent requests — all should get 429 immediately (not block)
+            flood_tasks = [
+                asyncio.create_task(ac.post(
+                    "/v1/completions",
+                    json={"prompt": f"Flood {i}", "max_tokens": 10},
+                ))
+                for i in range(5)
+            ]
+
+            # All flood requests should resolve quickly (within 1s, not waiting 2s)
+            flood_responses = await asyncio.wait_for(
+                asyncio.gather(*flood_tasks),
+                timeout=1.0,
+            )
+            for resp in flood_responses:
+                assert resp.status_code == 429, (
+                    f"Expected 429 for flood request, got {resp.status_code}"
+                )
+
+            # Clean up: release the slow request
+            release_event.set()
+            resp_slow = await task_slow
+            assert resp_slow.status_code == 200

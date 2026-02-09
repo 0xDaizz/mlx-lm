@@ -301,12 +301,93 @@ def create_app(
     # ------------------------------------------------------------------
     # Admission / security middleware
     # ------------------------------------------------------------------
+    # FastAPI middleware is LIFO: last registered runs first (outermost).
+    # We register concurrency_limiter FIRST, then api_key_guard, then
+    # request_size_guard so execution order is:
+    #   request_size_guard (outermost) -> api_key_guard -> concurrency_limiter (innermost)
+    # This ensures auth rejects BEFORE semaphore acquisition, and size
+    # rejects BEFORE auth processing.
+    # ------------------------------------------------------------------
 
     health_bypass_paths = {"/health", "/livez", "/readyz", "/metrics"}
     concurrency_bypass_paths = health_bypass_paths | {"/v1/models"}
     _concurrency_sem: asyncio.Semaphore | None = None
     if config.max_concurrent_requests > 0:
         _concurrency_sem = asyncio.Semaphore(config.max_concurrent_requests)
+
+    def _try_acquire_semaphore(sem: asyncio.Semaphore) -> bool:
+        """Atomically try to acquire a semaphore without awaiting.
+
+        Returns True if acquired, False if no permits available.
+        This avoids the TOCTOU gap between locked() and await acquire().
+        """
+        if sem._value <= 0:
+            return False
+        sem._value -= 1
+        return True
+
+    @app.middleware("http")
+    async def concurrency_limiter(request: Request, call_next):
+        if _concurrency_sem is None:
+            return await call_next(request)
+        # Bypass for health and non-inference endpoints
+        if request.url.path in concurrency_bypass_paths:
+            return await call_next(request)
+        # Atomic non-blocking acquire: no TOCTOU gap between check and acquire
+        if not _try_acquire_semaphore(_concurrency_sem):
+            return JSONResponse(
+                status_code=429,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Server is at capacity, please retry later",
+                        type="rate_limit_error",
+                        code="rate_limit_exceeded",
+                    )
+                ).model_dump(),
+            )
+        try:
+            return await call_next(request)
+        finally:
+            _concurrency_sem.release()
+
+    @app.middleware("http")
+    async def api_key_guard(request: Request, call_next):
+        api_key = app.state.config.api_key
+        if not api_key:
+            return await call_next(request)
+        if request.url.path in health_bypass_paths:
+            return await call_next(request)
+        if not request.url.path.startswith("/v1/"):
+            return await call_next(request)
+
+        auth = request.headers.get("authorization")
+        if auth is None or not auth.startswith("Bearer "):
+            await asyncio.sleep(0.05)
+            return JSONResponse(
+                status_code=401,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Missing or invalid Authorization header",
+                        type="authentication_error",
+                        code="invalid_api_key",
+                    )
+                ).model_dump(),
+            )
+
+        provided = auth[len("Bearer "):].strip()
+        if not hmac.compare_digest(provided, api_key):
+            await asyncio.sleep(0.05)
+            return JSONResponse(
+                status_code=401,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Invalid API key",
+                        type="authentication_error",
+                        code="invalid_api_key",
+                    )
+                ).model_dump(),
+            )
+        return await call_next(request)
 
     @app.middleware("http")
     async def request_size_guard(request: Request, call_next):
@@ -341,68 +422,6 @@ def create_app(
                     ).model_dump(),
                 )
         return await call_next(request)
-
-    @app.middleware("http")
-    async def api_key_guard(request: Request, call_next):
-        api_key = app.state.config.api_key
-        if not api_key:
-            return await call_next(request)
-        if request.url.path in health_bypass_paths:
-            return await call_next(request)
-        if not request.url.path.startswith("/v1/"):
-            return await call_next(request)
-
-        auth = request.headers.get("authorization")
-        if auth is None or not auth.startswith("Bearer "):
-            return JSONResponse(
-                status_code=401,
-                content=ErrorResponse(
-                    error=ErrorDetail(
-                        message="Missing or invalid Authorization header",
-                        type="authentication_error",
-                        code="invalid_api_key",
-                    )
-                ).model_dump(),
-            )
-
-        provided = auth[len("Bearer "):].strip()
-        if not hmac.compare_digest(provided, api_key):
-            return JSONResponse(
-                status_code=401,
-                content=ErrorResponse(
-                    error=ErrorDetail(
-                        message="Invalid API key",
-                        type="authentication_error",
-                        code="invalid_api_key",
-                    )
-                ).model_dump(),
-            )
-        return await call_next(request)
-
-    @app.middleware("http")
-    async def concurrency_limiter(request: Request, call_next):
-        if _concurrency_sem is None:
-            return await call_next(request)
-        # Bypass for health and non-inference endpoints
-        if request.url.path in concurrency_bypass_paths:
-            return await call_next(request)
-        # Non-blocking check: locked() is True when no permits remain
-        if _concurrency_sem.locked():
-            return JSONResponse(
-                status_code=429,
-                content=ErrorResponse(
-                    error=ErrorDetail(
-                        message="Server is at capacity, please retry later",
-                        type="rate_limit_error",
-                        code="rate_limit_exceeded",
-                    )
-                ).model_dump(),
-            )
-        await _concurrency_sem.acquire()
-        try:
-            return await call_next(request)
-        finally:
-            _concurrency_sem.release()
 
     # ------------------------------------------------------------------
     # Error handler
