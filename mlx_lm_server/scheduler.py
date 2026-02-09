@@ -34,6 +34,7 @@ from mlx_lm_server.types import (
 )
 
 import copy
+import pickle
 
 from mlx_lm_server.kv_cache_manager import (
     decompose_cache_to_blocks,
@@ -480,6 +481,13 @@ class Scheduler:
                 else:
                     self._handle_mock_error()
 
+        # Final bus drain: broadcast shutdown to non-rank0 workers
+        if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+            try:
+                self._drain_bus_outbox()
+            except Exception:
+                logger.warning("Failed to drain bus outbox during shutdown", exc_info=True)
+
         logger.info("Inference loop stopped")
 
     def _mock_inference_step(self) -> None:
@@ -518,66 +526,106 @@ class Scheduler:
         """Receive and apply control events from the distributed bus.
 
         Called by non-rank0 workers at the start of each batch inference step.
+        Receives a compound event containing all pending events for this step.
         Returns False if shutdown was received.
         """
         if self._control_bus is None:
             return True
 
         from mlx_lm_server.distributed_bus import ControlEvent
-        event = self._control_bus.recv()
 
-        if event.typ == "submit":
-            request = event.unpack_request()
-            if request is not None:
-                # Apply locally without re-publishing
-                self.request_queue.add(request)
-                with self._results_lock:
-                    self._results[request.request_id] = []
-                    self._results_ready[request.request_id] = threading.Event()
-                self._inc_stat("total_requests")
+        try:
+            raw_event = self._control_bus.recv()
+        except Exception:
+            logger.error("Failed to receive bus event", exc_info=True)
+            return True  # Continue despite error
+
+        # Unpack compound event (list of sub-events)
+        if raw_event.typ == "batch":
+            try:
+                events = pickle.loads(raw_event.payload) if raw_event.payload else []
+            except Exception:
+                logger.error("Failed to deserialize compound bus event", exc_info=True)
+                return True
+        else:
+            # Single event (backward compat or noop fallback)
+            events = [raw_event]
+
+        for event in events:
+            if event.typ == "submit":
+                request = event.unpack_request()
+                if request is not None:
+                    is_streaming = getattr(request, "stream", False)
+                    self.request_queue.add(request)
+                    if not is_streaming:
+                        with self._results_lock:
+                            self._results[request.request_id] = []
+                            self._results_ready[request.request_id] = threading.Event()
+                    self._inc_stat("total_requests")
+                    self._new_request_event.set()
+
+            elif event.typ == "cancel":
+                request_id = event.unpack_request_id()
+                if request_id is not None:
+                    # Try removing from queue first (matching rank0 behavior)
+                    if not self.request_queue.cancel(request_id):
+                        with self._cancelled_lock:
+                            self._cancelled.add(request_id)
+
+            elif event.typ == "shutdown":
+                self._running = False
                 self._new_request_event.set()
+                return False
 
-        elif event.typ == "cancel":
-            request_id = event.unpack_request_id()
-            if request_id is not None:
-                with self._cancelled_lock:
-                    self._cancelled.add(request_id)
+            # "noop" — do nothing
 
-        elif event.typ == "shutdown":
-            self._running = False
-            self._new_request_event.set()
-            return False
-
-        # "noop" — do nothing
         return True
 
     def _drain_bus_outbox(self) -> None:
-        """Rank0: broadcast one queued event to all ranks via the control bus.
+        """Rank0: broadcast all queued events to all ranks via the control bus.
 
-        Called once per inference step from the inference loop thread.
-        Sends a noop if no events are pending, to keep ranks synchronized.
+        Drains the entire outbox and sends all events in a single collective
+        broadcast. This ensures rank>0 workers receive all events atomically,
+        preventing rank divergence in active sequences.
+
+        If no events are pending, sends a noop to keep ranks synchronized.
         """
         if self._control_bus is None:
             return
 
         from mlx_lm_server.distributed_bus import ControlEvent
 
-        try:
-            event = self._bus_outbox.get_nowait()
-        except queue.Empty:
-            event = ControlEvent.noop()
+        # Drain all pending events
+        events: list[ControlEvent] = []
+        while True:
+            try:
+                events.append(self._bus_outbox.get_nowait())
+            except queue.Empty:
+                break
 
-        self._control_bus.publish(event)
+        if not events:
+            events = [ControlEvent.noop()]
+
+        # Broadcast the list of events as a single compound event
+        compound = ControlEvent(typ="batch", payload=pickle.dumps(events))
+        try:
+            self._control_bus.publish(compound)
+        except Exception:
+            logger.error("Failed to broadcast %d bus events", len(events), exc_info=True)
+            # Re-queue events that failed to publish
+            for ev in events:
+                if ev.typ != "noop":
+                    self._bus_outbox.put(ev)
 
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""
         # Distributed bus synchronization (TP mode)
         if self._control_bus is not None and self._dist_ctx is not None:
             if self._dist_ctx.is_rank0:
-                # rank0: broadcast one queued event (or noop)
+                # rank0: broadcast all queued events (or noop) atomically
                 self._drain_bus_outbox()
             else:
-                # rank>0: receive and apply one event
+                # rank>0: receive and apply compound event
                 if not self._apply_bus_events():
                     return  # shutdown received
 

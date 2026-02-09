@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import atexit
 import logging
 
 import uvicorn
@@ -18,10 +17,16 @@ def main() -> None:
 
     # --- Distributed initialization ---
     dist_ctx = init_distributed(config)
+    scheduler = None
 
     try:
         # --- Load model and tokenizer ---
         if dist_ctx.enabled and dist_ctx.world_size > 1:
+            if config.adapter_path is not None:
+                raise ValueError(
+                    "Distributed mode does not support adapter_path. "
+                    "Remove --adapter-path or set --distributed-mode off."
+                )
             from mlx_lm.utils import sharded_load
 
             logger.info(
@@ -123,9 +128,6 @@ def main() -> None:
         )
         scheduler.run_inference_loop()
 
-        # Ensure graceful shutdown even if uvicorn exits without lifespan cleanup
-        atexit.register(scheduler.stop)
-
         # --- Rank-based execution ---
         if not dist_ctx.enabled or dist_ctx.is_rank0:
             # Rank 0 (or single-machine): run HTTP server
@@ -142,6 +144,11 @@ def main() -> None:
             scheduler.join_worker_loop()
 
     finally:
+        if scheduler is not None:
+            try:
+                scheduler.stop()
+            except Exception:
+                logger.warning("Error during scheduler shutdown", exc_info=True)
         finalize_distributed(dist_ctx)
 
 

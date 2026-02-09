@@ -605,7 +605,7 @@ class TestSchedulerBusBroadcast:
         assert event.typ == "shutdown"
 
     def test_drain_outbox_publishes_event(self):
-        """_drain_bus_outbox should publish one queued event via control bus."""
+        """_drain_bus_outbox should publish a compound batch event containing the queued event."""
         published = []
 
         class MockBus:
@@ -626,14 +626,19 @@ class TestSchedulerBusBroadcast:
         # Nothing published yet
         assert len(published) == 0
 
-        # Drain should publish one event
+        # Drain should publish one compound batch event
         scheduler._drain_bus_outbox()
         assert len(published) == 1
-        assert published[0].typ == "submit"
+        assert published[0].typ == "batch"
+        # Unpack the compound event to verify it contains the submit event
+        inner_events = pickle.loads(published[0].payload)
+        assert len(inner_events) == 1
+        assert inner_events[0].typ == "submit"
+        assert inner_events[0].unpack_request().request_id == "drain-test"
         scheduler.stop()
 
     def test_drain_outbox_sends_noop_when_empty(self):
-        """_drain_bus_outbox should send noop when outbox is empty."""
+        """_drain_bus_outbox should send a compound batch event with noop when outbox is empty."""
         published = []
 
         class MockBus:
@@ -644,10 +649,13 @@ class TestSchedulerBusBroadcast:
         ctx = DistributedContext(enabled=True, rank=0, world_size=2)
         scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
 
-        # Outbox is empty — should send noop
+        # Outbox is empty — should send compound batch with noop inside
         scheduler._drain_bus_outbox()
         assert len(published) == 1
-        assert published[0].typ == "noop"
+        assert published[0].typ == "batch"
+        inner_events = pickle.loads(published[0].payload)
+        assert len(inner_events) == 1
+        assert inner_events[0].typ == "noop"
         scheduler.stop()
 
     def test_no_bus_means_no_broadcast(self):
@@ -781,3 +789,280 @@ class TestSSDRankNamespace:
 
         # Each rank gets a unique directory
         assert ssd_dir_r0 != ssd_dir_r1
+
+
+# =========================================================================
+# F. Compound Drain / Apply Bus Events Tests
+# =========================================================================
+
+
+class TestDrainBusOutboxCompound:
+    """Test compound event batching in _drain_bus_outbox."""
+
+    def test_drain_publishes_all_queued_events_as_compound(self):
+        """Multiple queued events should be published as single compound batch."""
+        published = []
+
+        class MockBus:
+            def publish(self, event):
+                published.append(event)
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Queue 3 submit events
+        for i in range(3):
+            req = InferenceRequest(request_id=f"r{i}", prompt_tokens=[i], max_tokens=5)
+            scheduler.submit_request(req)
+
+        # Drain ALL outbox items
+        published.clear()
+        scheduler._drain_bus_outbox()
+
+        # Should be ONE compound event containing all 3 submits
+        assert len(published) == 1
+        assert published[0].typ == "batch"
+        inner = pickle.loads(published[0].payload)
+        assert len(inner) == 3
+        assert all(e.typ == "submit" for e in inner)
+        scheduler.stop()
+
+    def test_drain_requeues_on_publish_failure(self):
+        """If publish fails, events should be re-queued for retry."""
+
+        class FailingBus:
+            def publish(self, event):
+                raise RuntimeError("Network error")
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=FailingBus())
+
+        req = InferenceRequest(request_id="fail-req", prompt_tokens=[1], max_tokens=5)
+        scheduler.submit_request(req)
+
+        # Drain should not raise (caught internally)
+        scheduler._drain_bus_outbox()
+
+        # Event should be re-queued (noop events are not re-queued)
+        assert not scheduler._bus_outbox.empty()
+        scheduler.stop()
+
+    def test_drain_outbox_no_bus_is_noop(self):
+        """_drain_bus_outbox should do nothing if no control_bus."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler._drain_bus_outbox()  # Should not raise
+        scheduler.stop()
+
+
+class TestApplyBusEventsCompound:
+    """Test _apply_bus_events with compound batch events."""
+
+    def test_apply_compound_event_processes_all(self):
+        """Compound batch event should apply all inner events."""
+        events = [
+            ControlEvent.submit(InferenceRequest(
+                request_id="batch-r1", prompt_tokens=[1], max_tokens=5
+            )),
+            ControlEvent.submit(InferenceRequest(
+                request_id="batch-r2", prompt_tokens=[2], max_tokens=5
+            )),
+        ]
+
+        class MockBus:
+            def recv(self):
+                return ControlEvent(typ="batch", payload=pickle.dumps(events))
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+        result = scheduler._apply_bus_events()
+        assert result is True
+        assert scheduler.request_queue.size == 2
+        assert "batch-r1" in scheduler._results
+        assert "batch-r2" in scheduler._results
+        scheduler.stop()
+
+    def test_apply_compound_with_shutdown_stops_early(self):
+        """Compound event with shutdown should stop processing and return False."""
+        events = [
+            ControlEvent.submit(InferenceRequest(
+                request_id="before-shutdown", prompt_tokens=[1], max_tokens=5
+            )),
+            ControlEvent.shutdown(),
+            ControlEvent.submit(InferenceRequest(
+                request_id="after-shutdown", prompt_tokens=[2], max_tokens=5
+            )),
+        ]
+
+        class MockBus:
+            def recv(self):
+                return ControlEvent(typ="batch", payload=pickle.dumps(events))
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+        scheduler._running = True
+        result = scheduler._apply_bus_events()
+        assert result is False
+        assert scheduler._running is False
+        # First submit should have been processed
+        assert "before-shutdown" in scheduler._results
+        scheduler.stop()
+
+
+# =========================================================================
+# G. Additional Apply Bus Events Tests (added to existing class via standalone)
+# =========================================================================
+
+
+class TestApplyBusEventsExtended:
+    """Extended _apply_bus_events tests: streaming, cancel-from-queue, unknown, recv failure."""
+
+    def _make_scheduler(self, mock_bus, rank=1):
+        """Create a scheduler with a mock bus and non-rank0 dist context."""
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=rank, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=mock_bus)
+        return scheduler
+
+    def test_apply_submit_streaming_no_result_buffers(self):
+        """Submit event for streaming request should NOT create result buffers."""
+        class MockBus:
+            def recv(self):
+                req = InferenceRequest(
+                    request_id="stream-req",
+                    prompt_tokens=[1],
+                    max_tokens=5,
+                    stream=True,
+                )
+                return ControlEvent.submit(req)
+
+        scheduler = self._make_scheduler(MockBus())
+        scheduler._apply_bus_events()
+
+        # Streaming request should NOT have result buffers
+        assert "stream-req" not in scheduler._results
+        assert "stream-req" not in scheduler._results_ready
+        # But should be in queue
+        assert scheduler.request_queue.size == 1
+        scheduler.stop()
+
+    def test_apply_cancel_removes_from_queue_first(self):
+        """Cancel event on rank>0 should try removing from queue before adding to _cancelled."""
+        class MockBus:
+            call_count = 0
+            def recv(self):
+                self.call_count += 1
+                if self.call_count == 1:
+                    return ControlEvent.submit(InferenceRequest(
+                        request_id="cancel-target",
+                        prompt_tokens=[1],
+                        max_tokens=5,
+                    ))
+                return ControlEvent.cancel("cancel-target")
+
+        bus = MockBus()
+        scheduler = self._make_scheduler(bus)
+
+        # First: receive submit
+        scheduler._apply_bus_events()
+        assert scheduler.request_queue.size == 1
+
+        # Second: receive cancel -- should remove from queue
+        scheduler._apply_bus_events()
+        assert scheduler.request_queue.size == 0
+        # Should NOT be in _cancelled since it was removed from queue
+        assert "cancel-target" not in scheduler._cancelled
+        scheduler.stop()
+
+    def test_apply_bus_events_unknown_type_returns_true(self):
+        """_apply_bus_events should ignore unknown event types gracefully."""
+        class MockBus:
+            def recv(self):
+                return ControlEvent(typ="unknown_type", payload=None)
+
+        scheduler = self._make_scheduler(MockBus())
+        result = scheduler._apply_bus_events()
+        assert result is True
+        scheduler.stop()
+
+    def test_apply_bus_events_recv_failure_continues(self):
+        """If recv() raises, _apply_bus_events should return True (continue)."""
+        class FailingBus:
+            def recv(self):
+                raise RuntimeError("Connection lost")
+
+        scheduler = self._make_scheduler(FailingBus())
+        result = scheduler._apply_bus_events()
+        assert result is True  # Should continue despite error
+        scheduler.stop()
+
+
+# =========================================================================
+# H. Cancel Active Path -> Outbox Test
+# =========================================================================
+
+
+class TestCancelActiveQueuesOutbox:
+    """Test cancel_request for active requests queues to outbox (rank0)."""
+
+    def test_cancel_active_request_queues_to_outbox(self):
+        """cancel_request for an active request should queue cancel to outbox."""
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Simulate a request that's already active (not in queue)
+        # Need to set up the active sequence properly
+        with scheduler._active_lock:
+            scheduler._active_sequences["active-req"] = object()
+
+        # Drain any existing outbox items from init
+        while not scheduler._bus_outbox.empty():
+            scheduler._bus_outbox.get_nowait()
+
+        scheduler.cancel_request("active-req")
+
+        # Should have queued a cancel event
+        assert not scheduler._bus_outbox.empty()
+        event = scheduler._bus_outbox.get_nowait()
+        assert event.typ == "cancel"
+        assert event.unpack_request_id() == "active-req"
+        scheduler.stop()
+
+
+# =========================================================================
+# I. Backward Compatibility / No Distributed Context Tests
+# =========================================================================
+
+
+class TestSchedulerBackwardCompat:
+    """Verify scheduler works identically without distributed context."""
+
+    def test_full_lifecycle_without_dist(self):
+        """Full submit -> cancel -> stop lifecycle without dist_ctx."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler.run_inference_loop(blocking=False)
+
+        req = InferenceRequest(
+            request_id="compat-test",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=5,
+        )
+        scheduler.submit_request(req)
+        assert scheduler._bus_outbox.empty()
+
+        scheduler.cancel_request("compat-test")
+        assert scheduler._bus_outbox.empty()
+
+        scheduler.stop()
+        assert scheduler._bus_outbox.empty()

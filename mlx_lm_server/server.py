@@ -13,6 +13,7 @@ import queue
 import time
 import uuid
 from contextlib import asynccontextmanager
+from pathlib import Path
 from queue import Queue
 from typing import Any, AsyncIterator, Protocol
 
@@ -880,7 +881,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     if parsed.adapter_path is not None:
         kwargs["adapter_path"] = parsed.adapter_path
     if parsed.ssd_cache_dir is not None:
-        kwargs["ssd_cache_dir"] = parsed.ssd_cache_dir
+        kwargs["ssd_cache_dir"] = Path(parsed.ssd_cache_dir)
     if parsed.max_kv_size is not None:
         kwargs["max_kv_size"] = parsed.max_kv_size
 

@@ -7,14 +7,12 @@ import pickle
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-import mlx.core as mx
-
 if TYPE_CHECKING:
     from .distributed import DistributedContext
 
 logger = logging.getLogger(__name__)
 
-ControlEventType = Literal["submit", "cancel", "shutdown", "noop"]
+ControlEventType = Literal["submit", "cancel", "shutdown", "noop", "batch"]
 
 
 @dataclass
@@ -61,10 +59,13 @@ class DistributedControlBus:
     """
 
     def __init__(self, dist_ctx: DistributedContext) -> None:
+        import mlx.core as mx
+
         self.group = dist_ctx.group
         self.rank = dist_ctx.rank
         self.world_size = dist_ctx.world_size
         self._stream = mx.new_stream(mx.default_device())
+        self._mx = mx
 
     def publish(self, event: ControlEvent) -> None:
         """Rank0 broadcasts an event to all ranks. Must only be called on rank0."""
@@ -73,10 +74,10 @@ class DistributedControlBus:
         self._broadcast_object(event)
 
     def recv(self) -> ControlEvent:
-        """All ranks receive the next event. Blocking collective call.
+        """Receive the next event from rank0. Must only be called on rank>0.
 
-        rank0: call publish() first, then recv() returns the same event.
-        rank>0: blocks until rank0 publishes.
+        Blocks until rank0 calls publish(). The publish() and recv() calls
+        form two halves of the same collective all_sum operations.
         """
         return self._receive_object()
 
@@ -94,8 +95,9 @@ class DistributedControlBus:
 
     def _broadcast_object(self, obj: ControlEvent) -> ControlEvent:
         """Rank0 sends object via all_sum (pickle + size broadcast)."""
+        mx = self._mx
         with mx.stream(self._stream):
-            data = mx.array(list(pickle.dumps(obj)), dtype=mx.uint8)
+            data = mx.array(pickle.dumps(obj), dtype=mx.uint8)
             size_arr = mx.array([data.size], dtype=mx.int32)
             size_arr = mx.distributed.all_sum(size_arr, group=self.group)
             mx.eval(size_arr)
@@ -105,14 +107,20 @@ class DistributedControlBus:
 
     def _receive_object(self) -> ControlEvent:
         """Non-rank0 receives object via all_sum."""
+        mx = self._mx
         with mx.stream(self._stream):
             size_arr = mx.array([0], dtype=mx.int32)
             size_arr = mx.distributed.all_sum(size_arr, group=self.group)
             mx.eval(size_arr)
             size = size_arr.item()
             if size == 0:
+                # Defensive: should not happen since broadcast always sends pickled events
                 return ControlEvent.noop()
             buf = mx.zeros(size, dtype=mx.uint8)
             buf = mx.distributed.all_sum(buf, group=self.group)
             mx.eval(buf)
-            return pickle.loads(bytes(buf.tolist()))
+            try:
+                return pickle.loads(bytes(buf))
+            except Exception:
+                logger.error("Failed to deserialize control event (%d bytes)", size, exc_info=True)
+                return ControlEvent.noop()

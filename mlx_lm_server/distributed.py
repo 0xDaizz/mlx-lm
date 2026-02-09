@@ -39,7 +39,7 @@ def init_distributed(config) -> DistributedContext:
     Returns:
         DistributedContext with group, rank, world_size, and shard groups.
     """
-    mode = getattr(config, "distributed_mode", "off")
+    mode = config.distributed_mode
     if mode == "off":
         logger.info("Distributed mode: off (single-machine)")
         return DistributedContext()
@@ -68,7 +68,11 @@ def init_distributed(config) -> DistributedContext:
     world_size = group.size()
 
     # Determine shard groups based on sharding strategy
-    sharding = getattr(config, "distributed_sharding", "tensor")
+    sharding = config.distributed_sharding
+    if sharding == "pipeline":
+        raise ValueError(
+            "Pipeline sharding is not supported in v1. Use distributed_sharding='tensor'."
+        )
     pipeline_group = group if sharding == "pipeline" and world_size > 1 else None
     tensor_group = group if sharding == "tensor" and world_size > 1 else None
 
