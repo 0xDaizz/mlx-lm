@@ -58,6 +58,10 @@ class ServerConfig:
     request_timeout_s: float = 120.0  # Timeout for inference requests
     first_token_timeout_s: float = 300.0  # Timeout for first token (prefill included)
 
+    # Admission control
+    max_concurrent_requests: int = 64  # Max concurrent inference requests (0 = unlimited)
+    memory_pressure_threshold: float = 0.9  # Reject requests when block utilization >= this
+
     # Distributed
     use_distributed: bool = False  # DEPRECATED: use distributed_mode instead
 

@@ -459,6 +459,7 @@ class TestHealthEndpoint:
         data = resp.json()
         assert data["status"] == "ok"
         assert "cache_stats" in data
+        assert "utilization" in data
 
     @pytest.mark.anyio
     async def test_health_cache_stats_contains_expected_fields(self, client):
@@ -1333,3 +1334,321 @@ class TestHealthDistributed:
         assert data["distributed"]["enabled"] is True
         assert data["distributed"]["rank"] == 1
         assert data["distributed"]["world_size"] == 4
+
+
+# ===========================================================================
+# TestRateLimitAndHealth — T3.2, T3.3, T3.4
+# ===========================================================================
+
+
+class TestRateLimitAndHealth:
+    """Tests for concurrency limiter, memory pressure, and load-aware health."""
+
+    @pytest.mark.anyio
+    async def test_concurrent_limit_429(self, tokenizer, tmp_path):
+        """T3.2: When max_concurrent_requests=1, second concurrent request gets 429."""
+        import asyncio
+
+        # Scheduler that blocks on get_result until told to release
+        release_event = asyncio.Event()
+
+        class SlowScheduler(MockSchedulerForApp):
+            def get_result(self, request_id, timeout=None):
+                # Block in executor — we need sync blocking for run_in_executor
+                import time
+                for _ in range(200):  # up to 2 seconds
+                    if release_event.is_set():
+                        break
+                    time.sleep(0.01)
+                return super().get_result(request_id, timeout)
+
+        sched = SlowScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_concurrent_requests=1,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Start first (slow) request
+            task1 = asyncio.create_task(ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            ))
+            # Give it a moment to acquire the semaphore
+            await asyncio.sleep(0.05)
+
+            # Second request should get 429
+            resp2 = await ac.post(
+                "/v1/completions",
+                json={"prompt": "World", "max_tokens": 10},
+            )
+            assert resp2.status_code == 429
+            data = resp2.json()
+            assert data["error"]["type"] == "rate_limit_error"
+            assert data["error"]["code"] == "rate_limit_exceeded"
+            assert "capacity" in data["error"]["message"].lower()
+
+            # Release slow request and let it finish
+            release_event.set()
+            resp1 = await task1
+            assert resp1.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_health_bypasses_concurrency_limit(self, tokenizer, tmp_path):
+        """T3.2: /health endpoint bypasses the concurrency limiter."""
+        import asyncio
+
+        release_event = asyncio.Event()
+
+        class SlowScheduler(MockSchedulerForApp):
+            def get_result(self, request_id, timeout=None):
+                import time
+                for _ in range(200):
+                    if release_event.is_set():
+                        break
+                    time.sleep(0.01)
+                return super().get_result(request_id, timeout)
+
+        sched = SlowScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_concurrent_requests=1,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Start slow inference request (fills semaphore)
+            task1 = asyncio.create_task(ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            ))
+            await asyncio.sleep(0.05)
+
+            # Health should still work even with semaphore full
+            resp_health = await ac.get("/health")
+            assert resp_health.status_code == 200
+
+            release_event.set()
+            await task1
+
+    @pytest.mark.anyio
+    async def test_memory_pressure_503(self, tokenizer, tmp_path):
+        """T3.3: High memory pressure returns 503."""
+
+        class HighPressureScheduler(MockSchedulerForApp):
+            def get_cache_stats(self):
+                return {
+                    "total_blocks": 100,
+                    "used_blocks": 95,  # 95% utilization >= 0.9 threshold
+                    "free_blocks": 5,
+                    "hit_rate": 0.5,
+                }
+
+        sched = HighPressureScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            memory_pressure_threshold=0.9,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # Chat completions
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 10,
+                },
+            )
+            assert resp.status_code == 503
+            data = resp.json()
+            assert data["error"]["code"] == "memory_pressure"
+            assert "memory pressure" in data["error"]["message"].lower()
+
+            # Text completions also affected
+            resp2 = await ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            )
+            assert resp2.status_code == 503
+
+    @pytest.mark.anyio
+    async def test_memory_pressure_below_threshold_ok(self, tokenizer, tmp_path):
+        """T3.3: Below memory pressure threshold, requests succeed."""
+
+        class LowPressureScheduler(MockSchedulerForApp):
+            def get_cache_stats(self):
+                return {
+                    "total_blocks": 100,
+                    "used_blocks": 50,  # 50% utilization < 0.9 threshold
+                    "free_blocks": 50,
+                    "hit_rate": 0.5,
+                }
+
+        sched = LowPressureScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            memory_pressure_threshold=0.9,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            )
+            assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_health_status_ok(self, tokenizer, tmp_path):
+        """T3.4: Low utilization returns status=ok with 200."""
+        sched = MockSchedulerForApp()  # 0% utilization by default
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            memory_pressure_threshold=0.9,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "ok"
+        assert data["utilization"] == 0.0
+
+    @pytest.mark.anyio
+    async def test_health_status_degraded(self, tokenizer, tmp_path):
+        """T3.4: ~80% utilization returns status=degraded with 200."""
+
+        class DegradedScheduler(MockSchedulerForApp):
+            def get_cache_stats(self):
+                return {
+                    "total_blocks": 100,
+                    "used_blocks": 75,  # 75% >= 0.9*0.8=72%, < 90%
+                    "free_blocks": 25,
+                    "hit_rate": 0.5,
+                }
+
+        sched = DegradedScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            memory_pressure_threshold=0.9,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "degraded"
+        assert data["utilization"] == 0.75
+
+    @pytest.mark.anyio
+    async def test_health_status_overloaded(self, tokenizer, tmp_path):
+        """T3.4: >90% utilization returns status=overloaded with 503."""
+
+        class OverloadedScheduler(MockSchedulerForApp):
+            def get_cache_stats(self):
+                return {
+                    "total_blocks": 100,
+                    "used_blocks": 95,  # 95% >= 90% threshold
+                    "free_blocks": 5,
+                    "hit_rate": 0.5,
+                }
+
+        sched = OverloadedScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            memory_pressure_threshold=0.9,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "overloaded"
+        assert data["utilization"] == 0.95
+
+    @pytest.mark.anyio
+    async def test_health_status_shutting_down(self, tokenizer, tmp_path):
+        """T3.4: Shutting down returns status=shutting_down with 503."""
+        sched = MockSchedulerForApp()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        app.state.shutting_down = True
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "shutting_down"
+
+    def test_config_defaults(self):
+        """T3.2+T3.3: Config defaults for admission control."""
+        cfg = ServerConfig()
+        assert cfg.max_concurrent_requests == 64
+        assert cfg.memory_pressure_threshold == 0.9
+
+    def test_cli_max_concurrent_requests(self):
+        """T3.2: CLI --max-concurrent-requests is parsed correctly."""
+        from mlx_lm_server.server import parse_args
+        cfg = parse_args(["--max-concurrent-requests", "32"])
+        assert cfg.max_concurrent_requests == 32
+
+    def test_cli_memory_pressure_threshold(self):
+        """T3.3: CLI --memory-pressure-threshold is parsed correctly."""
+        from mlx_lm_server.server import parse_args
+        cfg = parse_args(["--memory-pressure-threshold", "0.8"])
+        assert cfg.memory_pressure_threshold == 0.8

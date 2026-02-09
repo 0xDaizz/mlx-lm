@@ -297,6 +297,34 @@ def create_app(
     app.state.dist_ctx = dist_ctx
 
     # ------------------------------------------------------------------
+    # T3.2: Concurrency limiter
+    # ------------------------------------------------------------------
+    _concurrency_sem = asyncio.Semaphore(config.max_concurrent_requests)
+
+    @app.middleware("http")
+    async def concurrency_limiter(request: Request, call_next):
+        # Bypass for health and non-inference endpoints
+        if request.url.path in ("/health", "/v1/models"):
+            return await call_next(request)
+        # Non-blocking check: locked() is True when no permits remain
+        if _concurrency_sem.locked():
+            return JSONResponse(
+                status_code=429,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Server is at capacity, please retry later",
+                        type="rate_limit_error",
+                        code="rate_limit_exceeded",
+                    )
+                ).model_dump(),
+            )
+        await _concurrency_sem.acquire()
+        try:
+            return await call_next(request)
+        finally:
+            _concurrency_sem.release()
+
+    # ------------------------------------------------------------------
     # Error handler
     # ------------------------------------------------------------------
 
@@ -339,6 +367,19 @@ def create_app(
                 )
             ).model_dump(),
         )
+
+    # ------------------------------------------------------------------
+    # T3.3: Memory pressure admission control
+    # ------------------------------------------------------------------
+
+    def _check_memory_pressure() -> bool:
+        """Return True if memory pressure exceeds threshold."""
+        stats = scheduler.get_cache_stats()
+        total = stats.get("total_blocks", 0)
+        if total == 0:
+            return False
+        used = stats.get("used_blocks", 0)
+        return used / total >= config.memory_pressure_threshold
 
     # ------------------------------------------------------------------
     # Common non-streaming inference helper
@@ -447,6 +488,18 @@ def create_app(
             app.state.shutting_down, app.state.model_name,
         )
 
+        if _check_memory_pressure():
+            return JSONResponse(
+                status_code=503,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Server under memory pressure, please retry later",
+                        type="server_error",
+                        code="memory_pressure",
+                    )
+                ).model_dump(),
+            )
+
         inf_req = InferenceRequest(
             request_id=request_id,
             prompt_tokens=prompt_tokens,
@@ -486,6 +539,18 @@ def create_app(
             body, app.state.config, prompt_tokens,
             app.state.shutting_down, app.state.model_name,
         )
+
+        if _check_memory_pressure():
+            return JSONResponse(
+                status_code=503,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Server under memory pressure, please retry later",
+                        type="server_error",
+                        code="memory_pressure",
+                    )
+                ).model_dump(),
+            )
 
         inf_req = InferenceRequest(
             request_id=request_id,
@@ -528,15 +593,50 @@ def create_app(
         sched = app.state.scheduler
         cache_stats = sched.get_cache_stats()
         dist = app.state.dist_ctx
-        return {
-            "status": "ok",
-            "cache_stats": cache_stats,
-            "distributed": {
-                "enabled": dist.enabled if dist else False,
-                "rank": dist.rank if dist and dist.enabled else None,
-                "world_size": dist.world_size if dist and dist.enabled else None,
+
+        # T3.4: Determine load-aware status
+        if app.state.shutting_down:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "status": "shutting_down",
+                    "cache_stats": cache_stats,
+                    "distributed": {
+                        "enabled": dist.enabled if dist else False,
+                        "rank": dist.rank if dist and dist.enabled else None,
+                        "world_size": dist.world_size if dist and dist.enabled else None,
+                    },
+                },
+            )
+
+        total_blocks = cache_stats.get("total_blocks", 0)
+        used_blocks = cache_stats.get("used_blocks", 0)
+        utilization = used_blocks / total_blocks if total_blocks > 0 else 0.0
+
+        threshold = config.memory_pressure_threshold
+        if utilization >= threshold:
+            status = "overloaded"
+            status_code = 503
+        elif utilization >= threshold * 0.8:
+            status = "degraded"
+            status_code = 200
+        else:
+            status = "ok"
+            status_code = 200
+
+        return JSONResponse(
+            status_code=status_code,
+            content={
+                "status": status,
+                "utilization": utilization,
+                "cache_stats": cache_stats,
+                "distributed": {
+                    "enabled": dist.enabled if dist else False,
+                    "rank": dist.rank if dist and dist.enabled else None,
+                    "world_size": dist.world_size if dist and dist.enabled else None,
+                },
             },
-        }
+        )
 
     return app
 
@@ -875,6 +975,10 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--max-generation-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout-s", type=float, default=120.0)
     parser.add_argument("--first-token-timeout-s", type=float, default=300.0)
+    parser.add_argument("--max-concurrent-requests", type=int, default=64,
+                        help="Max concurrent inference requests (0 = unlimited)")
+    parser.add_argument("--memory-pressure-threshold", type=float, default=0.9,
+                        help="Reject requests when block utilization >= this (0.0-1.0)")
 
     # Distributed / Tensor Parallel
     parser.add_argument("--distributed-mode", type=str, default="off",
@@ -922,6 +1026,10 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--max-queue-size must be > 0")
     if parsed.prefill_batch_size > parsed.max_batch_size:
         parser.error("--prefill-batch-size cannot exceed --max-batch-size")
+    if parsed.max_concurrent_requests < 0:
+        parser.error("--max-concurrent-requests must be >= 0")
+    if not (0.0 <= parsed.memory_pressure_threshold <= 1.0):
+        parser.error("--memory-pressure-threshold must be between 0.0 and 1.0")
 
     # Distributed validation
     if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None:
@@ -983,6 +1091,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "max_generation_tokens": parsed.max_generation_tokens,
         "request_timeout_s": parsed.request_timeout_s,
         "first_token_timeout_s": parsed.first_token_timeout_s,
+        "max_concurrent_requests": parsed.max_concurrent_requests,
+        "memory_pressure_threshold": parsed.memory_pressure_threshold,
         "distributed_mode": parsed.distributed_mode,
         "distributed_sharding": parsed.distributed_sharding,
         "distributed_strict": parsed.distributed_strict,
