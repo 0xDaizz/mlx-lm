@@ -37,6 +37,17 @@ class ControlEvent:
     def noop(cls) -> ControlEvent:
         return cls(typ="noop")
 
+    @classmethod
+    def batch(cls, events: list["ControlEvent"]) -> "ControlEvent":
+        """Create a compound batch event containing multiple sub-events."""
+        return cls(typ="batch", payload=pickle.dumps(events))
+
+    def unpack_batch(self) -> list["ControlEvent"]:
+        """Deserialize payload as a list of ControlEvents."""
+        if self.payload is None:
+            return []
+        return pickle.loads(self.payload)
+
     def unpack_request(self):
         """Deserialize payload as InferenceRequest."""
         if self.payload is None:

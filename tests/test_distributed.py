@@ -476,9 +476,9 @@ class TestApplyBusEvents:
         scheduler._apply_bus_events()
         # Verify request was added to the request queue
         assert scheduler.request_queue.size == 1
-        # Verify result buffers were set up
-        assert "remote-req" in scheduler._results
-        assert "remote-req" in scheduler._results_ready
+        # Verify result buffers were NOT set up (U1: rank>0 workers don't create them)
+        assert "remote-req" not in scheduler._results
+        assert "remote-req" not in scheduler._results_ready
         # Verify stats incremented
         assert scheduler._stats["total_requests"] == 1
         scheduler.stop()
@@ -881,8 +881,9 @@ class TestApplyBusEventsCompound:
         result = scheduler._apply_bus_events()
         assert result is True
         assert scheduler.request_queue.size == 2
-        assert "batch-r1" in scheduler._results
-        assert "batch-r2" in scheduler._results
+        # rank>0 workers don't create result buffers (U1 fix)
+        assert "batch-r1" not in scheduler._results
+        assert "batch-r2" not in scheduler._results
         scheduler.stop()
 
     def test_apply_compound_with_shutdown_stops_early(self):
@@ -908,8 +909,8 @@ class TestApplyBusEventsCompound:
         result = scheduler._apply_bus_events()
         assert result is False
         assert scheduler._running is False
-        # First submit should have been processed
-        assert "before-shutdown" in scheduler._results
+        # First submit should have been processed (request in queue)
+        assert scheduler.request_queue.size == 1
         scheduler.stop()
 
 
@@ -1066,3 +1067,336 @@ class TestSchedulerBackwardCompat:
 
         scheduler.stop()
         assert scheduler._bus_outbox.empty()
+
+
+# =========================================================================
+# J. ControlEvent.batch() Factory Tests (F5)
+# =========================================================================
+
+
+class TestControlEventBatch:
+    """Test ControlEvent.batch() factory method (F5)."""
+
+    def test_control_event_batch_factory(self):
+        """batch() creates an event with typ='batch' and correct payload."""
+        events = [
+            ControlEvent.submit(InferenceRequest(
+                request_id="b1", prompt_tokens=[1], max_tokens=5
+            )),
+            ControlEvent.cancel("b2"),
+            ControlEvent.noop(),
+        ]
+        batch_event = ControlEvent.batch(events)
+        assert batch_event.typ == "batch"
+        assert batch_event.payload is not None
+        # Verify the payload is the correct list
+        unpacked = batch_event.unpack_batch()
+        assert len(unpacked) == 3
+        assert unpacked[0].typ == "submit"
+        assert unpacked[1].typ == "cancel"
+        assert unpacked[2].typ == "noop"
+
+    def test_control_event_batch_roundtrip(self):
+        """Batch event should survive pickle roundtrip (simulating bus transport)."""
+        events = [
+            ControlEvent.submit(InferenceRequest(
+                request_id="rt1", prompt_tokens=[10, 20], max_tokens=50
+            )),
+            ControlEvent.shutdown(),
+        ]
+        batch_event = ControlEvent.batch(events)
+
+        # Simulate pickle roundtrip (as happens in bus transport)
+        serialized = pickle.dumps(batch_event)
+        deserialized = pickle.loads(serialized)
+
+        assert deserialized.typ == "batch"
+        unpacked = deserialized.unpack_batch()
+        assert len(unpacked) == 2
+        assert unpacked[0].typ == "submit"
+        req = unpacked[0].unpack_request()
+        assert req.request_id == "rt1"
+        assert req.prompt_tokens == [10, 20]
+        assert unpacked[1].typ == "shutdown"
+
+    def test_control_event_batch_empty(self):
+        """batch() with empty list should still work."""
+        batch_event = ControlEvent.batch([])
+        assert batch_event.typ == "batch"
+        unpacked = batch_event.unpack_batch()
+        assert unpacked == []
+
+    def test_unpack_batch_none_payload(self):
+        """unpack_batch() with None payload should return empty list."""
+        event = ControlEvent(typ="batch", payload=None)
+        assert event.unpack_batch() == []
+
+
+# =========================================================================
+# K. Bus Cancel Cleans Result Buffers (U6)
+# =========================================================================
+
+
+class TestBusCancelCleansBuffers:
+    """Test that cancel in _apply_bus_events cleans result buffers (U6)."""
+
+    def test_bus_cancel_from_queue_cleans_buffers(self):
+        """When cancel event removes a request from queue on worker rank,
+        result buffers should be cleaned up."""
+
+        class MockBus:
+            call_count = 0
+            def recv(self):
+                self.call_count += 1
+                if self.call_count == 1:
+                    # First: submit a non-streaming request
+                    return ControlEvent.submit(InferenceRequest(
+                        request_id="clean-target",
+                        prompt_tokens=[1, 2],
+                        max_tokens=5,
+                    ))
+                # Second: cancel it
+                return ControlEvent.cancel("clean-target")
+
+        bus = MockBus()
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=bus)
+
+        # First apply: submit adds to queue (U1: rank>0 doesn't create result buffers)
+        scheduler._apply_bus_events()
+        assert "clean-target" not in scheduler._results
+        assert "clean-target" not in scheduler._results_ready
+        assert scheduler.request_queue.size == 1
+
+        # Second apply: cancel removes from queue
+        scheduler._apply_bus_events()
+        assert scheduler.request_queue.size == 0
+        # Result buffers were never created (U1 fix)
+        assert "clean-target" not in scheduler._results
+        assert "clean-target" not in scheduler._results_ready
+        scheduler.stop()
+
+
+# =========================================================================
+# L. Commit 3 Fixes — U1, U3, U4, U5
+# =========================================================================
+
+
+class TestWorkerResultBufferLeak:
+    """U1: Workers (rank>0) should NOT create result buffers on submit events."""
+
+    def test_worker_no_result_buffers_for_submit(self):
+        """rank>0 scheduler should not create _results/_results_ready on submit."""
+        class MockBus:
+            def recv(self):
+                req = InferenceRequest(
+                    request_id="worker-req",
+                    prompt_tokens=[1, 2, 3],
+                    max_tokens=10,
+                )
+                return ControlEvent.submit(req)
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+        scheduler._apply_bus_events()
+
+        # Request should be in queue but no result buffers
+        assert scheduler.request_queue.size == 1
+        assert "worker-req" not in scheduler._results
+        assert "worker-req" not in scheduler._results_ready
+        scheduler.stop()
+
+    def test_rank0_still_creates_result_buffers(self):
+        """rank0 scheduler should still create result buffers on submit via _apply_bus_events."""
+        class MockBus:
+            def recv(self):
+                req = InferenceRequest(
+                    request_id="rank0-req",
+                    prompt_tokens=[1, 2, 3],
+                    max_tokens=10,
+                )
+                return ControlEvent.submit(req)
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+        scheduler._apply_bus_events()
+
+        # rank0 should have result buffers
+        assert "rank0-req" in scheduler._results
+        assert "rank0-req" in scheduler._results_ready
+        scheduler.stop()
+
+
+class TestBusErrorThreshold:
+    """U3: Bus consecutive errors should trigger distributed shutdown."""
+
+    def test_bus_error_count_triggers_shutdown(self):
+        """Consecutive bus recv failures should set _dist_fatal and stop running."""
+        from mlx_lm_server.scheduler import BUS_ERROR_THRESHOLD
+
+        class FailingBus:
+            def recv(self):
+                raise RuntimeError("Bus connection lost")
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=FailingBus())
+        scheduler._running = True
+
+        # Call _apply_bus_events BUS_ERROR_THRESHOLD times
+        for i in range(BUS_ERROR_THRESHOLD - 1):
+            result = scheduler._apply_bus_events()
+            assert result is True  # Not yet at threshold
+            assert scheduler._running is True
+
+        # The threshold-reaching call should return False and set _dist_fatal
+        result = scheduler._apply_bus_events()
+        assert result is False
+        assert scheduler._running is False
+        assert scheduler._dist_fatal is True
+        assert scheduler._dist_fatal_reason == "bus_error_threshold"
+        scheduler.stop()
+
+    def test_bus_error_count_resets_on_success(self):
+        """Successful recv should reset _bus_error_count to 0."""
+        class FlakeyBus:
+            call_count = 0
+            def recv(self):
+                self.call_count += 1
+                if self.call_count <= 5:
+                    raise RuntimeError("Temporary failure")
+                return ControlEvent.noop()
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        bus = FlakeyBus()
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=bus)
+        scheduler._running = True
+
+        # 5 failures
+        for _ in range(5):
+            scheduler._apply_bus_events()
+        assert scheduler._bus_error_count == 5
+
+        # 1 success should reset
+        scheduler._apply_bus_events()
+        assert scheduler._bus_error_count == 0
+        scheduler.stop()
+
+    def test_publish_error_threshold_triggers_shutdown(self):
+        """Consecutive publish failures should also trigger shutdown."""
+        from mlx_lm_server.scheduler import BUS_ERROR_THRESHOLD
+
+        class FailingBus:
+            def publish(self, event):
+                raise RuntimeError("Publish failed")
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=FailingBus())
+        scheduler._running = True
+
+        # Each drain call increments bus_error_count
+        for i in range(BUS_ERROR_THRESHOLD):
+            scheduler._drain_bus_outbox()
+
+        assert scheduler._dist_fatal is True
+        assert scheduler._running is False
+        scheduler.stop()
+
+    def test_submit_rejects_when_dist_fatal(self):
+        """submit_request should raise RuntimeError when _dist_fatal is True."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler._dist_fatal = True
+
+        req = InferenceRequest(
+            request_id="rejected-req",
+            prompt_tokens=[1],
+            max_tokens=5,
+        )
+        with pytest.raises(RuntimeError, match="Distributed control plane degraded"):
+            scheduler.submit_request(req)
+        scheduler.stop()
+
+
+class TestWorldSize1FailFast:
+    """U4: distributed_mode != 'off' but world_size==1 should fail-fast."""
+
+    def test_world_size_1_raises_runtime_error(self):
+        """init_distributed should raise when world_size==1 with ring/jaccl mode."""
+        from unittest.mock import MagicMock, patch
+
+        config = ServerConfig(
+            distributed_mode="ring",
+            distributed_hostfile="/tmp/hosts.json",
+        )
+
+        # Mock mx.distributed.init to return a group with world_size=1
+        mock_group = MagicMock()
+        mock_group.rank.return_value = 0
+        mock_group.size.return_value = 1
+
+        with patch.dict("sys.modules", {"mlx": MagicMock(), "mlx.core": MagicMock()}):
+            import mlx.core as mx_mock
+            mx_mock.distributed.init.return_value = mock_group
+
+            with patch("mlx_lm_server.distributed.mx", create=True):
+                # We need to patch the import inside init_distributed
+                with patch.dict("sys.modules", {"mlx.core": mx_mock}):
+                    with pytest.raises(RuntimeError, match="world_size=1"):
+                        init_distributed(config)
+
+
+class TestJoinWorkerLoopTimeout:
+    """U5: join_worker_loop with timeout should set worker_timed_out flag."""
+
+    def test_join_worker_loop_timeout_sets_flag(self):
+        """join_worker_loop should set worker_timed_out=True when thread doesn't exit."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+
+        # Create a thread that never exits (blocked on an event)
+        blocker = threading.Event()
+
+        def blocked_loop():
+            blocker.wait()  # Block forever until set
+
+        scheduler._inference_thread = threading.Thread(target=blocked_loop, daemon=True)
+        scheduler._inference_thread.start()
+
+        # join_worker_loop with very short timeout
+        scheduler.join_worker_loop(timeout=0.1)
+
+        assert scheduler.worker_timed_out is True
+
+        # Clean up
+        blocker.set()
+        scheduler._inference_thread.join(timeout=2.0)
+        scheduler.stop()
+
+    def test_join_worker_loop_no_timeout_clears_flag(self):
+        """join_worker_loop should set worker_timed_out=False when thread exits normally."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler.run_inference_loop(blocking=False)
+        assert scheduler._inference_thread is not None
+
+        # Stop the loop so the thread exits
+        scheduler._running = False
+        scheduler._new_request_event.set()
+
+        scheduler.join_worker_loop(timeout=5.0)
+        assert scheduler.worker_timed_out is False
+        scheduler.stop()
+
+    def test_join_worker_loop_no_thread_no_timeout(self):
+        """join_worker_loop without inference thread should not set timeout flag."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler.join_worker_loop(timeout=1.0)
+        assert scheduler.worker_timed_out is False
+        scheduler.stop()

@@ -19,7 +19,7 @@ from typing import Any, AsyncIterator, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import InferenceRequest, TokenEvent
@@ -87,6 +87,13 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     stream: bool = False
     stop: list[str] | str | None = None
+
+    @field_validator('messages')
+    @classmethod
+    def messages_must_not_be_empty(cls, v):
+        if len(v) == 0:
+            raise ValueError('messages must not be empty')
+        return v
 
 
 class CompletionRequest(BaseModel):
@@ -226,7 +233,7 @@ def _validate_and_prepare_request(
     # 5-7. Clamp generation parameters
     temperature = max(0.0, min(2.0, body.temperature))
     top_p = max(0.0, min(1.0, body.top_p))
-    max_tokens = max(1, body.max_tokens)
+    max_tokens = min(max(1, body.max_tokens), config.max_generation_tokens)
 
     # 8. Normalize stop sequences
     stop_sequences = _normalize_stop(body.stop)
@@ -332,6 +339,8 @@ def create_app(
         try:
             sched.submit_request(inf_req)
         except RuntimeError as e:
+            if "Distributed control plane degraded" in str(e):
+                raise HTTPException(status_code=503, detail=str(e))
             raise HTTPException(status_code=429, detail=str(e))
 
         # Track whether we successfully built the response.  If not,
@@ -626,7 +635,10 @@ def _stream_response(
             try:
                 scheduler.submit_request(inf_req)
             except RuntimeError as e:
-                error_data = {"error": {"message": str(e), "type": "rate_limit_error"}}
+                if "Distributed control plane degraded" in str(e):
+                    error_data = {"error": {"message": str(e), "type": "server_error"}}
+                else:
+                    error_data = {"error": {"message": str(e), "type": "rate_limit_error"}}
                 yield f"data: {json.dumps(error_data)}\n\n"
                 return
 
@@ -777,6 +789,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--max-kv-size", type=int, default=None)
     parser.add_argument("--sequence-cache-size", type=int, default=50)
     parser.add_argument("--max-prompt-tokens", type=int, default=32768)
+    parser.add_argument("--max-generation-tokens", type=int, default=32768)
     parser.add_argument("--request-timeout-s", type=float, default=120.0)
     parser.add_argument("--first-token-timeout-s", type=float, default=300.0)
 
@@ -812,6 +825,16 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--ssd-persistent-max-retries must be >= 0")
     if parsed.ssd_flush_interval_s <= 0:
         parser.error("--ssd-flush-interval-s must be > 0")
+
+    # Core numeric parameter validation
+    if parsed.block_size <= 0:
+        parser.error("--block-size must be > 0")
+    if parsed.num_blocks <= 0:
+        parser.error("--num-blocks must be > 0")
+    if parsed.max_batch_size <= 0:
+        parser.error("--max-batch-size must be > 0")
+    if parsed.max_queue_size <= 0:
+        parser.error("--max-queue-size must be > 0")
 
     # Distributed validation
     if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None:
@@ -864,6 +887,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "completion_batch_size": parsed.completion_batch_size,
         "sequence_cache_size": parsed.sequence_cache_size,
         "max_prompt_tokens": parsed.max_prompt_tokens,
+        "max_generation_tokens": parsed.max_generation_tokens,
         "request_timeout_s": parsed.request_timeout_s,
         "first_token_timeout_s": parsed.first_token_timeout_s,
         "distributed_mode": parsed.distributed_mode,

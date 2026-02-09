@@ -122,3 +122,51 @@ class TestParseArgsSSD:
         assert config.ssd_writer_queue_size == 256
         assert config.ssd_persistent_max_retries == 5
         assert config.ssd_flush_interval_s == 0.5
+
+
+class TestParseArgsGenerationTokens:
+    """F1: --max-generation-tokens CLI argument."""
+
+    def test_default_max_generation_tokens(self):
+        config = parse_args([])
+        assert config.max_generation_tokens == 32768
+
+    def test_max_generation_tokens_cli_arg(self):
+        config = parse_args(["--max-generation-tokens", "4096"])
+        assert config.max_generation_tokens == 4096
+
+
+class TestParseArgsRangeValidation:
+    """U12: Core numeric params must be > 0."""
+
+    def test_parse_args_rejects_zero_block_size(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--block-size", "0"])
+
+    def test_parse_args_rejects_negative_block_size(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--block-size", "-1"])
+
+    def test_parse_args_rejects_zero_num_blocks(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--num-blocks", "0"])
+
+    def test_parse_args_rejects_zero_max_batch_size(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--max-batch-size", "0"])
+
+    def test_parse_args_rejects_zero_max_queue_size(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--max-queue-size", "0"])
+
+    def test_parse_args_accepts_valid_values(self):
+        config = parse_args([
+            "--block-size", "32",
+            "--num-blocks", "1024",
+            "--max-batch-size", "4",
+            "--max-queue-size", "64",
+        ])
+        assert config.block_size == 32
+        assert config.num_blocks == 1024
+        assert config.max_batch_size == 4
+        assert config.max_queue_size == 64

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import sys
 
 import uvicorn
 
-from mlx_lm_server.distributed import finalize_distributed, init_distributed
+from mlx_lm_server.distributed import DistributedContext, finalize_distributed, init_distributed
 from mlx_lm_server.server import create_app, parse_args
 
 logger = logging.getLogger(__name__)
@@ -16,10 +17,12 @@ def main() -> None:
     config = parse_args()
 
     # --- Distributed initialization ---
-    dist_ctx = init_distributed(config)
+    dist_ctx = DistributedContext()  # default disabled
     scheduler = None
 
     try:
+        dist_ctx = init_distributed(config)
+
         # --- Load model and tokenizer ---
         if dist_ctx.enabled and dist_ctx.world_size > 1:
             if config.adapter_path is not None:
@@ -141,8 +144,18 @@ def main() -> None:
                 "Rank %d: waiting for inference loop (no HTTP server)",
                 dist_ctx.rank,
             )
-            scheduler.join_worker_loop()
+            scheduler.join_worker_loop(timeout=300.0)
+            if scheduler.worker_timed_out:
+                logger.critical(
+                    "Rank %d: worker loop timed out — force exiting",
+                    dist_ctx.rank,
+                )
+                import os
+                os._exit(1)
 
+    except RuntimeError as e:
+        logger.critical("Fatal error: %s", e)
+        sys.exit(1)
     finally:
         if scheduler is not None:
             try:

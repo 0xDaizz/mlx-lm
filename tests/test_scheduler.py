@@ -1044,3 +1044,69 @@ class TestCancelGetResultContract:
         finally:
             gate.set()
             s.stop()
+
+
+# ---------------------------------------------------------------------------
+# F4  Cancel frees KV cache blocks
+# ---------------------------------------------------------------------------
+
+
+class TestCancelFreesKVBlocks:
+    """Test that cancelling a request frees its KV cache blocks (F4)."""
+
+    def test_cancel_frees_kv_blocks(self):
+        """When a request is cancelled mid-generation, its KV blocks must be freed."""
+        from unittest.mock import MagicMock
+
+        mock_cache_mgr = MagicMock()
+        mock_cache_mgr.find_cached_prefix = MagicMock(return_value=0)
+
+        config = _make_config(max_batch_size=2)
+        s = Scheduler(
+            config=config,
+            model=None,
+            tokenizer=None,
+            kv_cache_manager=mock_cache_mgr,
+        )
+
+        # Use a gate to keep the request active long enough to cancel
+        gate = threading.Event()
+
+        def slow_gen(rid, tids, step):
+            if step == 0:
+                gate.wait(timeout=5.0)
+            return (step + 1, f"t{step}", None if step < 5 else "stop")
+
+        s._mock_generate = slow_gen
+
+        req = _make_request("cancel-blocks", max_tokens=100)
+        s.submit_request(req)
+        s.run_inference_loop(blocking=False)
+
+        # Wait for the request to become active
+        deadline = time.monotonic() + 3.0
+        while s.num_active_sequences == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert s.num_active_sequences > 0
+
+        # Inject block_ids into the active sequence (simulating allocated blocks)
+        with s._active_lock:
+            seq = s._active_sequences.get("cancel-blocks")
+        if seq is not None:
+            seq.block_ids = [10, 20, 30]
+
+        # Cancel the request
+        s.cancel_request("cancel-blocks")
+
+        # Release the gate so the inference loop processes the cancellation
+        gate.set()
+
+        # Wait for cleanup
+        deadline = time.monotonic() + 3.0
+        while s.num_active_sequences > 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Verify free_blocks was called with the block_ids
+        mock_cache_mgr.free_blocks.assert_called_with([10, 20, 30])
+
+        s.stop()

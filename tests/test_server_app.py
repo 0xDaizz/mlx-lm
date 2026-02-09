@@ -368,8 +368,8 @@ class TestValidation:
         assert resp.status_code == 200
 
     @pytest.mark.anyio
-    async def test_empty_messages_list_returns_400(self, client):
-        """Empty messages list produces an empty prompt, which should return 400."""
+    async def test_empty_messages_list_returns_422(self, client):
+        """Empty messages list is rejected by Pydantic field_validator (422)."""
         resp = await client.post(
             "/v1/chat/completions",
             json={
@@ -377,15 +377,7 @@ class TestValidation:
                 "max_tokens": 10,
             },
         )
-        # SimpleTokenizer.apply_chat_template with empty messages produces "assistant:"
-        # which encodes to non-empty tokens. So this actually succeeds.
-        # However the behavior is correct: non-empty prompt passes validation.
-        # Let's verify the actual status code from the current code.
-        # "assistant:" encodes to [97, 115, 115, 105, 115, 116, 97, 110, 116, 58]
-        # which is 10 tokens, so the prompt is NOT empty -> 200.
-        # NOTE: This documents current behavior. True empty-prompt validation
-        # only triggers if the encoded prompt is literally zero tokens.
-        assert resp.status_code == 200
+        assert resp.status_code == 422
 
     @pytest.mark.anyio
     async def test_empty_prompt_string_returns_400(self, client):
@@ -1117,3 +1109,77 @@ class TestC3FirstTokenTimeout:
         # Subsequent get() calls should use request_timeout_s=10
         for t in timeouts_used[1:]:
             assert t == 10.0, f"Subsequent timeout should be 10.0, got {t}"
+
+
+# ===========================================================================
+# TestMaxTokensCap: F1 — max_generation_tokens caps max_tokens
+# ===========================================================================
+
+
+class TestMaxTokensCap:
+    """F1: max_tokens is capped by config.max_generation_tokens."""
+
+    @pytest.mark.anyio
+    async def test_max_tokens_capped_by_config(self, mock_scheduler, tokenizer, tmp_path):
+        """Requesting max_tokens > max_generation_tokens gets capped."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_generation_tokens=100,
+        )
+        app = create_app(config=cfg, scheduler=mock_scheduler, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 99999,
+                },
+            )
+        assert resp.status_code == 200
+        # Verify the submitted request was capped
+        assert len(mock_scheduler.submitted) == 1
+        assert mock_scheduler.submitted[0].max_tokens == 100
+
+    @pytest.mark.anyio
+    async def test_max_tokens_under_cap_unchanged(self, mock_scheduler, tokenizer, tmp_path):
+        """Requesting max_tokens < max_generation_tokens is not changed."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_generation_tokens=1000,
+        )
+        app = create_app(config=cfg, scheduler=mock_scheduler, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 50,
+                },
+            )
+        assert resp.status_code == 200
+        assert len(mock_scheduler.submitted) == 1
+        assert mock_scheduler.submitted[0].max_tokens == 50
+
+    @pytest.mark.anyio
+    async def test_max_tokens_zero_clamped_to_one(self, client):
+        """max_tokens=0 should be clamped to 1."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 0,
+            },
+        )
+        assert resp.status_code == 200

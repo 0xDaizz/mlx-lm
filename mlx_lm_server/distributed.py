@@ -67,6 +67,13 @@ def init_distributed(config) -> DistributedContext:
     rank = group.rank()
     world_size = group.size()
 
+    if world_size == 1:
+        raise RuntimeError(
+            f"distributed_mode={mode!r} but world_size=1. "
+            "This indicates a misconfigured launch. "
+            "Aborting to prevent port conflict and silent single-node operation."
+        )
+
     # Determine shard groups based on sharding strategy
     sharding = config.distributed_sharding
     if sharding == "pipeline":

@@ -19,6 +19,7 @@ Pass model=None and tokenizer=None for mock-based tests.
 from __future__ import annotations
 
 import logging
+import pickle
 import queue
 import threading
 import time
@@ -34,7 +35,6 @@ from mlx_lm_server.types import (
 )
 
 import copy
-import pickle
 
 from mlx_lm_server.kv_cache_manager import (
     decompose_cache_to_blocks,
@@ -55,6 +55,8 @@ except ImportError:
     make_sampler = None
 
 logger = logging.getLogger(__name__)
+
+BUS_ERROR_THRESHOLD = 10
 
 
 class RequestQueue:
@@ -193,6 +195,11 @@ class Scheduler:
         # Local queue for events to broadcast (rank0 only, used by inference loop)
         self._bus_outbox: queue.Queue = queue.Queue()
 
+        # Bus error tracking for resilience (U3)
+        self._bus_error_count: int = 0
+        self._dist_fatal: bool = False
+        self._dist_fatal_reason: str = ""
+
         # SSD pruning counter (prune every N inference steps)
         self._ssd_prune_interval: int = 1000
         self._ssd_prune_counter: int = 0
@@ -224,6 +231,7 @@ class Scheduler:
         # Shutdown health fields
         self._shutdown_clean: bool = True
         self._shutdown_partial_flush: bool = False
+        self.worker_timed_out: bool = False
 
         # Crash recovery: validate SSD index on startup
         if (self._tiered_cache is not None
@@ -287,6 +295,9 @@ class Scheduler:
         If request_queue.add() fails, any result buffers are cleaned up to
         prevent memory leaks.
         """
+        if self._dist_fatal:
+            raise RuntimeError("Distributed control plane degraded")
+
         # Set up result storage BEFORE adding to queue (so cleanup paths can find it)
         is_streaming = getattr(request, "stream", False)
         if not is_streaming:
@@ -407,11 +418,20 @@ class Scheduler:
             )
             self._inference_thread.start()
 
-    def join_worker_loop(self) -> None:
-        """Block until the inference loop finishes. Used by non-rank0 workers."""
+    def join_worker_loop(self, timeout: float = 300.0) -> None:
+        """Block until the inference loop finishes. Used by non-rank0 workers.
+
+        Args:
+            timeout: Maximum seconds to wait. If exceeded, sets worker_timed_out=True.
+        """
+        self.worker_timed_out = False
         if self._inference_thread is not None:
-            self._inference_thread.join()
-        logger.info("Worker loop finished")
+            self._inference_thread.join(timeout=timeout)
+            if self._inference_thread.is_alive():
+                logger.critical("Worker inference loop did not exit within %ss.", timeout)
+                self.worker_timed_out = True
+        else:
+            logger.info("Worker loop finished")
 
     def stop(self) -> None:
         """Stop the inference loop and gracefully shut down all subsystems."""
@@ -536,14 +556,26 @@ class Scheduler:
 
         try:
             raw_event = self._control_bus.recv()
+            self._bus_error_count = 0
         except Exception:
             logger.error("Failed to receive bus event", exc_info=True)
+            self._bus_error_count += 1
+            if self._bus_error_count >= BUS_ERROR_THRESHOLD:
+                logger.critical(
+                    "Bus error threshold (%d) reached — shutting down distributed",
+                    BUS_ERROR_THRESHOLD,
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "bus_error_threshold"
+                self._running = False
+                self._new_request_event.set()
+                return False
             return True  # Continue despite error
 
         # Unpack compound event (list of sub-events)
         if raw_event.typ == "batch":
             try:
-                events = pickle.loads(raw_event.payload) if raw_event.payload else []
+                events = raw_event.unpack_batch()
             except Exception:
                 logger.error("Failed to deserialize compound bus event", exc_info=True)
                 return True
@@ -558,9 +590,11 @@ class Scheduler:
                     is_streaming = getattr(request, "stream", False)
                     self.request_queue.add(request)
                     if not is_streaming:
-                        with self._results_lock:
-                            self._results[request.request_id] = []
-                            self._results_ready[request.request_id] = threading.Event()
+                        is_worker = self._dist_ctx is not None and not self._dist_ctx.is_rank0
+                        if not is_worker:
+                            with self._results_lock:
+                                self._results[request.request_id] = []
+                                self._results_ready[request.request_id] = threading.Event()
                     self._inc_stat("total_requests")
                     self._new_request_event.set()
 
@@ -568,7 +602,10 @@ class Scheduler:
                 request_id = event.unpack_request_id()
                 if request_id is not None:
                     # Try removing from queue first (matching rank0 behavior)
-                    if not self.request_queue.cancel(request_id):
+                    if self.request_queue.cancel(request_id):
+                        # Clean up result buffers for queued request (U6 fix)
+                        self._cleanup_result_buffers(request_id)
+                    else:
                         with self._cancelled_lock:
                             self._cancelled.add(request_id)
 
@@ -607,15 +644,33 @@ class Scheduler:
             events = [ControlEvent.noop()]
 
         # Broadcast the list of events as a single compound event
-        compound = ControlEvent(typ="batch", payload=pickle.dumps(events))
+        compound = ControlEvent.batch(events)
         try:
             self._control_bus.publish(compound)
+            self._bus_error_count = 0
         except Exception:
             logger.error("Failed to broadcast %d bus events", len(events), exc_info=True)
-            # Re-queue events that failed to publish
-            for ev in events:
-                if ev.typ != "noop":
-                    self._bus_outbox.put(ev)
+            self._bus_error_count += 1
+            if self._bus_error_count >= BUS_ERROR_THRESHOLD:
+                logger.critical(
+                    "Bus error threshold (%d) reached — shutting down distributed",
+                    BUS_ERROR_THRESHOLD,
+                )
+                # Best-effort shutdown broadcast
+                try:
+                    from mlx_lm_server.distributed_bus import ControlEvent as _CE
+                    self._control_bus.publish(ControlEvent(typ="batch", payload=pickle.dumps([_CE.shutdown()])))
+                except Exception:
+                    pass
+                self._dist_fatal = True
+                self._dist_fatal_reason = "bus_error_threshold"
+                self._running = False
+                self._new_request_event.set()
+            else:
+                # Re-queue events that failed to publish
+                for ev in events:
+                    if ev.typ != "noop":
+                        self._bus_outbox.put(ev)
 
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""
@@ -853,6 +908,9 @@ class Scheduler:
             if seq is not None:
                 seq.is_finished = True
                 seq.finish_reason = "cancelled"
+                # Free KV cache blocks to prevent memory leak (F4 fix)
+                if self.kv_cache_manager is not None and seq.block_ids:
+                    self.kv_cache_manager.free_blocks(seq.block_ids)
                 self._signal_finish(rid, finish_reason="cancelled")
                 self._cleanup_result_buffers(rid)
             with self._cancelled_lock:
@@ -1149,6 +1207,9 @@ class Scheduler:
                     seq = self._active_sequences.pop(rid)
                     seq.is_finished = True
                     seq.finish_reason = "cancelled"
+                    # Free KV cache blocks to prevent memory leak (F4 fix)
+                    if self.kv_cache_manager is not None and seq.block_ids:
+                        self.kv_cache_manager.free_blocks(seq.block_ids)
                     self._signal_finish(rid, finish_reason="cancelled")
                     with self._cancelled_lock:
                         self._cancelled.discard(rid)

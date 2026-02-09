@@ -1850,19 +1850,16 @@ class TestF16_EmptyPromptRejected:
     """
 
     @pytest.mark.anyio
-    async def test_empty_messages_returns_400(self):
-        """Chat with empty messages list returns 400 when template yields empty tokens.
+    async def test_empty_messages_returns_422(self):
+        """Chat with empty messages list returns 422 (Pydantic field_validator).
 
-        With a tokenizer whose apply_chat_template returns "" for empty messages,
-        the resulting prompt_tokens is [], which triggers the empty-prompt check.
+        Empty messages are now rejected at the Pydantic model validation layer
+        via a field_validator on ChatCompletionRequest.messages, returning 422
+        before the request reaches _validate_and_prepare_request().
         """
         config = ServerConfig(model="test-model")
         mock_sched = _TimeoutMockScheduler()
         tok = _MockTokenizerForServer()
-        # Override apply_chat_template to return "" for empty messages
-        tok.apply_chat_template = lambda messages, tokenize=False, add_generation_prompt=True: (
-            "" if not messages else "\n".join(f"{m['role']}: {m['content']}" for m in messages) + "\nassistant:"
-        )
         app = create_app(config=config, scheduler=mock_sched, tokenizer=tok)
 
         transport = ASGITransport(app=app)
@@ -1876,12 +1873,9 @@ class TestF16_EmptyPromptRejected:
                 },
             )
 
-        assert resp.status_code == 400, (
-            f"Expected 400 for empty messages, got {resp.status_code}"
+        assert resp.status_code == 422, (
+            f"Expected 422 for empty messages, got {resp.status_code}"
         )
-        body = resp.json()
-        assert "error" in body
-        assert "empty" in body["error"]["message"].lower() or "prompt" in body["error"]["message"].lower()
 
     @pytest.mark.anyio
     async def test_empty_prompt_string_returns_400(self):
