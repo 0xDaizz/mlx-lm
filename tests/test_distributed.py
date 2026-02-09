@@ -1531,6 +1531,52 @@ class TestApplyBusEventsAddException:
 class TestBusOutboxBackpressure:
     """U9: Bus outbox backpressure should reject requests."""
 
+    def test_distributed_nonstream_submit_precreates_result_slot(self):
+        """Distributed non-stream submit should pre-register result buffers."""
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        req = InferenceRequest(request_id="precreate-slot", prompt_tokens=[1], max_tokens=5, stream=False)
+        scheduler.submit_request(req)
+
+        with scheduler._results_lock:
+            assert "precreate-slot" in scheduler._results
+            assert "precreate-slot" in scheduler._results_ready
+            assert isinstance(scheduler._results_ready["precreate-slot"], threading.Event)
+        scheduler.stop()
+
+    def test_distributed_submit_reject_cleans_precreated_result_slot(self):
+        """If distributed submit is rejected, pre-registered result buffers are cleaned up."""
+        from mlx_lm_server.types import BusOutboxFullError
+        from mlx_lm_server.scheduler import BUS_OUTBOX_MAXSIZE, BUS_OUTBOX_CONTROL_RESERVE
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Fill to the submit rejection threshold
+        from mlx_lm_server.distributed_bus import ControlEvent as CE
+        for _ in range(BUS_OUTBOX_MAXSIZE - BUS_OUTBOX_CONTROL_RESERVE):
+            scheduler._bus_outbox.put_nowait(CE.noop())
+
+        req = InferenceRequest(request_id="reject-cleanup", prompt_tokens=[1], max_tokens=5, stream=False)
+        with pytest.raises(BusOutboxFullError):
+            scheduler.submit_request(req)
+
+        with scheduler._results_lock:
+            assert "reject-cleanup" not in scheduler._results
+            assert "reject-cleanup" not in scheduler._results_ready
+        scheduler.stop()
+
     def test_bus_outbox_full_rejects_request(self):
         """When outbox is nearly full, submit should raise BusOutboxFullError."""
         from mlx_lm_server.types import BusOutboxFullError
@@ -1623,4 +1669,30 @@ class TestBusOutboxBackpressure:
         assert not scheduler._bus_outbox.empty()
         event = scheduler._bus_outbox.get_nowait()
         assert event.typ == "cancel"
+        scheduler.stop()
+
+    def test_rank0_cancel_local_apply_cleans_orphan_buffers(self):
+        """Rank0 local cancel apply should clean orphan result buffers for unknown requests."""
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        request_id = "orphan-cancel"
+        with scheduler._results_lock:
+            scheduler._results[request_id] = []
+            scheduler._results_ready[request_id] = threading.Event()
+
+        scheduler.register_stream(request_id)
+        scheduler._bus_outbox.put_nowait(ControlEvent.cancel(request_id))
+        scheduler._drain_bus_outbox()
+
+        with scheduler._results_lock:
+            assert request_id not in scheduler._results
+            assert request_id not in scheduler._results_ready
+        with scheduler._streams_lock:
+            assert request_id not in scheduler._streams
         scheduler.stop()

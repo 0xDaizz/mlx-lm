@@ -611,6 +611,69 @@ class TestErrorHandling:
         assert "error" in body
         assert "queue" in body["error"]["message"].lower()
 
+    @pytest.mark.anyio
+    async def test_streaming_submit_failure_cleans_registered_stream(self, config, tokenizer):
+        """Streaming submit failure should unregister the pre-registered stream queue."""
+        from mlx_lm_server.types import BusOutboxFullError
+
+        class OutboxFullScheduler(MockSchedulerForApp):
+            def submit_request(self, request):
+                raise BusOutboxFullError(request.request_id)
+
+        sched = OutboxFullScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 10,
+                    "stream": True,
+                },
+            )
+        assert resp.status_code == 503
+        assert len(sched.streams) == 0
+
+    @pytest.mark.anyio
+    async def test_distributed_nonstream_submit_does_not_raise_keyerror(self, tokenizer, tmp_path):
+        """Distributed non-stream submit should not raise KeyError before local apply.
+
+        Without pre-registered result buffers, this path fails with KeyError(500).
+        With the fix, request waits for result and returns 504 timeout cleanly.
+        """
+        from mlx_lm_server.distributed import DistributedContext
+        from mlx_lm_server.scheduler import Scheduler
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache-distributed",
+            max_batch_size=2,
+            max_queue_size=8,
+            request_timeout_s=0.05,
+        )
+        dist_ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        sched = Scheduler(config=config, model=None, tokenizer=tokenizer, dist_ctx=dist_ctx, control_bus=MockBus())
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer, dist_ctx=dist_ctx)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/completions",
+                json={
+                    "prompt": "hello",
+                    "max_tokens": 10,
+                },
+            )
+        assert resp.status_code == 504
+        assert "timed out" in resp.json()["error"]["message"].lower()
+        sched.stop()
+
 
 # ===========================================================================
 # TestA1: Chat tokenize special token dedup

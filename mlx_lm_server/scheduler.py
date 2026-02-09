@@ -320,17 +320,28 @@ class Scheduler:
         if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
             # ===== DISTRIBUTED MODE: outbox enqueue ONLY =====
             # Do NOT call request_queue.add() here.
-            # Do NOT create result buffers here.
             # The inference thread's _drain_bus_outbox() will:
             #   1. publish to all ranks
             #   2. rank0 local apply (add + buffers)
             from mlx_lm_server.distributed_bus import ControlEvent
             from mlx_lm_server.types import BusOutboxFullError
+
+            # Pre-register result buffers for non-streaming requests so get_result()
+            # can wait immediately without racing on KeyError before local apply.
+            if not is_streaming:
+                with self._results_lock:
+                    self._results.setdefault(request.request_id, [])
+                    self._results_ready.setdefault(request.request_id, threading.Event())
+
             if self._bus_outbox.qsize() >= BUS_OUTBOX_MAXSIZE - BUS_OUTBOX_CONTROL_RESERVE:
+                if not is_streaming:
+                    self._cleanup_result_buffers(request.request_id)
                 raise BusOutboxFullError(request.request_id)
             try:
                 self._bus_outbox.put_nowait(ControlEvent.submit(request))
             except queue.Full:
+                if not is_streaming:
+                    self._cleanup_result_buffers(request.request_id)
                 raise BusOutboxFullError(request.request_id)
             self._inc_stat("submitted_requests")
             self._new_request_event.set()
@@ -364,6 +375,11 @@ class Scheduler:
         with self._streams_lock:
             self._streams[request_id] = q
         return q
+
+    def unregister_stream(self, request_id: str) -> None:
+        """Remove a previously registered stream queue, if present."""
+        with self._streams_lock:
+            self._streams.pop(request_id, None)
 
     def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
         """Wait for and return generation results.
@@ -767,8 +783,9 @@ class Scheduler:
                         self.request_queue.add(request)
                         if not is_streaming:
                             with self._results_lock:
-                                self._results[request.request_id] = []
-                                self._results_ready[request.request_id] = threading.Event()
+                                # Keep pre-registered buffers/event if already present.
+                                self._results.setdefault(request.request_id, [])
+                                self._results_ready.setdefault(request.request_id, threading.Event())
                         self._inc_stat("total_requests")
                         self._inc_stat("accepted_requests")
                     except Exception:
@@ -779,8 +796,16 @@ class Scheduler:
                 request_id = ev.unpack_request_id()
                 if request_id is not None:
                     if not self.request_queue.cancel(request_id):
-                        with self._cancelled_lock:
-                            self._cancelled.add(request_id)
+                        with self._active_lock:
+                            is_active = request_id in self._active_sequences
+                        if is_active:
+                            with self._cancelled_lock:
+                                self._cancelled.add(request_id)
+                        else:
+                            # Unknown request on rank0 local apply: clean up any
+                            # pre-registered buffers/streams to avoid leaks.
+                            self._cleanup_result_buffers(request_id)
+                            self.unregister_stream(request_id)
                     else:
                         # Request was in queue — signal finish and clean up buffers
                         self._signal_finish(request_id, finish_reason="cancelled")

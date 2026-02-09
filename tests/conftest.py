@@ -179,6 +179,9 @@ class MockSchedulerForApp:
         self.streams[request_id] = q
         return q
 
+    def unregister_stream(self, request_id: str) -> None:
+        self.streams.pop(request_id, None)
+
     def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
         events: list[TokenEvent] = []
         for i, tok_text in enumerate(self.response_tokens):
