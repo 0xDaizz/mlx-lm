@@ -40,7 +40,7 @@ class SSDCache:
         index: Maps block_hash (str) -> SSDBlockMeta.
     """
 
-    def __init__(self, cache_dir: Path, ttl_days: int = 7, flush_interval_s: float = 1.0) -> None:
+    def __init__(self, cache_dir: Path, ttl_days: int = 7, flush_interval_s: float = 1.0, max_size_bytes: int = 0) -> None:
         self.cache_dir = Path(cache_dir)
         self.ttl_days = ttl_days
         self._lock = threading.Lock()
@@ -70,6 +70,22 @@ class SSDCache:
 
         # Non-cacheable collision isolation set: block_hash -> expiry timestamp
         self._noncacheable: dict[str, float] = {}
+
+        # Disk size tracking
+        self._max_size_bytes = max_size_bytes  # 0 = unlimited
+        self._total_bytes = 0
+        # Calculate initial total size from existing files
+        for meta in self.index.values():
+            try:
+                p = Path(meta.filepath) if not isinstance(meta.filepath, Path) else meta.filepath
+                if p.exists():
+                    self._total_bytes += p.stat().st_size
+            except OSError:
+                pass
+
+        # LRU prune stats
+        self._stats["ssd_lru_prune_count"] = 0
+        self._stats["ssd_lru_prune_bytes"] = 0
 
     def save_block(self, block_hash: str, kv_data: list[dict[str, mx.array]] | dict[str, mx.array], num_tokens: int | None = None) -> str:
         """Save K/V tensors for a block to disk as a safetensors file.
@@ -148,6 +164,10 @@ class SSDCache:
             else:
                 flat = kv_data
 
+            # Check capacity and prune if needed
+            if self._max_size_bytes > 0 and self._total_bytes >= self._max_size_bytes:
+                self._prune_lru_for_space(self._max_size_bytes // 10)  # free ~10% space
+
             # Atomic write: save to temp file, then rename
             tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
             try:
@@ -163,6 +183,13 @@ class SSDCache:
                 self._stats["ssd_save_fail"] += 1
                 logger.error("Failed to save block %s to SSD: %s", block_hash, e)
                 return "error"
+
+            # Track file size
+            try:
+                file_size = filepath.stat().st_size
+                self._total_bytes += file_size
+            except OSError:
+                pass
 
             # last_accessed is set at save time (not enqueue time for async writes).
             # TTL granularity is days, so seconds of async delay are negligible.
@@ -268,18 +295,72 @@ class SSDCache:
 
             for block_hash in to_prune:
                 meta = self.index[block_hash]
+                file_size = 0
                 try:
                     if meta.filepath.exists():
+                        file_size = meta.filepath.stat().st_size
                         meta.filepath.unlink()
                         logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
                 except OSError as e:
                     logger.warning("Failed to delete expired block file %s: %s", meta.filepath, e)
+                    file_size = 0  # Don't subtract if delete failed
+                self._total_bytes = max(0, self._total_bytes - file_size)
                 del self.index[block_hash]
 
             if to_prune:
                 self._save_index()
 
             return len(to_prune)
+
+    def _prune_lru_for_space(self, bytes_to_free: int) -> int:
+        """Prune least-recently-accessed blocks to free disk space.
+
+        Called internally when disk usage exceeds max_size_bytes.
+        Must be called with self._lock held.
+
+        Args:
+            bytes_to_free: Target number of bytes to free.
+
+        Returns:
+            Number of bytes actually freed.
+        """
+        if not self.index:
+            return 0
+
+        # Sort by last_accessed (oldest first)
+        sorted_blocks = sorted(
+            self.index.items(),
+            key=lambda item: item[1].last_accessed,
+        )
+
+        freed = 0
+        pruned_hashes = []
+        for block_hash, meta in sorted_blocks:
+            if freed >= bytes_to_free:
+                break
+            file_size = 0
+            try:
+                p = Path(meta.filepath) if not isinstance(meta.filepath, Path) else meta.filepath
+                if p.exists():
+                    file_size = p.stat().st_size
+                    p.unlink()
+                    logger.info("LRU-pruned block %s (%d bytes)", block_hash, file_size)
+            except OSError as e:
+                logger.warning("Failed to LRU-prune block %s: %s", block_hash, e)
+                continue
+            freed += file_size
+            self._total_bytes = max(0, self._total_bytes - file_size)
+            pruned_hashes.append(block_hash)
+
+        for bh in pruned_hashes:
+            del self.index[bh]
+
+        if pruned_hashes:
+            self._save_index()
+            self._stats["ssd_lru_prune_count"] += len(pruned_hashes)
+            self._stats["ssd_lru_prune_bytes"] += freed
+
+        return freed
 
     def _mark_dirty(self) -> None:
         """Mark index as dirty; flush after mutation count or time threshold."""
@@ -417,7 +498,10 @@ class SSDCache:
     def get_stats(self) -> dict[str, int]:
         """Return a snapshot of SSD cache statistics."""
         with self._lock:
-            return dict(self._stats)
+            snapshot = dict(self._stats)
+            snapshot["ssd_total_bytes"] = self._total_bytes
+            snapshot["ssd_max_size_bytes"] = self._max_size_bytes
+            return snapshot
 
     def validate_index(self) -> dict[str, int]:
         """Startup crash recovery: clean orphan files + remove missing entries.

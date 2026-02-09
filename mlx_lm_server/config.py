@@ -34,6 +34,7 @@ class ServerConfig:
     ssd_writer_queue_size: int = 512
     ssd_flush_interval_s: float = 1.0
     ssd_persistent_max_retries: int = 3
+    ssd_max_size_gb: float = 50.0  # Max SSD cache size in GB (0 = unlimited)
 
     # Scheduler
     max_batch_size: int = 8  # Max concurrent decode sequences

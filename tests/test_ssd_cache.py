@@ -407,3 +407,107 @@ class TestBatchFlush:
         # After exactly 3 mark_dirty calls with interval=3, should be flushed
         assert cache._index_dirty is False
         assert cache._mutation_count == 0
+
+
+# ---------------------------------------------------------------------------
+# T3.1 — SSD disk size limit
+# ---------------------------------------------------------------------------
+
+
+class TestSSDDiskSizeLimit:
+    """Tests for SSD disk size limit (T3.1)."""
+
+    def test_max_size_prune_on_save(self, tmp_path: Path):
+        """When max_size_bytes is exceeded, LRU blocks are pruned."""
+        # Very small max size to trigger pruning
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=1000)
+
+        # Save several blocks to fill up
+        for i in range(10):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            result = cache.save_block(f"hash_{i}", kv, num_tokens=4)
+            assert result in ("saved", "dedup")
+
+        # Total bytes should be tracked
+        assert cache._total_bytes > 0
+        # Some blocks should have been pruned via LRU
+        assert len(cache.index) < 10
+
+    def test_unlimited_size(self, tmp_path: Path):
+        """max_size_bytes=0 means unlimited."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=0)
+        for i in range(5):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            cache.save_block(f"hash_{i}", kv, num_tokens=4)
+        assert len(cache.index) == 5  # All kept
+
+    def test_prune_lru_order(self, tmp_path: Path):
+        """LRU pruning removes oldest-accessed blocks first."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=0)
+
+        # Save 3 blocks
+        for i in range(3):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            cache.save_block(f"hash_{i}", kv, num_tokens=4)
+
+        # Manually set access times: hash_0 oldest, hash_2 newest
+        cache.index["hash_0"].last_accessed = datetime.now() - timedelta(days=3)
+        cache.index["hash_1"].last_accessed = datetime.now() - timedelta(days=2)
+        cache.index["hash_2"].last_accessed = datetime.now() - timedelta(days=1)
+
+        # Prune with small target
+        with cache._lock:
+            freed = cache._prune_lru_for_space(1)  # Just free 1 byte minimum
+
+        # Oldest block should be gone
+        assert "hash_0" not in cache.index
+        assert "hash_2" in cache.index  # newest kept
+        assert freed > 0
+
+    def test_total_bytes_tracking(self, tmp_path: Path):
+        """_total_bytes tracks cumulative size correctly."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=0)
+        assert cache._total_bytes == 0
+
+        kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+        cache.save_block("hash_a", kv, num_tokens=4)
+        assert cache._total_bytes > 0
+
+        # Load initial size
+        size_after_one = cache._total_bytes
+        cache.save_block("hash_b", kv, num_tokens=4)
+        assert cache._total_bytes > size_after_one
+
+    def test_get_stats_includes_size_fields(self, tmp_path: Path):
+        """get_stats() includes ssd_total_bytes and ssd_max_size_bytes."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=5000)
+        stats = cache.get_stats()
+        assert "ssd_total_bytes" in stats
+        assert "ssd_max_size_bytes" in stats
+        assert stats["ssd_max_size_bytes"] == 5000
+        assert stats["ssd_total_bytes"] == 0
+
+    def test_lru_prune_stats_tracked(self, tmp_path: Path):
+        """LRU pruning increments ssd_lru_prune_count and ssd_lru_prune_bytes."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=1000)
+
+        for i in range(10):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            cache.save_block(f"hash_{i}", kv, num_tokens=4)
+
+        stats = cache.get_stats()
+        assert stats["ssd_lru_prune_count"] > 0
+        assert stats["ssd_lru_prune_bytes"] > 0
+
+    def test_initial_size_from_existing_files(self, tmp_path: Path):
+        """New SSDCache instance calculates _total_bytes from existing files."""
+        cache_dir = tmp_path / "cache"
+        cache1 = SSDCache(cache_dir=cache_dir, ttl_days=7, max_size_bytes=0)
+        kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+        cache1.save_block("hash_persist", kv, num_tokens=4)
+        size1 = cache1._total_bytes
+        assert size1 > 0
+
+        # Create new cache instance pointing at same directory
+        cache2 = SSDCache(cache_dir=cache_dir, ttl_days=7, max_size_bytes=0)
+        assert cache2._total_bytes == size1
