@@ -1277,8 +1277,8 @@ class TestMaxTokensCap:
         assert mock_scheduler.submitted[0].max_tokens == 50
 
     @pytest.mark.anyio
-    async def test_max_tokens_zero_clamped_to_one(self, client):
-        """max_tokens=0 should be clamped to 1."""
+    async def test_max_tokens_zero_returns_400(self, client):
+        """max_tokens=0 should return 400 error."""
         resp = await client.post(
             "/v1/chat/completions",
             json={
@@ -1286,7 +1286,25 @@ class TestMaxTokensCap:
                 "max_tokens": 0,
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "max_tokens must be at least 1" in data["error"]["message"]
+
+    @pytest.mark.anyio
+    async def test_max_tokens_negative_returns_400(self, client):
+        """max_tokens=-1 should return 400 error."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": -1,
+            },
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert data["error"]["type"] == "invalid_request_error"
+        assert "max_tokens must be at least 1" in data["error"]["message"]
 
 
 class TestHealthDistributed:

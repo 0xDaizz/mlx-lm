@@ -577,8 +577,8 @@ async def test_negative_temperature_clamped(client, mock_scheduler):
 
 
 @pytest.mark.anyio
-async def test_max_tokens_clamped_to_minimum_1(client, mock_scheduler):
-    """B3: max_tokens=0 or negative is clamped to 1, no error."""
+async def test_max_tokens_zero_or_negative_returns_400(client, mock_scheduler):
+    """DA-C5-M1: max_tokens=0 or negative returns 400 error."""
     # Test with max_tokens=0
     resp = await client.post(
         "/v1/chat/completions",
@@ -588,9 +588,10 @@ async def test_max_tokens_clamped_to_minimum_1(client, mock_scheduler):
             "max_tokens": 0,
         },
     )
-    assert resp.status_code == 200
-    submitted = mock_scheduler.submitted[-1]
-    assert submitted.max_tokens == 1
+    assert resp.status_code == 400
+    data = resp.json()
+    assert data["error"]["type"] == "invalid_request_error"
+    assert "max_tokens must be at least 1" in data["error"]["message"]
 
     # Test with max_tokens=-5
     resp2 = await client.post(
@@ -601,9 +602,10 @@ async def test_max_tokens_clamped_to_minimum_1(client, mock_scheduler):
             "max_tokens": -5,
         },
     )
-    assert resp2.status_code == 200
-    submitted2 = mock_scheduler.submitted[-1]
-    assert submitted2.max_tokens == 1
+    assert resp2.status_code == 400
+    data2 = resp2.json()
+    assert data2["error"]["type"] == "invalid_request_error"
+    assert "max_tokens must be at least 1" in data2["error"]["message"]
 
 
 # ---------------------------------------------------------------------------

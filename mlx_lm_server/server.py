@@ -239,7 +239,14 @@ def _validate_and_prepare_request(
             detail=f"Prompt too long: {len(prompt_tokens)} tokens exceeds maximum of {config.max_prompt_tokens}",
         )
 
-    # 5-7. Clamp generation parameters
+    # 5. Reject non-positive max_tokens
+    if body.max_tokens is not None and body.max_tokens <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="max_tokens must be at least 1",
+        )
+
+    # 6-8. Clamp generation parameters
     temperature = max(0.0, min(2.0, body.temperature))
     top_p = max(0.0, min(1.0, body.top_p))
     max_tokens = min(max(1, body.max_tokens), config.max_generation_tokens)
