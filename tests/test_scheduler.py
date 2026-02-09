@@ -1216,3 +1216,66 @@ class TestBatchGeneratorImportGuard:
                 Scheduler(config=config, model="fake-model", tokenizer=None)
         finally:
             sched_mod.BatchGenerator = original
+
+
+# ---------------------------------------------------------------------------
+# T1.1  Non-blocking finish event delivery
+# ---------------------------------------------------------------------------
+
+
+class TestFinishEventDelivery:
+    """Tests for non-blocking finish event delivery (T1.1)."""
+
+    def test_finish_event_nonblocking_delivery(self):
+        """Finish event is delivered via put_nowait (non-blocking)."""
+        config = _make_config()
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        # Create a stream queue with capacity 1
+        stream = queue.Queue(maxsize=1)
+        finish_event = TokenEvent(request_id="r1", token_id=-1, token_text="", finish_reason="stop")
+
+        # Should succeed on empty queue
+        sched._put_event_to_stream(stream, finish_event, "r1", is_finish=True)
+        assert stream.qsize() == 1
+        got = stream.get_nowait()
+        assert got.finish_reason == "stop"
+
+    def test_finish_event_drops_oldest_on_full(self):
+        """When queue is full, oldest token is dropped to make room for finish."""
+        config = _make_config()
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        stream = queue.Queue(maxsize=1)
+        # Fill the queue with a regular token
+        old_token = TokenEvent(request_id="r1", token_id=1, token_text="old", finish_reason=None)
+        stream.put_nowait(old_token)
+
+        # Now put finish event -- should drop oldest and succeed
+        finish_event = TokenEvent(request_id="r1", token_id=-1, token_text="", finish_reason="stop")
+        sched._put_event_to_stream(stream, finish_event, "r1", is_finish=True)
+
+        assert stream.qsize() == 1
+        got = stream.get_nowait()
+        assert got.finish_reason == "stop"
+
+    def test_finish_event_retry_with_persistent_full(self):
+        """When queue stays full after 3 retries, finish event is dropped with error log."""
+        from unittest.mock import patch, MagicMock
+
+        config = _make_config()
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        # Use a mock queue that always raises Full
+        mock_stream = MagicMock(spec=queue.Queue)
+        mock_stream.put_nowait.side_effect = queue.Full()
+        mock_stream.get_nowait.side_effect = queue.Empty()
+
+        finish_event = TokenEvent(request_id="r1", token_id=-1, token_text="", finish_reason="stop")
+
+        with patch("mlx_lm_server.scheduler.logger") as mock_logger:
+            sched._put_event_to_stream(mock_stream, finish_event, "r1", is_finish=True)
+            # Should have tried 3 times
+            assert mock_stream.put_nowait.call_count == 3
+            # Should have logged error
+            mock_logger.error.assert_called_once()

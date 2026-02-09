@@ -1016,7 +1016,7 @@ class Scheduler:
                             # and will be pushed to eviction heap by free_blocks()
                             self.kv_cache_manager.free_blocks([block_id])
                 except Exception as e:
-                    logger.debug("Failed to decompose cache to blocks: %s", e)
+                    logger.warning("Failed to decompose cache to blocks: %s", e)
 
     def _prune_ssd_if_needed(self) -> None:
         """Periodically prune expired SSD cache blocks (step-based or time-based)."""
@@ -1560,23 +1560,23 @@ class Scheduler:
     ) -> None:
         """Put a token event onto a stream queue with backpressure handling.
 
-        For finish events (is_finish=True), uses a blocking put with timeout
-        to guarantee delivery. For regular token events, uses put_nowait with
-        drop-oldest retry on full queue.
+        For finish events (is_finish=True), uses non-blocking put_nowait with
+        drop-oldest retry (max 3 attempts) to guarantee delivery without blocking
+        the inference loop. For regular token events, uses put_nowait with
+        backpressure overflow cancellation.
         """
         if is_finish:
-            try:
-                stream.put(event, timeout=5)
-            except queue.Full:
-                logger.warning("Stream queue full for %s during finish, dropping oldest", request_id)
-                try:
-                    stream.get_nowait()
-                except queue.Empty:
-                    pass
+            for attempt in range(3):
                 try:
                     stream.put_nowait(event)
+                    break
                 except queue.Full:
-                    logger.warning("Stream queue full for %s, finish event dropped", request_id)
+                    try:
+                        stream.get_nowait()  # drop oldest token
+                    except queue.Empty:
+                        pass
+            else:
+                logger.error("Stream queue full for %s after 3 retries, finish event dropped", request_id)
         else:
             try:
                 stream.put_nowait(event)
