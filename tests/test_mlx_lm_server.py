@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from queue import Queue
 from threading import Thread
@@ -736,3 +737,139 @@ async def test_stream_timeout_cancels_request(stream_timeout_client, slow_stream
     assert lines[-1] == "data: [DONE]"
     # Verify cancel was called on the scheduler
     assert len(slow_stream_scheduler.cancelled) == 1
+
+
+# ---------------------------------------------------------------------------
+# B5: Non-streaming client disconnect (CancelledError) cleanup
+# ---------------------------------------------------------------------------
+
+
+class BlockingMockScheduler(MockScheduler):
+    """Scheduler mock whose get_result blocks until signalled.
+
+    Used to simulate a long-running inference that gets interrupted by
+    client disconnect (asyncio.CancelledError).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._block_event = threading.Event()
+        self.reached_get_result = threading.Event()
+        self.cancel_called = threading.Event()
+
+    def get_result(self, request_id: str, timeout: float | None = None) -> list[TokenEvent]:
+        """Block until the event is set, then raise TimeoutError.
+
+        This runs inside run_in_executor so it blocks the executor thread.
+        The await on run_in_executor is where CancelledError can be injected
+        when the asyncio task is cancelled.
+        """
+        self.reached_get_result.set()
+        # Block for up to 30 seconds (effectively forever for the test).
+        # The test will cancel the asyncio task while we're blocking here.
+        self._block_event.wait(timeout=30)
+        raise TimeoutError("Simulated timeout after unblock")
+
+    def cancel_request(self, request_id: str) -> bool:
+        result = super().cancel_request(request_id)
+        self.cancel_called.set()
+        return result
+
+    def unblock(self):
+        """Signal the blocking get_result to proceed."""
+        self._block_event.set()
+
+
+@pytest.fixture
+def blocking_scheduler():
+    return BlockingMockScheduler()
+
+
+@pytest.fixture
+def disconnect_config(tmp_path):
+    """ServerConfig with a long timeout so the test controls cancellation timing."""
+    return ServerConfig(
+        model="test-model",
+        block_size=4,
+        num_blocks=64,
+        ssd_cache_dir=tmp_path / "ssd-cache",
+        max_batch_size=2,
+        max_queue_size=8,
+        request_timeout_s=60.0,  # Long timeout — test cancels before this
+    )
+
+
+@pytest.fixture
+def disconnect_app(disconnect_config, blocking_scheduler, mock_tokenizer):
+    return create_app(
+        config=disconnect_config,
+        scheduler=blocking_scheduler,
+        tokenizer=mock_tokenizer,
+    )
+
+
+@pytest.mark.anyio
+async def test_non_streaming_disconnect_cleanup(disconnect_app, blocking_scheduler):
+    """B5: CancelledError during non-streaming poll triggers cancel_request().
+
+    Simulates a client disconnecting mid-inference by cancelling the asyncio
+    task that drives the request.  Verifies that the finally block in
+    _do_inference() calls scheduler.cancel_request() for cleanup.
+    """
+    transport = ASGITransport(app=disconnect_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as ac:
+        # Launch the request as a task so we can cancel it
+        request_task = asyncio.create_task(
+            ac.post(
+                "/v1/completions",
+                json={
+                    "model": "test-model",
+                    "prompt": "Hello world",
+                    "max_tokens": 50,
+                },
+            )
+        )
+
+        # Wait for the request to reach the blocking get_result in the executor
+        for _ in range(100):  # 100 * 10ms = 1s max
+            if blocking_scheduler.reached_get_result.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert blocking_scheduler.reached_get_result.is_set(), (
+            "get_result was not called within timeout"
+        )
+
+        # Verify the request was submitted to the scheduler
+        assert len(blocking_scheduler.submitted) == 1, (
+            "Request should have been submitted before cancellation"
+        )
+
+        # Cancel the task — simulates client disconnect
+        request_task.cancel()
+
+        # Wait for the cancellation to propagate
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+        # Unblock the executor thread so it can finish cleanly
+        blocking_scheduler.unblock()
+
+        # Wait for the finally block's cancel_request() to execute
+        for _ in range(100):  # 100 * 10ms = 1s max
+            if blocking_scheduler.cancel_called.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert blocking_scheduler.cancel_called.is_set(), (
+            "cancel_request was not called within timeout"
+        )
+
+    # The critical assertion: cancel_request was called with the correct request_id
+    assert len(blocking_scheduler.cancelled) == 1, (
+        f"Expected cancel_request to be called once, got {len(blocking_scheduler.cancelled)} calls"
+    )
+    # Verify the cancelled request_id matches the submitted one
+    submitted_id = blocking_scheduler.submitted[0].request_id
+    cancelled_id = blocking_scheduler.cancelled[0]
+    assert cancelled_id == submitted_id, (
+        f"Cancelled request_id {cancelled_id!r} != submitted {submitted_id!r}"
+    )
