@@ -243,6 +243,7 @@ class Scheduler:
         self._shutdown_partial_flush: bool = False
         self.worker_timed_out: bool = False
         self.shutdown_status: str = "clean"
+        self._stopped: bool = False
 
         # Crash recovery: validate SSD index on startup
         if (self._tiered_cache is not None
@@ -496,15 +497,24 @@ class Scheduler:
 
     def stop(self) -> None:
         """Stop the inference loop and gracefully shut down all subsystems."""
-        self._running = False
+        if self._stopped:
+            return
+        self._stopped = True
 
-        # Signal all active sequences with error so waiters don't hang
+        # 1. Enqueue shutdown event FIRST (while inference loop is still alive to drain)
+        if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+            self._enqueue_shutdown_event()
+
+        # 2. NOW stop the inference loop
+        self._running = False
+        self._new_request_event.set()
+
+        # 3. Signal active sequences and drain queue
         with self._active_lock:
             for rid, seq in list(self._active_sequences.items()):
                 if not seq.is_finished:
                     self._signal_finish(rid, finish_reason="error")
 
-        # Drain queued requests
         while True:
             reqs = self.request_queue.pop_batch(128)
             if not reqs:
@@ -512,35 +522,7 @@ class Scheduler:
             for req in reqs:
                 self._signal_finish(req.request_id, finish_reason="error")
 
-        # Queue shutdown event for broadcast (TP mode)
-        if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
-            try:
-                from mlx_lm_server.distributed_bus import ControlEvent
-
-                deadline = time.monotonic() + BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S
-                enqueued = False
-                while time.monotonic() < deadline:
-                    try:
-                        self._bus_outbox.put_nowait(ControlEvent.shutdown())
-                        enqueued = True
-                        break
-                    except queue.Full:
-                        # Let the inference loop make progress and retry without
-                        # discarding queued submit/cancel events.
-                        self._new_request_event.set()
-                        time.sleep(0.01)
-                if not enqueued:
-                    logger.critical(
-                        "Cannot enqueue shutdown event within timeout; marking distributed fatal"
-                    )
-                    self._dist_fatal = True
-                    self._dist_fatal_reason = "bus_outbox_full_shutdown"
-                    self._shutdown_clean = False
-                    self.shutdown_status = "shutdown_event_enqueue_failed"
-            except Exception:
-                logger.warning("Failed to queue shutdown event", exc_info=True)
-
-        self._new_request_event.set()
+        # 4. Join inference thread
         if self._inference_thread is not None:
             self._inference_thread.join(timeout=5.0)
             if self._inference_thread.is_alive():
@@ -579,6 +561,34 @@ class Scheduler:
                     )
             except Exception:
                 logger.warning("Failed to flush SSD cache index on shutdown")
+
+    def _enqueue_shutdown_event(self) -> None:
+        """Enqueue a shutdown event to the bus outbox for distributed broadcast."""
+        try:
+            from mlx_lm_server.distributed_bus import ControlEvent
+
+            deadline = time.monotonic() + BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S
+            enqueued = False
+            while time.monotonic() < deadline:
+                try:
+                    self._bus_outbox.put_nowait(ControlEvent.shutdown())
+                    enqueued = True
+                    break
+                except queue.Full:
+                    # Let the inference loop make progress and retry without
+                    # discarding queued submit/cancel events.
+                    self._new_request_event.set()
+                    time.sleep(0.01)
+            if not enqueued:
+                logger.critical(
+                    "Cannot enqueue shutdown event within timeout; marking distributed fatal"
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "bus_outbox_full_shutdown"
+                self._shutdown_clean = False
+                self.shutdown_status = "shutdown_event_enqueue_failed"
+        except Exception:
+            logger.warning("Failed to queue shutdown event", exc_info=True)
 
     def _inference_loop(self) -> None:
         """Main inference loop: schedule -> prefill -> decode -> emit tokens."""

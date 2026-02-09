@@ -2059,3 +2059,99 @@ class TestRestrictedUnpickler:
         assert restored.temperature == 0.8
         assert restored.top_p == 0.95
         assert restored.stream is True
+
+
+# =========================================================================
+# P. Commit 4 — stop() idempotency + shutdown event ordering
+# =========================================================================
+
+
+class TestStopIdempotencyAndOrdering:
+    """Test stop() idempotency and shutdown event ordering."""
+
+    def test_double_stop_is_idempotent(self):
+        """Call stop() twice -> no exception, no duplicate shutdown events."""
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # First stop should enqueue a shutdown event
+        scheduler.stop()
+
+        # Collect all events from the outbox
+        events_after_first_stop = []
+        while not scheduler._bus_outbox.empty():
+            events_after_first_stop.append(scheduler._bus_outbox.get_nowait())
+
+        shutdown_count_first = sum(1 for e in events_after_first_stop if e.typ == "shutdown")
+        assert shutdown_count_first == 1, "First stop should enqueue exactly one shutdown event"
+
+        # Second stop should be a no-op (idempotent)
+        scheduler.stop()  # Should not raise
+
+        # No additional shutdown events should have been enqueued
+        events_after_second_stop = []
+        while not scheduler._bus_outbox.empty():
+            events_after_second_stop.append(scheduler._bus_outbox.get_nowait())
+
+        shutdown_count_second = sum(1 for e in events_after_second_stop if e.typ == "shutdown")
+        assert shutdown_count_second == 0, "Second stop should not enqueue any shutdown events"
+
+        # _stopped flag should be True
+        assert scheduler._stopped is True
+
+    def test_shutdown_event_enqueued_before_running_false(self):
+        """Verify outbox contains shutdown event before _running is set to False.
+
+        Uses a mock bus that records the state of _running at the time the
+        shutdown event is enqueued to the outbox.
+        """
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+        scheduler._running = True
+
+        # Monkey-patch _enqueue_shutdown_event to record _running state
+        original_enqueue = scheduler._enqueue_shutdown_event
+        running_at_enqueue = []
+
+        def recording_enqueue():
+            running_at_enqueue.append(scheduler._running)
+            original_enqueue()
+
+        scheduler._enqueue_shutdown_event = recording_enqueue
+
+        scheduler.stop()
+
+        # Verify _enqueue_shutdown_event was called while _running was still True
+        assert len(running_at_enqueue) == 1, "Shutdown event enqueue should have been called exactly once"
+        assert running_at_enqueue[0] is True, (
+            "_running should still be True when shutdown event is enqueued"
+        )
+        # After stop(), _running should be False
+        assert scheduler._running is False
+
+    def test_stopped_flag_initialized_false(self):
+        """_stopped should be False after construction."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        assert scheduler._stopped is False
+        scheduler.stop()
+
+    def test_double_stop_no_dist_is_idempotent(self):
+        """Double stop without distributed context should also be idempotent."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler.stop()
+        scheduler.stop()  # Should not raise
+        assert scheduler._stopped is True
