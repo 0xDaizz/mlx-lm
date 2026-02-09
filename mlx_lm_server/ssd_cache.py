@@ -169,7 +169,12 @@ class SSDCache:
                 self._prune_lru_for_space(self._max_size_bytes // 10)  # free ~10% space
 
             # Atomic write: save to temp file, then rename
-            tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
+            try:
+                tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
+            except OSError as e:
+                self._stats["ssd_save_fail"] += 1
+                logger.error("Failed to create temp file for block %s: %s", block_hash, e)
+                return "error"
             try:
                 os.close(tmp_fd)
                 os.unlink(tmp_path)  # mx.save_safetensors needs to create the file itself

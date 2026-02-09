@@ -1020,7 +1020,11 @@ class TieredKVCache:
         # --- Phase 2: save to SSD WITHOUT holding ram.lock ---
         save_results: dict[int, str] = {}
         for block, block_hash, kv_data in candidates_to_save:
-            result = self._save_to_ssd_with_durability(block_hash, kv_data)
+            try:
+                result = self._save_to_ssd_with_durability(block_hash, kv_data)
+            except Exception as e:
+                logger.warning("SSD save failed for block %d: %s", block.block_id, e)
+                result = "error"
             save_results[block.block_id] = result
 
         # --- Phase 3: evict confirmed saves under lock ---
