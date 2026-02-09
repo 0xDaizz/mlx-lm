@@ -1279,3 +1279,52 @@ class TestFinishEventDelivery:
             assert mock_stream.put_nowait.call_count == 3
             # Should have logged error
             mock_logger.error.assert_called_once()
+
+
+class TestKVBlockLeakGuard:
+    """Tests for KV block leak on insert failure (T1.2)."""
+
+    def test_outer_except_frees_blocks(self):
+        """When setup fails after block allocation, blocks are freed."""
+        from unittest.mock import patch, MagicMock
+
+        config = _make_config()
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        # Create a mock KV cache manager
+        mock_kv = MagicMock()
+        mock_kv.find_cached_prefix.return_value = 0  # No cache hit
+        sched.kv_cache_manager = mock_kv
+
+        # Create a mock sequence that has block_ids allocated
+        mock_seq = MagicMock()
+        mock_seq.block_ids = [10, 11, 12]
+        mock_seq.token_ids = [1, 2, 3, 4]
+        mock_seq.is_finished = False
+        mock_seq.request_id = "req-leak-test"
+
+        # Patch _init_sequence to return our mock, then make something else fail
+        def fake_init(req):
+            return mock_seq
+
+        sched._init_sequence = fake_init
+
+        # Patch the sampler creation to raise
+        with patch("mlx_lm_server.scheduler.make_sampler", side_effect=RuntimeError("sampler boom")):
+            req = InferenceRequest(
+                request_id="req-leak-test",
+                prompt_tokens=[1, 2, 3, 4],
+                max_tokens=10,
+                temperature=1.0,
+                top_p=1.0,
+                stop_sequences=[],
+                stream=False,
+            )
+            # Pre-register result buffer
+            sched._results["req-leak-test"] = []
+            sched._results_ready["req-leak-test"] = threading.Event()
+            sched.request_queue.add(req)
+            sched._insert_new_requests_batch()
+
+        # Verify blocks were freed
+        mock_kv.free_blocks.assert_called_with([10, 11, 12])

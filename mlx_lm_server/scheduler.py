@@ -1085,6 +1085,8 @@ class Scheduler:
             return
 
         for req in new_requests:
+            seq = None
+            allocated_block_ids: list[int] = []
             try:
                 seq = self._init_sequence(req)
 
@@ -1113,6 +1115,7 @@ class Scheduler:
                             seq.token_ids[:num_cached]
                         )
                         seq.block_ids = block_ids
+                        allocated_block_ids = block_ids
                         # D1+G1: Validate all blocks before reconstruction
                         try:
                             block_data = []
@@ -1270,6 +1273,10 @@ class Scheduler:
                 # signal error to caller so they don't hang forever
                 request_id = req.request_id
                 logger.error("Failed to insert request %s: %s", request_id, e)
+                # Free KV blocks allocated during cache lookup to prevent leak
+                if seq is not None and self.kv_cache_manager is not None and seq.block_ids:
+                    self.kv_cache_manager.free_blocks(seq.block_ids)
+                    seq.block_ids = []
                 self._signal_finish(request_id, finish_reason="error")
                 # Clean up if sequence was partially added to active set
                 with self._active_lock:
