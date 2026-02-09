@@ -1704,3 +1704,247 @@ class TestSSDPromote:
             block = mgr.pool.blocks[bid]
             assert block.kv_data is not None
             assert block.ref_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Stale SSD index promote fix (phantom hash entry prevention)
+# ---------------------------------------------------------------------------
+
+
+class TestStaleSSDPromote:
+    """Tests for the fix to 'Phantom RAM hash entries after stale SSD index miss'.
+
+    When ssd.has_block() returns True but ssd.load_block() returns None,
+    the block should be treated as a COLLISION (hash NOT registered in
+    hash_table) so that cache_block() can self-heal later.
+    """
+
+    def test_stale_ssd_no_phantom_hash_entry(self):
+        """Stale SSD entry must NOT create a hash_table registration."""
+        from unittest.mock import MagicMock
+
+        config = make_config(block_size=4, num_blocks=8)
+        mock_ssd = MagicMock()
+        mgr = KVCacheManager(config, ssd=mock_ssd)
+
+        tokens = [1, 2, 3, 4]
+
+        # SSD index says it has the block, but load returns None (stale)
+        mock_ssd.has_block.return_value = True
+        mock_ssd.load_block.return_value = None
+
+        block_ids = mgr.allocate_blocks(tokens)
+        assert len(block_ids) == 1
+
+        # The block should have been allocated (MISS/COLLISION path)
+        block = mgr.pool.blocks[block_ids[0]]
+
+        # CRITICAL: block_hash should be None (COLLISION treatment),
+        # NOT registered in hash_table
+        assert block.block_hash is None, (
+            "Stale SSD promote should NOT register block_hash in hash_table"
+        )
+        block_hash = _compute_chain_hash([1, 2, 3, 4], None)
+        assert block_hash not in mgr.hash_table, (
+            "Phantom hash entry found — stale SSD promote should not register hash"
+        )
+
+        # kv_promote_fail stat should have been incremented
+        stats = mgr.get_stats()
+        assert stats["kv_promote_fail"] == 1
+
+    def test_stale_ssd_self_heals_with_cache_block(self):
+        """After stale SSD promote, cache_block() should succeed (self-heal)."""
+        from unittest.mock import MagicMock
+
+        config = make_config(block_size=4, num_blocks=8)
+        mock_ssd = MagicMock()
+        mgr = KVCacheManager(config, ssd=mock_ssd)
+
+        tokens = [1, 2, 3, 4]
+        block_hash = _compute_chain_hash(tokens, None)
+
+        # Step 1: stale SSD promote
+        mock_ssd.has_block.return_value = True
+        mock_ssd.load_block.return_value = None
+
+        stale_ids = mgr.allocate_blocks(tokens)
+        assert len(stale_ids) == 1
+
+        # Verify hash NOT in hash_table
+        assert block_hash not in mgr.hash_table
+
+        # Step 2: Free the stale block (collision blocks go directly to free pool)
+        mgr.free_blocks(stale_ids)
+
+        # Step 3: Self-heal via cache_block() — should succeed since
+        # block_hash is not in hash_table
+        kv_data = [{"keys": "real_k", "values": "real_v"}]
+        bid = mgr.cache_block(block_hash, tokens, kv_data)
+
+        assert bid is not None, "cache_block() should succeed after stale SSD promote"
+        assert block_hash in mgr.hash_table
+        healed_block = mgr.pool.blocks[bid]
+        assert healed_block.block_hash == block_hash
+        assert healed_block.kv_data == kv_data
+
+    def test_stale_ssd_mixed_with_ram_hits(self):
+        """9 RAM hits + 1 stale SSD promote: RAM hits preserved, stale treated as COLLISION."""
+        from unittest.mock import MagicMock
+
+        config = make_config(block_size=4, num_blocks=16)
+        mock_ssd = MagicMock()
+        mgr = KVCacheManager(config, ssd=mock_ssd)
+
+        # Build 10 blocks = 40 tokens
+        all_tokens = list(range(1, 41))
+
+        # First allocation: all blocks go to RAM (no SSD involvement)
+        mock_ssd.has_block.return_value = False
+        first_ids = mgr.allocate_blocks(all_tokens)
+        assert len(first_ids) == 10
+
+        # Save all block hashes for reference
+        block_hashes = [mgr.pool.blocks[bid].block_hash for bid in first_ids]
+
+        # Verify all 10 are in hash_table
+        for bh in block_hashes:
+            assert bh in mgr.hash_table
+
+        # Now simulate: evict block index 5 (the 6th block) from RAM
+        # and make it appear as "stale SSD" on re-allocation
+        target_idx = 5
+        target_hash = block_hashes[target_idx]
+        target_bid = first_ids[target_idx]
+
+        # Free and evict the target block
+        mgr.free_blocks([target_bid])
+        mgr.evict_lru(num_blocks=1)
+        assert target_hash not in mgr.hash_table
+
+        # Configure SSD mock: only target_hash is "on SSD" (but stale)
+        def mock_has_block(h):
+            return h == target_hash
+
+        mock_ssd.has_block.side_effect = mock_has_block
+        mock_ssd.load_block.return_value = None  # stale
+
+        # Re-allocate all tokens
+        new_ids = mgr.allocate_blocks(all_tokens)
+        assert len(new_ids) == 10
+
+        # NOTE: allocated_block_ids ordering is:
+        # - Pass 1 appends RAM hits in index order (0-4, 6-9 = 9 blocks)
+        # - Pass 3 appends the stale SSD block (index 5 = 1 block)
+        # So the stale block is the LAST element in new_ids.
+
+        # Count RAM hits: 9 blocks should be reused from first allocation
+        ram_hit_ids = set(first_ids) - {target_bid}
+        ram_hits_in_new = [bid for bid in new_ids if bid in ram_hit_ids]
+        assert len(ram_hits_in_new) == 9, (
+            f"Expected 9 RAM hits, got {len(ram_hits_in_new)}"
+        )
+
+        # Find the stale block: the one NOT in the original first_ids
+        # (it was freshly allocated from the free pool)
+        stale_candidates = [
+            bid for bid in new_ids
+            if mgr.pool.blocks[bid].block_hash is None
+        ]
+        assert len(stale_candidates) == 1, (
+            f"Expected exactly 1 COLLISION block, got {len(stale_candidates)}"
+        )
+        stale_bid = stale_candidates[0]
+        stale_block = mgr.pool.blocks[stale_bid]
+
+        # CRITICAL: block_hash must be None (COLLISION treatment)
+        assert stale_block.block_hash is None, (
+            "Stale SSD block should have block_hash=None (COLLISION)"
+        )
+        assert target_hash not in mgr.hash_table, (
+            "Target hash should NOT be in hash_table after stale promote"
+        )
+
+        # Verify kv_promote_fail incremented
+        stats = mgr.get_stats()
+        assert stats["kv_promote_fail"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _rollback_allocations_locked helper
+# ---------------------------------------------------------------------------
+
+
+class TestRollbackAllocationsLocked:
+    """Tests for the extracted _rollback_allocations_locked() helper."""
+
+    def test_rollback_freshly_allocated(self):
+        """Freshly allocated blocks are returned to pool and removed from hash_table."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+
+        # Manually set up a "freshly allocated" block
+        with mgr.lock:
+            block = mgr.pool.get_free_block()
+            block.block_hash = "test_hash"
+            block.token_ids = [1, 2, 3, 4]
+            block.ref_count = 1
+            mgr.hash_table["test_hash"] = block.block_id
+
+            allocated = [block.block_id]
+            freshly = [block.block_id]
+
+            free_before = mgr.pool.num_free
+
+            mgr._rollback_allocations_locked(allocated, freshly)
+
+            # Block should be returned to free pool
+            assert mgr.pool.num_free == free_before + 1
+            # Hash should be removed
+            assert "test_hash" not in mgr.hash_table
+
+    def test_rollback_reused_blocks(self):
+        """Reused (cache-hit) blocks get ref_count decremented."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        block = mgr.pool.blocks[ids[0]]
+        # Simulate a second allocation reusing this block
+        block.ref_count = 2
+
+        with mgr.lock:
+            mgr._rollback_allocations_locked(ids, [])  # Not freshly allocated
+
+        assert block.ref_count == 1  # Decremented back
+
+    def test_rollback_mixed(self):
+        """Mix of fresh and reused blocks handled correctly."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+
+        # Allocate a reused block (cache hit)
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        reused_bid = ids[0]
+        mgr.pool.blocks[reused_bid].ref_count = 2  # Simulating 2nd alloc
+
+        # Allocate a fresh block
+        with mgr.lock:
+            fresh_block = mgr.pool.get_free_block()
+            fresh_block.block_hash = "fresh_hash"
+            fresh_block.token_ids = [5, 6, 7, 8]
+            fresh_block.ref_count = 1
+            mgr.hash_table["fresh_hash"] = fresh_block.block_id
+            fresh_bid = fresh_block.block_id
+
+            all_allocated = [reused_bid, fresh_bid]
+            freshly = [fresh_bid]
+
+            mgr._rollback_allocations_locked(all_allocated, freshly)
+
+        # Reused block: ref_count decremented
+        assert mgr.pool.blocks[reused_bid].ref_count == 1
+        # Fresh block: returned to pool, hash removed
+        assert "fresh_hash" not in mgr.hash_table

@@ -333,52 +333,64 @@ def create_app(
         except RuntimeError as e:
             raise HTTPException(status_code=429, detail=str(e))
 
-        # Poll with short intervals to detect client disconnect.
-        # Between polls, asyncio.CancelledError can propagate if client disconnects.
-        loop = asyncio.get_running_loop()
-        poll_interval = 2.0
-        elapsed = 0.0
-        events = None
-        while elapsed < timeout:
-            remaining = timeout - elapsed
-            wait = min(poll_interval, remaining) if remaining > 0 else poll_interval
-            try:
-                events = await loop.run_in_executor(
-                    None, lambda t=wait: sched.get_result(request_id, timeout=t)
-                )
-                break  # Got result
-            except TimeoutError:
-                elapsed += wait
-                continue
+        # Track whether we successfully built the response.  If not,
+        # the finally block cancels the request (handles client disconnect
+        # via asyncio.CancelledError and any other unexpected failure).
+        completed = False
+        try:
+            # Poll with short intervals to detect client disconnect.
+            # Between polls, asyncio.CancelledError can propagate if client disconnects.
+            loop = asyncio.get_running_loop()
+            poll_interval = 2.0
+            elapsed = 0.0
+            events = None
+            while elapsed < timeout:
+                remaining = timeout - elapsed
+                wait = min(poll_interval, remaining) if remaining > 0 else poll_interval
+                try:
+                    events = await loop.run_in_executor(
+                        None, lambda t=wait: sched.get_result(request_id, timeout=t)
+                    )
+                    break  # Got result
+                except TimeoutError:
+                    elapsed += wait
+                    continue
 
-        if not events:
-            sched.cancel_request(request_id)
-            raise HTTPException(status_code=504, detail="Request timed out")
+            if not events:
+                raise HTTPException(status_code=504, detail="Request timed out")
 
-        # Exclude EOS token from output if present (by token_id, not text)
-        filtered_events = events
-        eos_ids = _get_eos_token_ids(tok) if tok else set()
-        if events and eos_ids and events[-1].token_id in eos_ids:
-            filtered_events = events[:-1]
-        completion_text = "".join(e.token_text for e in filtered_events)
-        finish_reason = events[-1].finish_reason if events else "stop"
+            # Exclude EOS token from output if present (by token_id, not text)
+            filtered_events = events
+            eos_ids = _get_eos_token_ids(tok) if tok else set()
+            if events and eos_ids and events[-1].token_id in eos_ids:
+                filtered_events = events[:-1]
+            completion_text = "".join(e.token_text for e in filtered_events)
+            finish_reason = events[-1].finish_reason if events else "stop"
 
-        # Truncate stop-sequence text from output (the scheduler truncates
-        # seq.output_text, but individual TokenEvent.token_text values still
-        # carry the raw text, so the joined string may contain the stop sequence).
-        if finish_reason == "stop" and inf_req.stop_sequences:
-            for stop_seq in inf_req.stop_sequences:
-                idx = completion_text.find(stop_seq)
-                if idx != -1:
-                    completion_text = completion_text[:idx]
-                    break
+            # Truncate stop-sequence text from output (the scheduler truncates
+            # seq.output_text, but individual TokenEvent.token_text values still
+            # carry the raw text, so the joined string may contain the stop sequence).
+            if finish_reason == "stop" and inf_req.stop_sequences:
+                for stop_seq in inf_req.stop_sequences:
+                    idx = completion_text.find(stop_seq)
+                    if idx != -1:
+                        completion_text = completion_text[:idx]
+                        break
 
-        completion_tokens = len(filtered_events)
+            completion_tokens = len(filtered_events)
 
-        return format_response(
-            request_id, app.state.model_name, completion_text,
-            finish_reason, len(prompt_tokens), completion_tokens,
-        )
+            result = format_response(
+                request_id, app.state.model_name, completion_text,
+                finish_reason, len(prompt_tokens), completion_tokens,
+            )
+            completed = True
+            return result
+        finally:
+            if not completed:
+                try:
+                    sched.cancel_request(request_id)
+                except Exception:
+                    logger.warning("Best-effort cancel failed for %s", request_id)
 
     # ------------------------------------------------------------------
     # POST /v1/chat/completions

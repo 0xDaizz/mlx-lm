@@ -297,6 +297,30 @@ class KVCacheManager:
 
         return cached_tokens
 
+    def _rollback_allocations_locked(
+        self, allocated_block_ids: list[int], freshly_allocated: list[int]
+    ) -> None:
+        """Rollback all allocations made so far. Caller must hold self.lock.
+
+        For freshly allocated blocks (new blocks pulled from free pool),
+        removes their hash_table entry and returns them to the free pool.
+        For reused blocks (cache hits with incremented ref_count),
+        decrements their ref_count back.
+
+        Args:
+            allocated_block_ids: All block IDs allocated in this call so far.
+            freshly_allocated: Subset of allocated_block_ids that were freshly
+                pulled from the free pool (not cache-hit reuses).
+        """
+        for bid in allocated_block_ids:
+            b = self.pool.blocks[bid]
+            if bid in freshly_allocated:
+                if b.block_hash is not None and self.hash_table.get(b.block_hash) == bid:
+                    del self.hash_table[b.block_hash]
+                self.pool.return_block(bid)
+            else:
+                b.ref_count -= 1
+
     def allocate_blocks(
         self, token_ids: list[int], num_existing_blocks: int = 0
     ) -> list[int]:
@@ -424,14 +448,7 @@ class KVCacheManager:
                             evicted = self._evict_lru_locked(num_blocks=1)
                             if not evicted:
                                 self._stats["kv_promote_fail"] += 1
-                                for bid in allocated_block_ids:
-                                    b = self.pool.blocks[bid]
-                                    if bid in freshly_allocated:
-                                        if b.block_hash is not None and b.block_hash in self.hash_table:
-                                            del self.hash_table[b.block_hash]
-                                        self.pool.return_block(bid)
-                                    else:
-                                        b.ref_count -= 1
+                                self._rollback_allocations_locked(allocated_block_ids, freshly_allocated)
                                 raise BlockPoolExhaustedError(
                                     "Block pool exhausted and no blocks eligible for eviction"
                                 )
@@ -451,7 +468,14 @@ class KVCacheManager:
                             block.block_id, block_hash,
                         )
                         continue
-                    # SSD load returned None — fall through to MISS
+
+                    # SSD load returned None (stale index) — reclassify as
+                    # COLLISION so the MISS handler allocates a block WITHOUT
+                    # registering block_hash in hash_table.  This prevents
+                    # "phantom" hash entries that block self-healing via
+                    # cache_block().
+                    self._stats["kv_promote_fail"] += 1
+                    classification = COLLISION
 
                 # MISS or COLLISION or failed SSD promote
                 is_collision = (classification == COLLISION)
@@ -460,14 +484,7 @@ class KVCacheManager:
                 except BlockPoolExhaustedError:
                     evicted = self._evict_lru_locked(num_blocks=1)
                     if not evicted:
-                        for bid in allocated_block_ids:
-                            b = self.pool.blocks[bid]
-                            if bid in freshly_allocated:
-                                if b.block_hash is not None and b.block_hash in self.hash_table:
-                                    del self.hash_table[b.block_hash]
-                                self.pool.return_block(bid)
-                            else:
-                                b.ref_count -= 1
+                        self._rollback_allocations_locked(allocated_block_ids, freshly_allocated)
                         raise BlockPoolExhaustedError(
                             "Block pool exhausted and no blocks eligible for eviction"
                         )
