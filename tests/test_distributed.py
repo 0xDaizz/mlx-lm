@@ -829,7 +829,7 @@ class TestDrainBusOutboxCompound:
         scheduler.stop()
 
     def test_drain_requeues_on_publish_failure(self):
-        """If publish fails, events should be re-queued for retry."""
+        """If publish fails, events should be saved in _bus_retry_events for retry."""
 
         class FailingBus:
             def publish(self, event):
@@ -845,8 +845,8 @@ class TestDrainBusOutboxCompound:
         # Drain should not raise (caught internally)
         scheduler._drain_bus_outbox()
 
-        # Event should be re-queued (noop events are not re-queued)
-        assert not scheduler._bus_outbox.empty()
+        # Event should be saved in _bus_retry_events (not re-queued to outbox)
+        assert len(scheduler._bus_retry_events) > 0
         scheduler.stop()
 
     def test_drain_outbox_no_bus_is_noop(self):
@@ -1399,4 +1399,212 @@ class TestJoinWorkerLoopTimeout:
         scheduler = Scheduler(config=config)
         scheduler.join_worker_loop(timeout=1.0)
         assert scheduler.worker_timed_out is False
+        scheduler.stop()
+
+
+# =========================================================================
+# M. Commit 4 Fixes — U7, U8, U9
+# =========================================================================
+
+
+class TestPublishFailurePreservesOrder:
+    """U7: Publish failure should preserve event order for retry."""
+
+    def test_publish_failure_preserves_event_order(self):
+        """When publish fails, events should be saved for retry in order."""
+        fail_count = 0
+
+        class FailOnceBus:
+            def publish(self, event):
+                nonlocal fail_count
+                fail_count += 1
+                if fail_count == 1:
+                    raise RuntimeError("Network error")
+                # Second call succeeds
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=FailOnceBus())
+
+        req = InferenceRequest(request_id="order-test", prompt_tokens=[1], max_tokens=5)
+        scheduler.submit_request(req)
+
+        # First drain fails — events should be saved in _bus_retry_events
+        scheduler._drain_bus_outbox()
+        assert len(scheduler._bus_retry_events) > 0
+
+        # Second drain should retry the saved events (not drain new from outbox)
+        scheduler._drain_bus_outbox()
+        assert len(scheduler._bus_retry_events) == 0  # Success clears retry
+        scheduler.stop()
+
+    def test_retry_backlog_does_not_drain_new_events(self):
+        """When retry backlog exists, new outbox items should not be drained."""
+        published_events = []
+
+        class TrackingBus:
+            call_count = 0
+            def publish(self, event):
+                self.call_count += 1
+                if self.call_count == 1:
+                    raise RuntimeError("First publish fails")
+                published_events.append(event)
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        bus = TrackingBus()
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=bus)
+
+        # Submit first request
+        req1 = InferenceRequest(request_id="retry-r1", prompt_tokens=[1], max_tokens=5)
+        scheduler.submit_request(req1)
+
+        # First drain fails
+        scheduler._drain_bus_outbox()
+        assert len(scheduler._bus_retry_events) > 0
+
+        # Submit a second request while retry is pending
+        req2 = InferenceRequest(request_id="retry-r2", prompt_tokens=[2], max_tokens=5)
+        scheduler.submit_request(req2)
+
+        # Second drain should only retry the first batch, NOT drain r2
+        scheduler._drain_bus_outbox()
+        assert len(published_events) == 1  # Only the retry batch
+        # Verify the retried batch contains r1 but not r2
+        inner = published_events[0].unpack_batch()
+        request_ids = [e.unpack_request().request_id for e in inner if e.typ == "submit"]
+        assert "retry-r1" in request_ids
+        assert "retry-r2" not in request_ids
+
+        # r2 should still be in the outbox
+        assert not scheduler._bus_outbox.empty()
+        scheduler.stop()
+
+
+class TestApplyBusEventsAddException:
+    """U8: request_queue.add() exception in _apply_bus_events should be handled."""
+
+    def test_apply_bus_events_add_exception_handled(self):
+        """If request_queue.add() fails in _apply_bus_events, should not crash."""
+        class MockBus:
+            def recv(self):
+                req = InferenceRequest(
+                    request_id="add-fail-req",
+                    prompt_tokens=[1],
+                    max_tokens=5,
+                )
+                return ControlEvent.submit(req)
+
+        config = ServerConfig(max_queue_size=1)  # queue size 1
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Fill the queue first
+        scheduler.request_queue.add(InferenceRequest(
+            request_id="filler", prompt_tokens=[1], max_tokens=1
+        ))
+
+        # Apply bus event should not crash even though queue is full
+        result = scheduler._apply_bus_events()
+        assert result is True  # Should continue despite add failure
+        # Queue should still have original item
+        assert scheduler.request_queue.size == 1
+        scheduler.stop()
+
+
+class TestBusOutboxBackpressure:
+    """U9: Bus outbox backpressure should reject requests."""
+
+    def test_bus_outbox_full_rejects_request(self):
+        """When outbox is nearly full, submit should raise BusOutboxFullError."""
+        from mlx_lm_server.types import BusOutboxFullError
+        from mlx_lm_server.scheduler import BUS_OUTBOX_MAXSIZE, BUS_OUTBOX_CONTROL_RESERVE
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Fill the outbox to the backpressure threshold
+        from mlx_lm_server.distributed_bus import ControlEvent as CE
+        for i in range(BUS_OUTBOX_MAXSIZE - BUS_OUTBOX_CONTROL_RESERVE):
+            scheduler._bus_outbox.put_nowait(CE.noop())
+
+        # Next submit should be rejected
+        req = InferenceRequest(request_id="full-bus-req", prompt_tokens=[1], max_tokens=5)
+        with pytest.raises(BusOutboxFullError):
+            scheduler.submit_request(req)
+
+        # Request should NOT be in queue (was rolled back)
+        assert scheduler.request_queue.size == 0
+        scheduler.stop()
+
+    def test_dist_fatal_submit_returns_503(self):
+        """After _dist_fatal, submit should raise RuntimeError."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler._dist_fatal = True
+
+        req = InferenceRequest(request_id="fatal-req", prompt_tokens=[1], max_tokens=5)
+        with pytest.raises(RuntimeError, match="Distributed control plane degraded"):
+            scheduler.submit_request(req)
+        scheduler.stop()
+
+    def test_cancel_uses_control_reserve(self):
+        """Cancel events should use the control reserve and succeed even when submit would fail."""
+        from mlx_lm_server.types import BusOutboxFullError
+        from mlx_lm_server.scheduler import BUS_OUTBOX_MAXSIZE, BUS_OUTBOX_CONTROL_RESERVE
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Fill the outbox to the backpressure threshold
+        from mlx_lm_server.distributed_bus import ControlEvent as CE
+        for i in range(BUS_OUTBOX_MAXSIZE - BUS_OUTBOX_CONTROL_RESERVE):
+            scheduler._bus_outbox.put_nowait(CE.noop())
+
+        # Put a request in queue so cancel has something to find
+        scheduler.request_queue.add(InferenceRequest(
+            request_id="cancel-reserve", prompt_tokens=[1], max_tokens=5
+        ))
+
+        # Cancel should work even though submit would fail (uses control reserve)
+        result = scheduler.cancel_request("cancel-reserve")
+        assert result is True
+        scheduler.stop()
+
+    def test_distributed_cancel_is_outbox_only(self):
+        """In distributed mode, cancel should go through outbox."""
+        published = []
+
+        class MockBus:
+            def publish(self, event):
+                published.append(event)
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Submit and drain
+        req = InferenceRequest(request_id="outbox-cancel", prompt_tokens=[1], max_tokens=5)
+        scheduler.submit_request(req)
+        # Drain submit event
+        while not scheduler._bus_outbox.empty():
+            scheduler._bus_outbox.get_nowait()
+
+        # Cancel queued request
+        scheduler.cancel_request("outbox-cancel")
+
+        # Cancel event should be in outbox
+        assert not scheduler._bus_outbox.empty()
+        event = scheduler._bus_outbox.get_nowait()
+        assert event.typ == "cancel"
         scheduler.stop()

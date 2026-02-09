@@ -1110,3 +1110,109 @@ class TestCancelFreesKVBlocks:
         mock_cache_mgr.free_blocks.assert_called_with([10, 20, 30])
 
         s.stop()
+
+
+# ---------------------------------------------------------------------------
+# F8  Mock path bus sync
+# ---------------------------------------------------------------------------
+
+
+class TestMockPathBusSync:
+    """F8: Mock inference step should call bus sync like batch step."""
+
+    def test_mock_path_bus_sync(self):
+        """Verify mock inference step calls _drain_bus_outbox and _apply_bus_events."""
+        from unittest.mock import MagicMock
+
+        config = _make_config()
+        ctx = MagicMock()
+        ctx.is_rank0 = True
+        ctx.__bool__ = lambda self: True
+
+        mock_bus = MagicMock()
+        s = Scheduler(config=config, dist_ctx=ctx, control_bus=mock_bus)
+
+        # Track drain calls
+        drain_calls = []
+        original_drain = s._drain_bus_outbox
+        def tracking_drain():
+            drain_calls.append(1)
+            original_drain()
+        s._drain_bus_outbox = tracking_drain
+
+        # Submit a request to trigger mock inference step processing
+        s._mock_generate = lambda rid, tids, step: (step + 1, f"t{step}", "stop")
+        req = _make_request("bus-sync-test", max_tokens=3)
+        s.submit_request(req)
+
+        s.run_inference_loop(blocking=False)
+        try:
+            s.get_result("bus-sync-test", timeout=5.0)
+            # drain should have been called at least once during mock inference steps
+            assert len(drain_calls) > 0, "Expected _drain_bus_outbox to be called in mock path"
+        finally:
+            s.stop()
+
+
+# ---------------------------------------------------------------------------
+# F9  Shutdown status
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownStatus:
+    """F9: Scheduler should track shutdown status."""
+
+    def test_shutdown_status_clean(self):
+        """shutdown_status defaults to 'clean' and appears in stats."""
+        s = _make_scheduler()
+        assert s.shutdown_status == "clean"
+        stats = s.get_cache_stats()
+        assert stats["shutdown_status"] == "clean"
+
+    def test_shutdown_status_writer_failed(self):
+        """shutdown_status set to 'writer_failed' when SSD writer fails."""
+        from unittest.mock import MagicMock
+
+        mock_writer = MagicMock()
+        mock_writer.stop.return_value = False  # writer did not stop cleanly
+
+        s = _make_scheduler(ssd_writer=mock_writer)
+        s.stop()
+        assert s.shutdown_status == "writer_failed"
+
+    def test_shutdown_status_partial_flush(self):
+        """shutdown_status set to 'partial_flush' when flush after writer failure."""
+        from unittest.mock import MagicMock
+
+        mock_writer = MagicMock()
+        mock_writer.stop.return_value = False
+
+        mock_ssd = MagicMock()
+        mock_tiered = MagicMock()
+        mock_tiered.ssd = mock_ssd
+
+        s = _make_scheduler(ssd_writer=mock_writer, tiered_cache=mock_tiered)
+        s.stop()
+        assert s.shutdown_status == "partial_flush"
+
+
+# ---------------------------------------------------------------------------
+# U2  BatchGenerator import failure
+# ---------------------------------------------------------------------------
+
+
+class TestBatchGeneratorImportGuard:
+    """U2: Model provided but BatchGenerator import failed should raise."""
+
+    def test_batch_generator_import_fail_raises(self):
+        """model!=None but BatchGenerator=None should raise ImportError."""
+        import mlx_lm_server.scheduler as sched_mod
+        original = sched_mod.BatchGenerator
+
+        try:
+            sched_mod.BatchGenerator = None
+            config = _make_config()
+            with pytest.raises(ImportError, match="BatchGenerator failed to import"):
+                Scheduler(config=config, model="fake-model", tokenizer=None)
+        finally:
+            sched_mod.BatchGenerator = original

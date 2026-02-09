@@ -25,11 +25,6 @@ def main() -> None:
 
         # --- Load model and tokenizer ---
         if dist_ctx.enabled and dist_ctx.world_size > 1:
-            if config.adapter_path is not None:
-                raise ValueError(
-                    "Distributed mode does not support adapter_path. "
-                    "Remove --adapter-path or set --distributed-mode off."
-                )
             from mlx_lm.utils import sharded_load
 
             logger.info(

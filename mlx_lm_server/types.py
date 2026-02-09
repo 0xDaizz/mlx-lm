@@ -84,3 +84,10 @@ class SSDBlockMeta:
     filepath: Path
     last_accessed: datetime = field(default_factory=datetime.now)
     num_tokens: int = 0
+
+
+class BusOutboxFullError(Exception):
+    """Raised when the distributed bus outbox is full (backpressure)."""
+    def __init__(self, request_id: str):
+        self.request_id = request_id
+        super().__init__(f"Bus outbox full, cannot enqueue request {request_id}")

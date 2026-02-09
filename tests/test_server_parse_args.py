@@ -170,3 +170,20 @@ class TestParseArgsRangeValidation:
         assert config.num_blocks == 1024
         assert config.max_batch_size == 4
         assert config.max_queue_size == 64
+
+
+class TestParseArgsPrefillBatchSize:
+    """F7: prefill_batch_size > max_batch_size should be rejected."""
+
+    def test_prefill_exceeds_max_rejected(self):
+        with pytest.raises(SystemExit):
+            parse_args(["--prefill-batch-size", "16", "--max-batch-size", "8"])
+
+    def test_prefill_equals_max_accepted(self):
+        config = parse_args(["--prefill-batch-size", "8", "--max-batch-size", "8"])
+        assert config.prefill_batch_size == 8
+        assert config.max_batch_size == 8
+
+    def test_prefill_less_than_max_accepted(self):
+        config = parse_args(["--prefill-batch-size", "4", "--max-batch-size", "8"])
+        assert config.prefill_batch_size == 4

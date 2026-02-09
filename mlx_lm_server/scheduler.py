@@ -57,6 +57,8 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 BUS_ERROR_THRESHOLD = 10
+BUS_OUTBOX_MAXSIZE = 1024
+BUS_OUTBOX_CONTROL_RESERVE = 64
 
 
 class RequestQueue:
@@ -193,12 +195,16 @@ class Scheduler:
         self._dist_ctx = dist_ctx
         self._control_bus = control_bus
         # Local queue for events to broadcast (rank0 only, used by inference loop)
-        self._bus_outbox: queue.Queue = queue.Queue()
+        self._bus_outbox: queue.Queue = queue.Queue(
+            maxsize=BUS_OUTBOX_MAXSIZE if control_bus is not None else 0
+        )
 
         # Bus error tracking for resilience (U3)
         self._bus_error_count: int = 0
         self._dist_fatal: bool = False
         self._dist_fatal_reason: str = ""
+        # Bus retry events for publish failure ordering (U7)
+        self._bus_retry_events: list = []
 
         # SSD pruning counter (prune every N inference steps)
         self._ssd_prune_interval: int = 1000
@@ -232,6 +238,7 @@ class Scheduler:
         self._shutdown_clean: bool = True
         self._shutdown_partial_flush: bool = False
         self.worker_timed_out: bool = False
+        self.shutdown_status: str = "clean"
 
         # Crash recovery: validate SSD index on startup
         if (self._tiered_cache is not None
@@ -254,6 +261,12 @@ class Scheduler:
             self._create_batch_generator()
             self._sequence_cache = SequenceCacheStore(
                 max_entries=config.sequence_cache_size
+            )
+
+        if self.model is not None and BatchGenerator is None:
+            raise ImportError(
+                "model was provided but BatchGenerator failed to import. "
+                "Check mlx_lm installation."
             )
 
     def _inc_stat(self, key: str, value: int = 1) -> None:
@@ -322,7 +335,16 @@ class Scheduler:
         # Queue submit event for broadcast to non-rank0 workers (TP mode)
         if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
             from mlx_lm_server.distributed_bus import ControlEvent
-            self._bus_outbox.put(ControlEvent.submit(request))
+            from mlx_lm_server.types import BusOutboxFullError
+            if self._bus_outbox.qsize() >= BUS_OUTBOX_MAXSIZE - BUS_OUTBOX_CONTROL_RESERVE:
+                # Undo the queue add and result buffer setup
+                self.request_queue.cancel(request.request_id)
+                if not is_streaming:
+                    with self._results_lock:
+                        self._results.pop(request.request_id, None)
+                        self._results_ready.pop(request.request_id, None)
+                raise BusOutboxFullError(request.request_id)
+            self._bus_outbox.put_nowait(ControlEvent.submit(request))
 
         logger.debug("Submitted request %s", request.request_id)
 
@@ -379,7 +401,12 @@ class Scheduler:
             # Queue cancel event for broadcast to non-rank0 workers (TP mode)
             if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
                 from mlx_lm_server.distributed_bus import ControlEvent
-                self._bus_outbox.put(ControlEvent.cancel(request_id))
+                try:
+                    self._bus_outbox.put_nowait(ControlEvent.cancel(request_id))
+                except queue.Full:
+                    logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
+                    self._dist_fatal = True
+                    self._dist_fatal_reason = "bus_outbox_full_cancel"
             return True
 
         # Use consistent lock ordering: _active_lock FIRST, then _cancelled_lock
@@ -390,7 +417,12 @@ class Scheduler:
                 # Queue cancel event for broadcast to non-rank0 workers (TP mode)
                 if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
                     from mlx_lm_server.distributed_bus import ControlEvent
-                    self._bus_outbox.put(ControlEvent.cancel(request_id))
+                    try:
+                        self._bus_outbox.put_nowait(ControlEvent.cancel(request_id))
+                    except queue.Full:
+                        logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
+                        self._dist_fatal = True
+                        self._dist_fatal_reason = "bus_outbox_full_cancel"
                 return True
 
         # Request not found in queue or active — clean up any stale buffers
@@ -460,6 +492,7 @@ class Scheduler:
             writer_ok = self._ssd_writer.stop(drain_timeout=5.0)
             if not writer_ok:
                 self._shutdown_clean = False
+                self.shutdown_status = "writer_failed"
                 logger.critical(
                     "SSD writer did not stop cleanly. Partial durability state."
                 )
@@ -476,6 +509,7 @@ class Scheduler:
                 self._tiered_cache.ssd.flush()
                 if not self._shutdown_clean:
                     self._shutdown_partial_flush = True
+                    self.shutdown_status = "partial_flush"
                     logger.error(
                         "Partial SSD flush after incomplete writer shutdown. "
                         "validate_index() will reconcile on next startup."
@@ -512,6 +546,14 @@ class Scheduler:
 
     def _mock_inference_step(self) -> None:
         """One iteration of the mock inference loop (model=None)."""
+        # Distributed bus synchronization (TP mode) — same as _batch_inference_step
+        if self._control_bus is not None and self._dist_ctx is not None:
+            if self._dist_ctx.is_rank0:
+                self._drain_bus_outbox()
+            else:
+                if not self._apply_bus_events():
+                    return  # shutdown received
+
         # Wait for new requests if nothing is active
         with self._active_lock:
             has_active = len(self._active_sequences) > 0
@@ -588,7 +630,14 @@ class Scheduler:
                 request = event.unpack_request()
                 if request is not None:
                     is_streaming = getattr(request, "stream", False)
-                    self.request_queue.add(request)
+                    try:
+                        self.request_queue.add(request)
+                    except Exception:
+                        logger.warning(
+                            "Failed to add request %s from bus event to queue",
+                            request.request_id, exc_info=True,
+                        )
+                        continue
                     if not is_streaming:
                         is_worker = self._dist_ctx is not None and not self._dist_ctx.is_rank0
                         if not is_worker:
@@ -621,24 +670,27 @@ class Scheduler:
     def _drain_bus_outbox(self) -> None:
         """Rank0: broadcast all queued events to all ranks via the control bus.
 
-        Drains the entire outbox and sends all events in a single collective
-        broadcast. This ensures rank>0 workers receive all events atomically,
-        preventing rank divergence in active sequences.
-
-        If no events are pending, sends a noop to keep ranks synchronized.
+        Uses retry-first pattern: if previous events failed to publish,
+        retry those first before draining new events from the outbox.
+        This preserves event ordering across retries.
         """
         if self._control_bus is None:
             return
 
         from mlx_lm_server.distributed_bus import ControlEvent
 
-        # Drain all pending events
-        events: list[ControlEvent] = []
-        while True:
-            try:
-                events.append(self._bus_outbox.get_nowait())
-            except queue.Empty:
-                break
+        # Retry-first: if we have pending retries, use those instead of draining new events
+        if self._bus_retry_events:
+            events = self._bus_retry_events
+            self._bus_retry_events = []
+        else:
+            # Drain all pending events from the outbox
+            events = []
+            while True:
+                try:
+                    events.append(self._bus_outbox.get_nowait())
+                except queue.Empty:
+                    break
 
         if not events:
             events = [ControlEvent.noop()]
@@ -667,10 +719,12 @@ class Scheduler:
                 self._running = False
                 self._new_request_event.set()
             else:
-                # Re-queue events that failed to publish
-                for ev in events:
-                    if ev.typ != "noop":
-                        self._bus_outbox.put(ev)
+                # Preserve events for retry (skip noops)
+                real_events = [ev for ev in events if ev.typ != "noop"]
+                if real_events:
+                    self._bus_retry_events = real_events
+                    # Signal quick retry
+                    self._new_request_event.set()
 
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""
@@ -1597,6 +1651,7 @@ class Scheduler:
         # Shutdown health fields
         stats["shutdown_clean"] = self._shutdown_clean
         stats["shutdown_partial_flush"] = self._shutdown_partial_flush
+        stats["shutdown_status"] = self.shutdown_status
         return stats
 
     def shutdown(self) -> None:

@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, field_validator
 
 from mlx_lm_server.config import ServerConfig
-from mlx_lm_server.types import InferenceRequest, TokenEvent
+from mlx_lm_server.types import InferenceRequest, TokenEvent, BusOutboxFullError
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +338,8 @@ def create_app(
 
         try:
             sched.submit_request(inf_req)
+        except BusOutboxFullError:
+            raise HTTPException(status_code=503, detail="Server overloaded — distributed bus full")
         except RuntimeError as e:
             if "Distributed control plane degraded" in str(e):
                 raise HTTPException(status_code=503, detail=str(e))
@@ -634,6 +636,10 @@ def _stream_response(
         try:
             try:
                 scheduler.submit_request(inf_req)
+            except BusOutboxFullError:
+                error_data = {"error": {"message": "Server overloaded — distributed bus full", "type": "server_error"}}
+                yield f"data: {json.dumps(error_data)}\n\n"
+                return
             except RuntimeError as e:
                 if "Distributed control plane degraded" in str(e):
                     error_data = {"error": {"message": str(e), "type": "server_error"}}
@@ -835,6 +841,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--max-batch-size must be > 0")
     if parsed.max_queue_size <= 0:
         parser.error("--max-queue-size must be > 0")
+    if parsed.prefill_batch_size > parsed.max_batch_size:
+        parser.error("--prefill-batch-size cannot exceed --max-batch-size")
 
     # Distributed validation
     if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None:
