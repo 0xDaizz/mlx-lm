@@ -344,7 +344,16 @@ class Scheduler:
                         self._results.pop(request.request_id, None)
                         self._results_ready.pop(request.request_id, None)
                 raise BusOutboxFullError(request.request_id)
-            self._bus_outbox.put_nowait(ControlEvent.submit(request))
+            try:
+                self._bus_outbox.put_nowait(ControlEvent.submit(request))
+            except queue.Full:
+                # TOCTOU: another thread passed qsize check simultaneously
+                self.request_queue.cancel(request.request_id)
+                if not is_streaming:
+                    with self._results_lock:
+                        self._results.pop(request.request_id, None)
+                        self._results_ready.pop(request.request_id, None)
+                raise BusOutboxFullError(request.request_id)
 
         logger.debug("Submitted request %s", request.request_id)
 
@@ -407,6 +416,8 @@ class Scheduler:
                     logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
                     self._dist_fatal = True
                     self._dist_fatal_reason = "bus_outbox_full_cancel"
+                    self._running = False
+                    self._new_request_event.set()
             return True
 
         # Use consistent lock ordering: _active_lock FIRST, then _cancelled_lock
@@ -423,6 +434,8 @@ class Scheduler:
                         logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
                         self._dist_fatal = True
                         self._dist_fatal_reason = "bus_outbox_full_cancel"
+                        self._running = False
+                        self._new_request_event.set()
                 return True
 
         # Request not found in queue or active — clean up any stale buffers
