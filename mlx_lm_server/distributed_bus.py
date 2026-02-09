@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import logging
 import pickle
 from dataclasses import dataclass
@@ -11,6 +12,28 @@ if TYPE_CHECKING:
     from .distributed import DistributedContext
 
 logger = logging.getLogger(__name__)
+
+_ALLOWED_MODULES = {
+    "mlx_lm_server.distributed_bus": {"ControlEvent"},
+    "mlx_lm_server.types": {"InferenceRequest"},
+    "builtins": {"list", "dict", "tuple", "set", "frozenset", "str", "int", "float", "bool", "bytes", "type", "NoneType"},
+    "collections": {"OrderedDict"},
+}
+
+
+class RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str) -> type:
+        allowed = _ALLOWED_MODULES.get(module)
+        if allowed is not None and name in allowed:
+            return super().find_class(module, name)
+        raise pickle.UnpicklingError(
+            f"Restricted unpickle: {module}.{name} not in whitelist"
+        )
+
+
+def restricted_loads(data: bytes):
+    return RestrictedUnpickler(io.BytesIO(data)).load()
+
 
 ControlEventType = Literal["submit", "cancel", "shutdown", "noop", "batch"]
 
@@ -46,19 +69,19 @@ class ControlEvent:
         """Deserialize payload as a list of ControlEvents."""
         if self.payload is None:
             return []
-        return pickle.loads(self.payload)
+        return restricted_loads(self.payload)
 
     def unpack_request(self):
         """Deserialize payload as InferenceRequest."""
         if self.payload is None:
             return None
-        return pickle.loads(self.payload)
+        return restricted_loads(self.payload)
 
     def unpack_request_id(self) -> str | None:
         """Deserialize payload as request_id string."""
         if self.payload is None:
             return None
-        return pickle.loads(self.payload)
+        return restricted_loads(self.payload)
 
 
 class DistributedControlBus:
@@ -131,7 +154,7 @@ class DistributedControlBus:
             buf = mx.distributed.all_sum(buf, group=self.group)
             mx.eval(buf)
             try:
-                return pickle.loads(bytes(buf))
+                return restricted_loads(bytes(buf))
             except Exception as e:
                 logger.error("Failed to deserialize control event (%d bytes)", size, exc_info=True)
                 raise RuntimeError(
