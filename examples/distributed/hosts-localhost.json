@@ -1,0 +1,8 @@
+{
+    "hosts": [
+        {
+            "hostname": "localhost",
+            "num_ranks": 2
+        }
+    ]
+}

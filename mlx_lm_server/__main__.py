@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import logging
+import os
+import shutil
 import sys
 
 import uvicorn
@@ -13,7 +16,64 @@ from mlx_lm_server.server import create_app, parse_args
 logger = logging.getLogger(__name__)
 
 
+def _maybe_relaunch_under_mlx_launch() -> None:
+    """Auto-relaunch the server under ``mlx.launch`` when distributed mode is requested.
+
+    This performs a quick pre-parse of ``sys.argv`` to detect ``--distributed-mode``
+    and, if it is ``ring`` or ``jaccl``, replaces the current process with an
+    ``mlx.launch`` invocation that will re-enter ``main()`` with ``MLX_RANK`` set.
+    """
+    # Already running under mlx.launch — nothing to do.
+    if os.environ.get("MLX_RANK") is not None:
+        return
+
+    # Minimal pre-parse — only the flags we need to decide whether to relaunch.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--distributed-mode", default="off")
+    pre.add_argument("--distributed-hostfile", default=None)
+    pre.add_argument("--distributed-ibv-devices", default=None)
+    pre.add_argument("--distributed-jaccl-coordinator", default=None)
+    pre.add_argument("--num-local-ranks", type=int, default=None)
+    args, _ = pre.parse_known_args()
+
+    mode = args.distributed_mode
+    if mode == "off":
+        return
+
+    # Ensure mlx.launch is on PATH.
+    if shutil.which("mlx.launch") is None:
+        print(
+            "ERROR: --distributed-mode requires 'mlx.launch' but it was not found on PATH.\n"
+            "Install mlx with distributed support and ensure mlx.launch is available.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Build the mlx.launch command.
+    cmd: list[str] = ["mlx.launch", "--backend", mode]
+
+    if mode == "ring":
+        if args.distributed_hostfile:
+            cmd += ["--hostfile", args.distributed_hostfile]
+        elif args.num_local_ranks is not None:
+            cmd += ["--hosts", "localhost", "-n", str(args.num_local_ranks)]
+    elif mode == "jaccl":
+        if args.distributed_hostfile:
+            cmd += ["--hostfile", args.distributed_hostfile]
+        if args.distributed_ibv_devices:
+            os.environ["MLX_IBV_DEVICES"] = args.distributed_ibv_devices
+        if args.distributed_jaccl_coordinator:
+            os.environ["MLX_JACCL_COORDINATOR"] = args.distributed_jaccl_coordinator
+
+    cmd += ["--", sys.executable, "-m", "mlx_lm_server"] + sys.argv[1:]
+
+    logger.info("Re-launching under mlx.launch: %s", " ".join(cmd))
+    os.execvp(cmd[0], cmd)
+
+
 def main() -> None:
+    _maybe_relaunch_under_mlx_launch()
+
     config = parse_args()
 
     # --- Distributed initialization ---
@@ -146,7 +206,6 @@ def main() -> None:
                     "Rank %d: worker loop timed out — force exiting",
                     dist_ctx.rank,
                 )
-                import os
                 os._exit(1)
 
     except RuntimeError as e:

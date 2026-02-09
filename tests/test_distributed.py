@@ -10,6 +10,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import pickle
 import threading
 from pathlib import Path
@@ -1699,3 +1700,154 @@ class TestBusOutboxBackpressure:
         with scheduler._streams_lock:
             assert request_id not in scheduler._streams
         scheduler.stop()
+
+
+# =========================================================================
+# N. Auto-Relaunch Tests
+# =========================================================================
+
+
+class TestAutoRelaunch:
+    """Test _maybe_relaunch_under_mlx_launch() auto-relaunch logic."""
+
+    def test_skip_if_mlx_rank_set(self, monkeypatch):
+        """Should not exec when MLX_RANK is already set (recursion guard)."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.setenv("MLX_RANK", "0")
+        with patch("os.execvp") as mock_exec:
+            _maybe_relaunch_under_mlx_launch()
+            mock_exec.assert_not_called()
+
+    def test_skip_if_mode_off(self, monkeypatch):
+        """Should not exec when distributed_mode is 'off'."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--distributed-mode", "off"])
+        with patch("os.execvp") as mock_exec:
+            _maybe_relaunch_under_mlx_launch()
+            mock_exec.assert_not_called()
+
+    def test_skip_if_no_distributed_flag(self, monkeypatch):
+        """Should not exec when no --distributed-mode flag (defaults to off)."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--model", "test-model"])
+        with patch("os.execvp") as mock_exec:
+            _maybe_relaunch_under_mlx_launch()
+            mock_exec.assert_not_called()
+
+    def test_error_if_mlx_launch_missing(self, monkeypatch):
+        """Should sys.exit(1) if mlx.launch is not found."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--distributed-mode", "ring", "--distributed-hostfile", "/tmp/hosts.json"])
+        with patch("shutil.which", return_value=None):
+            with pytest.raises(SystemExit) as exc_info:
+                _maybe_relaunch_under_mlx_launch()
+            assert exc_info.value.code == 1
+
+    def test_ring_cmd_with_hostfile(self, monkeypatch):
+        """Should build correct mlx.launch command for ring + hostfile."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", [
+            "mlx_lm_server", "--distributed-mode", "ring",
+            "--distributed-hostfile", "/tmp/hosts.json",
+            "--model", "test-model",
+        ])
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        assert len(exec_calls) == 1
+        path, cmd = exec_calls[0]
+        assert path == "mlx.launch"
+        assert "--backend" in cmd
+        assert "ring" in cmd
+        assert "--hostfile" in cmd
+        assert "/tmp/hosts.json" in cmd
+        # sys.argv[1:] should be passed through
+        assert "--distributed-mode" in cmd
+        assert "--model" in cmd
+
+    def test_ring_cmd_with_num_local_ranks(self, monkeypatch):
+        """Should build correct mlx.launch command for ring + num-local-ranks (no hostfile)."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", [
+            "mlx_lm_server", "--distributed-mode", "ring",
+            "--num-local-ranks", "4",
+        ])
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        assert len(exec_calls) == 1
+        _, cmd = exec_calls[0]
+        assert "--hosts" in cmd
+        assert "localhost" in cmd
+        assert "-n" in cmd
+        assert "4" in cmd
+
+    def test_jaccl_cmd(self, monkeypatch):
+        """Should build correct mlx.launch command for jaccl + set env vars."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", [
+            "mlx_lm_server", "--distributed-mode", "jaccl",
+            "--distributed-ibv-devices", "/dev/ibv0",
+            "--distributed-jaccl-coordinator", "192.168.1.1:9000",
+        ])
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        assert len(exec_calls) == 1
+        _, cmd = exec_calls[0]
+        assert "--backend" in cmd
+        assert "jaccl" in cmd
+        # Env vars should be set
+        assert os.environ.get("MLX_IBV_DEVICES") == "/dev/ibv0"
+        assert os.environ.get("MLX_JACCL_COORDINATOR") == "192.168.1.1:9000"
+
+    def test_passthrough_all_args(self, monkeypatch):
+        """Should forward all original sys.argv[1:] verbatim."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        original_args = [
+            "mlx_lm_server",
+            "--distributed-mode", "ring",
+            "--distributed-hostfile", "/tmp/hosts.json",
+            "--model", "mlx-community/Qwen3-4B-4bit",
+            "--port", "9000",
+            "--max-batch-size", "16",
+        ]
+        monkeypatch.setattr("sys.argv", original_args)
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        _, cmd = exec_calls[0]
+        # All original args (except argv[0]) should appear in the command
+        for arg in original_args[1:]:
+            assert arg in cmd

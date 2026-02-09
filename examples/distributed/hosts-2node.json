@@ -1,0 +1,12 @@
+{
+    "hosts": [
+        {
+            "hostname": "mac-studio-1.local",
+            "num_ranks": 1
+        },
+        {
+            "hostname": "mac-studio-2.local",
+            "num_ranks": 1
+        }
+    ]
+}

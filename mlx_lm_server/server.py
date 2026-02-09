@@ -1003,6 +1003,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
                         help="IBV devices path for jaccl backend")
     parser.add_argument("--distributed-jaccl-coordinator", type=str, default=os.environ.get("MLX_JACCL_COORDINATOR"),
                         help="JACCL coordinator address (host:port)")
+    parser.add_argument("--num-local-ranks", type=int, default=None,
+                        help="Number of local ranks for single-machine TP (used by auto-relaunch)")
 
     parsed = parser.parse_args(args)
 
@@ -1032,9 +1034,10 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--memory-pressure-threshold must be between 0.0 and 1.0")
 
     # Distributed validation
-    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None:
+    already_launched = os.environ.get("MLX_RANK") is not None
+    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None and not already_launched:
         parser.error("--distributed-hostfile is required when --distributed-mode=ring")
-    if parsed.distributed_mode == "jaccl":
+    if parsed.distributed_mode == "jaccl" and not already_launched:
         if parsed.distributed_ibv_devices is None or parsed.distributed_jaccl_coordinator is None:
             parser.error(
                 "--distributed-ibv-devices and --distributed-jaccl-coordinator "
@@ -1059,9 +1062,9 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
             "--distributed-jaccl-coordinator) are ignored when --distributed-mode=off"
         )
 
-    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is not None and not os.path.exists(parsed.distributed_hostfile):
+    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is not None and not already_launched and not os.path.exists(parsed.distributed_hostfile):
         parser.error(f"--distributed-hostfile path does not exist: {parsed.distributed_hostfile}")
-    if parsed.distributed_mode == "jaccl" and parsed.distributed_ibv_devices is not None and not os.path.exists(parsed.distributed_ibv_devices):
+    if parsed.distributed_mode == "jaccl" and parsed.distributed_ibv_devices is not None and not already_launched and not os.path.exists(parsed.distributed_ibv_devices):
         parser.error(f"--distributed-ibv-devices path does not exist: {parsed.distributed_ibv_devices}")
 
     kwargs: dict[str, Any] = {
