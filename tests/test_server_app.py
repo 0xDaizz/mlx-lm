@@ -2039,3 +2039,112 @@ class TestMiddlewareOrdering:
             release_event.set()
             resp_slow = await task_slow
             assert resp_slow.status_code == 200
+
+
+# ===========================================================================
+# TestExecutorPool — P1-6: Dedicated thread pool executor
+# ===========================================================================
+
+
+class TestExecutorPool:
+    """P1-6: Verify dedicated ThreadPoolExecutor prevents starvation."""
+
+    @pytest.mark.anyio
+    async def test_executor_handles_concurrent_streams(self, tokenizer, tmp_path):
+        """N concurrent streaming requests all get served without executor exhaustion.
+
+        Uses a barrier-based SlowScheduler so all streams must start concurrently
+        before any of them can complete, proving the executor has enough threads.
+        """
+        import asyncio
+        import threading
+
+        N = 8  # Number of concurrent streaming requests
+
+        # Barrier ensures all N streams are actively polling before any completes.
+        barrier = threading.Barrier(N, timeout=10)
+        barrier_passed = threading.Event()
+
+        class BarrierScheduler(MockSchedulerForApp):
+            """Scheduler that blocks all streams at a barrier, then releases."""
+
+            def __init__(self):
+                super().__init__()
+                self._lock = threading.Lock()
+
+            def submit_request(self, request):
+                self.submitted.append(request)
+                if request.request_id in self.streams:
+                    q = self.streams[request.request_id]
+                    # Put tokens only after barrier_passed is set
+                    # (submit just enqueues; the token delivery waits)
+                    def _deliver():
+                        try:
+                            # Wait at the barrier — all N threads must arrive
+                            barrier.wait()
+                            barrier_passed.set()
+                        except threading.BrokenBarrierError:
+                            pass
+                        for i, tok_text in enumerate(self.response_tokens):
+                            is_last = i == len(self.response_tokens) - 1
+                            q.put(TokenEvent(
+                                request_id=request.request_id,
+                                token_id=i,
+                                token_text=tok_text,
+                                finish_reason="stop" if is_last else None,
+                            ))
+                        q.put(None)
+
+                    threading.Thread(target=_deliver, daemon=True).start()
+
+        sched = BarrierScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=N,
+            max_queue_size=N * 2,
+            max_concurrent_requests=0,  # unlimited
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            tasks = [
+                asyncio.create_task(ac.post(
+                    "/v1/chat/completions",
+                    json={
+                        "messages": [{"role": "user", "content": f"Hi {i}"}],
+                        "max_tokens": 50,
+                        "stream": True,
+                    },
+                ))
+                for i in range(N)
+            ]
+
+            # All N requests must complete within 10 seconds.
+            # If the executor has too few threads, the barrier will
+            # never be satisfied and this times out.
+            responses = await asyncio.wait_for(
+                asyncio.gather(*tasks),
+                timeout=10.0,
+            )
+
+        # All requests should succeed
+        for i, resp in enumerate(responses):
+            assert resp.status_code == 200, (
+                f"Stream {i} failed with status {resp.status_code}"
+            )
+            assert "text/event-stream" in resp.headers["content-type"]
+            chunks, has_done = _parse_sse_body(resp.text)
+            assert has_done, f"Stream {i} missing [DONE]"
+            # 1 role delta + 4 content chunks
+            assert len(chunks) == 5, (
+                f"Stream {i}: expected 5 chunks, got {len(chunks)}"
+            )
+
+        # Verify the barrier was actually hit (all N threads ran concurrently)
+        assert barrier_passed.is_set(), (
+            "Barrier was never satisfied — threads did not run concurrently"
+        )
