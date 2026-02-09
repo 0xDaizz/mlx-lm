@@ -1794,7 +1794,14 @@ class TestRateLimitAndHealth:
 
     @pytest.mark.anyio
     async def test_request_size_limit_returns_413(self, tokenizer, tmp_path):
-        """Oversized request body should return 413 before inference."""
+        """Content-Length header exceeding max_request_bytes returns 413.
+
+        The middleware performs a fast-path Content-Length header check for
+        well-behaved clients.  Chunked transfers and requests without a
+        Content-Length header are enforced by uvicorn's ``limit_request_body``
+        parameter (set in __main__.py), which is not exercised in ASGI
+        transport tests.
+        """
         cfg = ServerConfig(
             model="mlx-community/Qwen3-4B-4bit",
             block_size=4,
@@ -1806,9 +1813,17 @@ class TestRateLimitAndHealth:
         )
         app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
         transport = ASGITransport(app=app)
-        payload = {"prompt": "x" * 1024, "max_tokens": 10}
+        # Send a request with Content-Length header that exceeds the limit.
+        # The middleware rejects based on the header value alone.
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            resp = await ac.post("/v1/completions", json=payload)
+            resp = await ac.post(
+                "/v1/completions",
+                content=b'{"prompt":"hi","max_tokens":10}',
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Length": "999999",
+                },
+            )
         assert resp.status_code == 413
         assert resp.json()["error"]["code"] == "request_too_large"
 

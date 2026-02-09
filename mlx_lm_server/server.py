@@ -391,6 +391,14 @@ def create_app(
 
     @app.middleware("http")
     async def request_size_guard(request: Request, call_next):
+        """Fast-path Content-Length check for well-behaved clients.
+
+        Uvicorn's ``limit_request_body`` (set in __main__.py) enforces the
+        actual body size limit at the transport layer, covering chunked
+        transfers and requests without a Content-Length header.  This
+        middleware provides an early 413 for clients that advertise a
+        Content-Length exceeding the limit, avoiding unnecessary I/O.
+        """
         if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/v1/"):
             max_bytes = app.state.config.max_request_bytes
             content_length = request.headers.get("content-length")
@@ -409,18 +417,6 @@ def create_app(
                         )
                 except ValueError:
                     pass
-            body = await request.body()
-            if len(body) > max_bytes:
-                return JSONResponse(
-                    status_code=413,
-                    content=ErrorResponse(
-                        error=ErrorDetail(
-                            message=f"Request body too large (max {max_bytes} bytes)",
-                            type="invalid_request_error",
-                            code="request_too_large",
-                        )
-                    ).model_dump(),
-                )
         return await call_next(request)
 
     # ------------------------------------------------------------------

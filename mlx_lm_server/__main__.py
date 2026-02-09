@@ -208,7 +208,12 @@ def main() -> None:
                 config=config, scheduler=scheduler, tokenizer=tokenizer,
                 dist_ctx=dist_ctx,
             )
-            uvicorn.run(app, host=config.host, port=config.port)
+            uvicorn.run(
+                app,
+                host=config.host,
+                port=config.port,
+                limit_request_body=config.max_request_bytes,
+            )
         else:
             # Rank > 0: no HTTP server, wait for inference loop to finish
             logger.info(
