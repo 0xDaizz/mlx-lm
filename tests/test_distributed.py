@@ -1701,6 +1701,30 @@ class TestBusOutboxBackpressure:
             assert request_id not in scheduler._streams
         scheduler.stop()
 
+    def test_stop_marks_dist_fatal_when_shutdown_event_cannot_enqueue(self, monkeypatch):
+        """If shutdown cannot reserve outbox space, scheduler should mark distributed fatal."""
+        from mlx_lm_server.distributed_bus import ControlEvent as CE
+        from mlx_lm_server.scheduler import BUS_OUTBOX_MAXSIZE
+
+        class MockBus:
+            def publish(self, event):
+                pass
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=MockBus())
+
+        # Fill outbox completely so shutdown event cannot be enqueued.
+        for _ in range(BUS_OUTBOX_MAXSIZE):
+            scheduler._bus_outbox.put_nowait(CE.noop())
+
+        monkeypatch.setattr("mlx_lm_server.scheduler.BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S", 0.01)
+        scheduler.stop()
+
+        assert scheduler._dist_fatal is True
+        assert scheduler._dist_fatal_reason == "bus_outbox_full_shutdown"
+        assert scheduler.shutdown_status == "shutdown_event_enqueue_failed"
+
 
 # =========================================================================
 # N. Auto-Relaunch Tests
@@ -1753,6 +1777,26 @@ class TestAutoRelaunch:
             with pytest.raises(SystemExit) as exc_info:
                 _maybe_relaunch_under_mlx_launch()
             assert exc_info.value.code == 1
+
+    def test_ring_mode_missing_hostfile_and_local_ranks_errors(self, monkeypatch):
+        """ring mode should fail fast when both hostfile/local-ranks are missing."""
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--distributed-mode", "ring"])
+        with pytest.raises(SystemExit) as exc_info:
+            _maybe_relaunch_under_mlx_launch()
+        assert exc_info.value.code == 2
+
+    def test_jaccl_missing_required_args_errors(self, monkeypatch):
+        """jaccl mode should fail fast without required device/coordinator args."""
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--distributed-mode", "jaccl"])
+        with pytest.raises(SystemExit) as exc_info:
+            _maybe_relaunch_under_mlx_launch()
+        assert exc_info.value.code == 2
 
     def test_ring_cmd_with_hostfile(self, monkeypatch):
         """Should build correct mlx.launch command for ring + hostfile."""

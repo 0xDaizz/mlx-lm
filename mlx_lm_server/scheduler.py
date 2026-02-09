@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 BUS_ERROR_THRESHOLD = 10
 BUS_OUTBOX_MAXSIZE = 1024
 BUS_OUTBOX_CONTROL_RESERVE = 64
+BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S = 2.0
 
 
 class RequestQueue:
@@ -514,26 +515,27 @@ class Scheduler:
         if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
             try:
                 from mlx_lm_server.distributed_bus import ControlEvent
-                self._bus_outbox.put_nowait(ControlEvent.shutdown())
-            except queue.Full:
-                logger.warning("Bus outbox full during shutdown, draining first")
-                drained = []
-                for _ in range(min(10, self._bus_outbox.qsize())):
+
+                deadline = time.monotonic() + BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S
+                enqueued = False
+                while time.monotonic() < deadline:
                     try:
-                        drained.append(self._bus_outbox.get_nowait())
-                    except queue.Empty:
+                        self._bus_outbox.put_nowait(ControlEvent.shutdown())
+                        enqueued = True
                         break
-                # Unblock callers for any discarded submit events
-                for ev in drained:
-                    if ev.typ == "submit":
-                        req = ev.unpack_request()
-                        if req is not None:
-                            self._signal_finish(req.request_id, finish_reason="error")
-                            self._cleanup_result_buffers(req.request_id)
-                try:
-                    self._bus_outbox.put_nowait(ControlEvent.shutdown())
-                except queue.Full:
-                    logger.critical("Cannot enqueue shutdown event even after drain")
+                    except queue.Full:
+                        # Let the inference loop make progress and retry without
+                        # discarding queued submit/cancel events.
+                        self._new_request_event.set()
+                        time.sleep(0.01)
+                if not enqueued:
+                    logger.critical(
+                        "Cannot enqueue shutdown event within timeout; marking distributed fatal"
+                    )
+                    self._dist_fatal = True
+                    self._dist_fatal_reason = "bus_outbox_full_shutdown"
+                    self._shutdown_clean = False
+                    self.shutdown_status = "shutdown_event_enqueue_failed"
             except Exception:
                 logger.warning("Failed to queue shutdown event", exc_info=True)
 
@@ -680,6 +682,17 @@ class Scheduler:
                 events = raw_event.unpack_batch()
             except Exception:
                 logger.error("Failed to deserialize compound bus event", exc_info=True)
+                self._bus_error_count += 1
+                if self._bus_error_count >= BUS_ERROR_THRESHOLD:
+                    logger.critical(
+                        "Bus error threshold (%d) reached during batch unpack — shutting down distributed",
+                        BUS_ERROR_THRESHOLD,
+                    )
+                    self._dist_fatal = True
+                    self._dist_fatal_reason = "bus_error_threshold_unpack"
+                    self._running = False
+                    self._new_request_event.set()
+                    return False
                 return True
         else:
             # Single event (backward compat or noop fallback)
@@ -1774,6 +1787,11 @@ class Scheduler:
         stats["cache_effectiveness"] = (
             cached / (cached + prefill) if (cached + prefill) > 0 else 0.0
         )
+        # Distributed control-plane health
+        stats["dist_fatal"] = self._dist_fatal
+        stats["dist_fatal_reason"] = self._dist_fatal_reason
+        stats["dist_bus_error_count"] = self._bus_error_count
+        stats["dist_outbox_size"] = self._bus_outbox.qsize()
         # Shutdown health fields
         stats["shutdown_clean"] = self._shutdown_clean
         stats["shutdown_partial_flush"] = self._shutdown_partial_flush

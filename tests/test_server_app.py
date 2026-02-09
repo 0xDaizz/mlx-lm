@@ -1640,6 +1640,7 @@ class TestRateLimitAndHealth:
         cfg = ServerConfig()
         assert cfg.max_concurrent_requests == 64
         assert cfg.memory_pressure_threshold == 0.9
+        assert cfg.max_request_bytes == 1_048_576
 
     def test_cli_max_concurrent_requests(self):
         """T3.2: CLI --max-concurrent-requests is parsed correctly."""
@@ -1652,3 +1653,263 @@ class TestRateLimitAndHealth:
         from mlx_lm_server.server import parse_args
         cfg = parse_args(["--memory-pressure-threshold", "0.8"])
         assert cfg.memory_pressure_threshold == 0.8
+
+    @pytest.mark.anyio
+    async def test_concurrent_limit_zero_means_unlimited(self, tokenizer, tmp_path):
+        """max_concurrent_requests=0 disables request limiter."""
+        import asyncio
+
+        release_event = asyncio.Event()
+
+        class SlowScheduler(MockSchedulerForApp):
+            def get_result(self, request_id, timeout=None):
+                import time
+
+                for _ in range(200):
+                    if release_event.is_set():
+                        break
+                    time.sleep(0.01)
+                return super().get_result(request_id, timeout)
+
+        sched = SlowScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_concurrent_requests=0,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            task1 = asyncio.create_task(
+                ac.post("/v1/completions", json={"prompt": "Hello", "max_tokens": 10})
+            )
+            await asyncio.sleep(0.05)
+            resp2 = await ac.post("/v1/completions", json={"prompt": "World", "max_tokens": 10})
+            release_event.set()
+            resp1 = await task1
+        assert resp1.status_code == 200
+        assert resp2.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_nonstream_keyerror_maps_to_503(self, tokenizer, tmp_path):
+        """Unexpected missing result buffer should return 503, not 500."""
+
+        class MissingResultScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.cancelled: list[str] = []
+
+            def get_result(self, request_id, timeout=None):
+                raise KeyError(request_id)
+
+            def cancel_request(self, request_id: str) -> bool:
+                self.cancelled.append(request_id)
+                return True
+
+        sched = MissingResultScheduler()
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+        )
+        app = create_app(config=cfg, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post("/v1/completions", json={"prompt": "Hello", "max_tokens": 10})
+        assert resp.status_code == 503
+        assert "state unavailable" in resp.json()["error"]["message"].lower()
+        assert len(sched.cancelled) == 1
+
+    @pytest.mark.anyio
+    async def test_api_key_required_for_v1_endpoints(self, tokenizer, tmp_path):
+        """When api_key is configured, /v1 endpoints require a Bearer token."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            api_key="secret-key",
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp_completion = await ac.post("/v1/completions", json={"prompt": "Hello", "max_tokens": 10})
+            resp_models = await ac.get("/v1/models")
+        assert resp_completion.status_code == 401
+        assert resp_completion.json()["error"]["code"] == "invalid_api_key"
+        assert resp_models.status_code == 401
+
+    @pytest.mark.anyio
+    async def test_api_key_valid_bearer_allows_request(self, tokenizer, tmp_path):
+        """Valid Bearer API key should allow requests."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            api_key="secret-key",
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        headers = {"Authorization": "Bearer secret-key"}
+        async with AsyncClient(transport=transport, base_url="http://test", headers=headers) as ac:
+            resp = await ac.post("/v1/completions", json={"prompt": "Hello", "max_tokens": 10})
+        assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_health_endpoints_bypass_api_key(self, tokenizer, tmp_path):
+        """health/liveness/readiness/metrics should not require API key."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            api_key="secret-key",
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp_health = await ac.get("/health")
+            resp_livez = await ac.get("/livez")
+            resp_readyz = await ac.get("/readyz")
+            resp_metrics = await ac.get("/metrics")
+        assert resp_health.status_code == 200
+        assert resp_livez.status_code == 200
+        assert resp_readyz.status_code == 200
+        assert resp_metrics.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_request_size_limit_returns_413(self, tokenizer, tmp_path):
+        """Oversized request body should return 413 before inference."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_request_bytes=64,
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        payload = {"prompt": "x" * 1024, "max_tokens": 10}
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post("/v1/completions", json=payload)
+        assert resp.status_code == 413
+        assert resp.json()["error"]["code"] == "request_too_large"
+
+    @pytest.mark.anyio
+    async def test_readyz_and_health_report_distributed_fatal(self, tokenizer, tmp_path):
+        """Distributed fatal state should surface in /readyz and /health."""
+
+        class DistFatalScheduler(MockSchedulerForApp):
+            def get_cache_stats(self):
+                return {
+                    "total_blocks": 64,
+                    "used_blocks": 0,
+                    "free_blocks": 64,
+                    "dist_fatal": True,
+                    "dist_fatal_reason": "bus_error_threshold",
+                }
+
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+        )
+        app = create_app(config=cfg, scheduler=DistFatalScheduler(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp_ready = await ac.get("/readyz")
+            resp_health = await ac.get("/health")
+        assert resp_ready.status_code == 503
+        assert "bus_error_threshold" in resp_ready.json()["reasons"]
+        assert resp_health.status_code == 503
+        assert resp_health.json()["status"] == "distributed_fatal"
+
+    @pytest.mark.anyio
+    async def test_livez_and_metrics_shape(self, tokenizer, tmp_path):
+        """/livez and /metrics should return operational payloads."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp_livez = await ac.get("/livez")
+            resp_metrics = await ac.get("/metrics")
+        assert resp_livez.status_code == 200
+        assert resp_livez.json()["status"] == "alive"
+        assert "uptime_s" in resp_livez.json()
+        assert resp_metrics.status_code == 200
+        text = resp_metrics.text
+        assert "mlx_lm_server_active_sequences" in text
+        assert "mlx_lm_server_dist_fatal" in text
+
+    def test_cli_max_request_bytes(self):
+        """--max-request-bytes should be parsed correctly."""
+        from mlx_lm_server.server import parse_args
+
+        cfg = parse_args(["--max-request-bytes", "2048"])
+        assert cfg.max_request_bytes == 2048
+
+    def test_cli_api_key_from_flag(self):
+        """--api-key should be parsed into config.api_key."""
+        from mlx_lm_server.server import parse_args
+
+        cfg = parse_args(["--api-key", "my-secret"])
+        assert cfg.api_key == "my-secret"
+
+    def test_cli_api_key_file(self, tmp_path):
+        """--api-key-file should load and strip key content."""
+        from mlx_lm_server.server import parse_args
+
+        key_file = tmp_path / "api.key"
+        key_file.write_text("  file-secret-key  \n", encoding="utf-8")
+        cfg = parse_args(["--api-key-file", str(key_file)])
+        assert cfg.api_key == "file-secret-key"
+
+    def test_cli_rejects_non_positive_timeouts(self):
+        """Timeouts must be > 0."""
+        from mlx_lm_server.server import parse_args
+
+        with pytest.raises(SystemExit):
+            parse_args(["--request-timeout-s", "0"])
+        with pytest.raises(SystemExit):
+            parse_args(["--first-token-timeout-s", "-1"])
+
+    def test_cli_ring_accepts_num_local_ranks_without_hostfile(self):
+        """ring mode should accept --num-local-ranks as an alternative to hostfile."""
+        from mlx_lm_server.server import parse_args
+
+        cfg = parse_args([
+            "--model",
+            "test-model",
+            "--distributed-mode",
+            "ring",
+            "--num-local-ranks",
+            "2",
+        ])
+        assert cfg.distributed_mode == "ring"

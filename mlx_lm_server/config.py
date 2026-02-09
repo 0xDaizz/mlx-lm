@@ -17,6 +17,8 @@ class ServerConfig:
     # Server
     host: str = "0.0.0.0"
     port: int = 8000
+    api_key: str | None = None
+    max_request_bytes: int = 1_048_576  # Max request body size in bytes
 
     # KV Cache
     block_size: int = 16  # Tokens per KV block

@@ -7,6 +7,7 @@ Integrates with the Scheduler for continuous batching inference.
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -20,7 +21,7 @@ from typing import Any, AsyncIterator, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from mlx_lm_server.config import ServerConfig
@@ -295,16 +296,95 @@ def create_app(
     app.state.model_name = config.model
     app.state.shutting_down = False
     app.state.dist_ctx = dist_ctx
+    app.state.started_at = time.monotonic()
 
     # ------------------------------------------------------------------
-    # T3.2: Concurrency limiter
+    # Admission / security middleware
     # ------------------------------------------------------------------
-    _concurrency_sem = asyncio.Semaphore(config.max_concurrent_requests)
+
+    health_bypass_paths = {"/health", "/livez", "/readyz", "/metrics"}
+    concurrency_bypass_paths = health_bypass_paths | {"/v1/models"}
+    _concurrency_sem: asyncio.Semaphore | None = None
+    if config.max_concurrent_requests > 0:
+        _concurrency_sem = asyncio.Semaphore(config.max_concurrent_requests)
+
+    @app.middleware("http")
+    async def request_size_guard(request: Request, call_next):
+        if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/v1/"):
+            max_bytes = app.state.config.max_request_bytes
+            content_length = request.headers.get("content-length")
+            if content_length is not None:
+                try:
+                    if int(content_length) > max_bytes:
+                        return JSONResponse(
+                            status_code=413,
+                            content=ErrorResponse(
+                                error=ErrorDetail(
+                                    message=f"Request body too large (max {max_bytes} bytes)",
+                                    type="invalid_request_error",
+                                    code="request_too_large",
+                                )
+                            ).model_dump(),
+                        )
+                except ValueError:
+                    pass
+            body = await request.body()
+            if len(body) > max_bytes:
+                return JSONResponse(
+                    status_code=413,
+                    content=ErrorResponse(
+                        error=ErrorDetail(
+                            message=f"Request body too large (max {max_bytes} bytes)",
+                            type="invalid_request_error",
+                            code="request_too_large",
+                        )
+                    ).model_dump(),
+                )
+        return await call_next(request)
+
+    @app.middleware("http")
+    async def api_key_guard(request: Request, call_next):
+        api_key = app.state.config.api_key
+        if not api_key:
+            return await call_next(request)
+        if request.url.path in health_bypass_paths:
+            return await call_next(request)
+        if not request.url.path.startswith("/v1/"):
+            return await call_next(request)
+
+        auth = request.headers.get("authorization")
+        if auth is None or not auth.startswith("Bearer "):
+            return JSONResponse(
+                status_code=401,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Missing or invalid Authorization header",
+                        type="authentication_error",
+                        code="invalid_api_key",
+                    )
+                ).model_dump(),
+            )
+
+        provided = auth[len("Bearer "):].strip()
+        if not hmac.compare_digest(provided, api_key):
+            return JSONResponse(
+                status_code=401,
+                content=ErrorResponse(
+                    error=ErrorDetail(
+                        message="Invalid API key",
+                        type="authentication_error",
+                        code="invalid_api_key",
+                    )
+                ).model_dump(),
+            )
+        return await call_next(request)
 
     @app.middleware("http")
     async def concurrency_limiter(request: Request, call_next):
+        if _concurrency_sem is None:
+            return await call_next(request)
         # Bypass for health and non-inference endpoints
-        if request.url.path in ("/health", "/v1/models"):
+        if request.url.path in concurrency_bypass_paths:
             return await call_next(request)
         # Non-blocking check: locked() is True when no permits remain
         if _concurrency_sem.locked():
@@ -432,6 +512,11 @@ def create_app(
                 except TimeoutError:
                     elapsed += wait
                     continue
+                except KeyError as e:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"Request state unavailable for {request_id}",
+                    ) from e
 
             if not events:
                 raise HTTPException(status_code=504, detail="Request timed out")
@@ -584,15 +669,61 @@ def create_app(
             data=[ModelInfo(id=app.state.model_name)]
         )
 
+    def _distributed_health(cache_stats: dict[str, Any]) -> dict[str, Any]:
+        dist = app.state.dist_ctx
+        return {
+            "enabled": dist.enabled if dist else False,
+            "rank": dist.rank if dist and dist.enabled else None,
+            "world_size": dist.world_size if dist and dist.enabled else None,
+            "fatal": bool(cache_stats.get("dist_fatal", False)),
+            "fatal_reason": cache_stats.get("dist_fatal_reason") or None,
+        }
+
+    # ------------------------------------------------------------------
+    # GET /livez
+    # ------------------------------------------------------------------
+
+    @app.get("/livez")
+    async def livez():
+        return {
+            "status": "alive",
+            "uptime_s": max(0.0, time.monotonic() - app.state.started_at),
+        }
+
+    # ------------------------------------------------------------------
+    # GET /readyz
+    # ------------------------------------------------------------------
+
+    @app.get("/readyz")
+    async def readyz():
+        cache_stats = app.state.scheduler.get_cache_stats()
+        dist = _distributed_health(cache_stats)
+        reasons: list[str] = []
+        if app.state.shutting_down:
+            reasons.append("shutting_down")
+        if dist["fatal"]:
+            reasons.append(dist["fatal_reason"] or "distributed_fatal")
+        if _check_memory_pressure():
+            reasons.append("memory_pressure")
+        ready = len(reasons) == 0
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "status": "ready" if ready else "not_ready",
+                "ready": ready,
+                "reasons": reasons,
+                "distributed": dist,
+            },
+        )
+
     # ------------------------------------------------------------------
     # GET /health
     # ------------------------------------------------------------------
 
     @app.get("/health")
     async def health():
-        sched = app.state.scheduler
-        cache_stats = sched.get_cache_stats()
-        dist = app.state.dist_ctx
+        cache_stats = app.state.scheduler.get_cache_stats()
+        dist = _distributed_health(cache_stats)
 
         # T3.4: Determine load-aware status
         if app.state.shutting_down:
@@ -600,12 +731,9 @@ def create_app(
                 status_code=503,
                 content={
                     "status": "shutting_down",
+                    "ready": False,
                     "cache_stats": cache_stats,
-                    "distributed": {
-                        "enabled": dist.enabled if dist else False,
-                        "rank": dist.rank if dist and dist.enabled else None,
-                        "world_size": dist.world_size if dist and dist.enabled else None,
-                    },
+                    "distributed": dist,
                 },
             )
 
@@ -614,7 +742,10 @@ def create_app(
         utilization = used_blocks / total_blocks if total_blocks > 0 else 0.0
 
         threshold = config.memory_pressure_threshold
-        if utilization >= threshold:
+        if dist["fatal"]:
+            status = "distributed_fatal"
+            status_code = 503
+        elif utilization >= threshold:
             status = "overloaded"
             status_code = 503
         elif utilization >= threshold * 0.8:
@@ -628,15 +759,52 @@ def create_app(
             status_code=status_code,
             content={
                 "status": status,
+                "ready": status_code == 200,
                 "utilization": utilization,
                 "cache_stats": cache_stats,
-                "distributed": {
-                    "enabled": dist.enabled if dist else False,
-                    "rank": dist.rank if dist and dist.enabled else None,
-                    "world_size": dist.world_size if dist and dist.enabled else None,
-                },
+                "distributed": dist,
             },
         )
+
+    # ------------------------------------------------------------------
+    # GET /metrics
+    # ------------------------------------------------------------------
+
+    @app.get("/metrics")
+    async def metrics():
+        stats = app.state.scheduler.get_cache_stats()
+
+        def _metric_value(value: Any) -> float:
+            if isinstance(value, bool):
+                return 1.0 if value else 0.0
+            if isinstance(value, (int, float)):
+                return float(value)
+            return 0.0
+
+        lines = [
+            "# HELP mlx_lm_server_active_sequences Number of active in-flight sequences.",
+            "# TYPE mlx_lm_server_active_sequences gauge",
+            f"mlx_lm_server_active_sequences {_metric_value(stats.get('active_sequences', 0))}",
+            "# HELP mlx_lm_server_queued_requests Number of queued inference requests.",
+            "# TYPE mlx_lm_server_queued_requests gauge",
+            f"mlx_lm_server_queued_requests {_metric_value(stats.get('queued_requests', 0))}",
+            "# HELP mlx_lm_server_used_blocks Number of used KV cache blocks.",
+            "# TYPE mlx_lm_server_used_blocks gauge",
+            f"mlx_lm_server_used_blocks {_metric_value(stats.get('used_blocks', 0))}",
+            "# HELP mlx_lm_server_free_blocks Number of free KV cache blocks.",
+            "# TYPE mlx_lm_server_free_blocks gauge",
+            f"mlx_lm_server_free_blocks {_metric_value(stats.get('free_blocks', 0))}",
+            "# HELP mlx_lm_server_cache_hit_rate Cache hit ratio.",
+            "# TYPE mlx_lm_server_cache_hit_rate gauge",
+            f"mlx_lm_server_cache_hit_rate {_metric_value(stats.get('cache_hit_rate', 0.0))}",
+            "# HELP mlx_lm_server_dist_fatal Distributed control plane fatal flag.",
+            "# TYPE mlx_lm_server_dist_fatal gauge",
+            f"mlx_lm_server_dist_fatal {_metric_value(stats.get('dist_fatal', False))}",
+            "# HELP mlx_lm_server_shutdown_clean Shutdown completed cleanly.",
+            "# TYPE mlx_lm_server_shutdown_clean gauge",
+            f"mlx_lm_server_shutdown_clean {_metric_value(stats.get('shutdown_clean', True))}",
+        ]
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
 
     return app
 
@@ -905,7 +1073,10 @@ def _stream_response(
         finally:
             # Always cancel to clean up scheduler resources (stream queue, etc.)
             # Safe to call even if request already finished — cancel is idempotent.
-            scheduler.cancel_request(inf_req.request_id)
+            try:
+                scheduler.cancel_request(inf_req.request_id)
+            except Exception:
+                logger.warning("Best-effort stream cancel failed for %s", inf_req.request_id)
 
     return StreamingResponse(
         event_generator(),
@@ -928,6 +1099,14 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--adapter-path", type=str, default=None)
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--api-key", type=str, default=os.environ.get("MLX_LM_SERVER_API_KEY"))
+    parser.add_argument("--api-key-file", type=str, default=os.environ.get("MLX_LM_SERVER_API_KEY_FILE"))
+    parser.add_argument(
+        "--max-request-bytes",
+        type=int,
+        default=1_048_576,
+        help="Maximum accepted request body size in bytes",
+    )
     parser.add_argument("--block-size", type=int, default=16)
     parser.add_argument("--num-blocks", type=int, default=2048)
     parser.add_argument("--kv-bits", type=int, default=8)
@@ -1016,6 +1195,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--ssd-flush-interval-s must be > 0")
     if parsed.ssd_max_size_gb < 0:
         parser.error("--ssd-max-size-gb must be >= 0")
+    if parsed.max_request_bytes <= 0:
+        parser.error("--max-request-bytes must be > 0")
 
     # Core numeric parameter validation
     if parsed.block_size <= 0:
@@ -1032,11 +1213,52 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--max-concurrent-requests must be >= 0")
     if not (0.0 <= parsed.memory_pressure_threshold <= 1.0):
         parser.error("--memory-pressure-threshold must be between 0.0 and 1.0")
+    if parsed.default_max_tokens <= 0:
+        parser.error("--default-max-tokens must be > 0")
+    if parsed.completion_batch_size <= 0:
+        parser.error("--completion-batch-size must be > 0")
+    if parsed.max_prompt_tokens <= 0:
+        parser.error("--max-prompt-tokens must be > 0")
+    if parsed.max_generation_tokens <= 0:
+        parser.error("--max-generation-tokens must be > 0")
+    if parsed.request_timeout_s <= 0:
+        parser.error("--request-timeout-s must be > 0")
+    if parsed.first_token_timeout_s <= 0:
+        parser.error("--first-token-timeout-s must be > 0")
+    if parsed.num_local_ranks is not None and parsed.num_local_ranks <= 0:
+        parser.error("--num-local-ranks must be > 0")
+
+    if parsed.api_key is not None and parsed.api_key_file is not None:
+        parser.error("Specify only one of --api-key or --api-key-file")
+
+    api_key = parsed.api_key
+    if parsed.api_key_file is not None:
+        if not os.path.exists(parsed.api_key_file):
+            parser.error(f"--api-key-file path does not exist: {parsed.api_key_file}")
+        try:
+            with open(parsed.api_key_file, encoding="utf-8") as f:
+                api_key = f.read().strip()
+        except OSError as e:
+            parser.error(f"Failed to read --api-key-file: {e}")
+        if not api_key:
+            parser.error("--api-key-file is empty")
+    if api_key is not None:
+        api_key = api_key.strip()
+        if not api_key:
+            parser.error("--api-key must not be empty")
 
     # Distributed validation
     already_launched = os.environ.get("MLX_RANK") is not None
-    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None and not already_launched:
-        parser.error("--distributed-hostfile is required when --distributed-mode=ring")
+    if (
+        parsed.distributed_mode == "ring"
+        and parsed.distributed_hostfile is None
+        and parsed.num_local_ranks is None
+        and not already_launched
+    ):
+        parser.error(
+            "--distributed-hostfile or --num-local-ranks is required "
+            "when --distributed-mode=ring"
+        )
     if parsed.distributed_mode == "jaccl" and not already_launched:
         if parsed.distributed_ibv_devices is None or parsed.distributed_jaccl_coordinator is None:
             parser.error(
@@ -1062,7 +1284,13 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
             "--distributed-jaccl-coordinator) are ignored when --distributed-mode=off"
         )
 
-    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is not None and not already_launched and not os.path.exists(parsed.distributed_hostfile):
+    if (
+        parsed.distributed_mode == "ring"
+        and parsed.distributed_hostfile is not None
+        and parsed.num_local_ranks is None
+        and not already_launched
+        and not os.path.exists(parsed.distributed_hostfile)
+    ):
         parser.error(f"--distributed-hostfile path does not exist: {parsed.distributed_hostfile}")
     if parsed.distributed_mode == "jaccl" and parsed.distributed_ibv_devices is not None and not already_launched and not os.path.exists(parsed.distributed_ibv_devices):
         parser.error(f"--distributed-ibv-devices path does not exist: {parsed.distributed_ibv_devices}")
@@ -1071,6 +1299,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "model": parsed.model,
         "host": parsed.host,
         "port": parsed.port,
+        "max_request_bytes": parsed.max_request_bytes,
         "block_size": parsed.block_size,
         "num_blocks": parsed.num_blocks,
         "kv_bits": parsed.kv_bits,
@@ -1100,6 +1329,9 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "distributed_sharding": parsed.distributed_sharding,
         "distributed_strict": parsed.distributed_strict,
     }
+
+    if api_key is not None:
+        kwargs["api_key"] = api_key
 
     if parsed.distributed_hostfile is not None:
         kwargs["distributed_hostfile"] = parsed.distributed_hostfile

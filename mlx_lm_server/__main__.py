@@ -40,6 +40,21 @@ def _maybe_relaunch_under_mlx_launch() -> None:
     if mode == "off":
         return
 
+    if mode == "ring" and args.distributed_hostfile is None and args.num_local_ranks is None:
+        print(
+            "ERROR: --distributed-mode=ring requires --distributed-hostfile or --num-local-ranks.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if mode == "jaccl":
+        if args.distributed_ibv_devices is None or args.distributed_jaccl_coordinator is None:
+            print(
+                "ERROR: --distributed-mode=jaccl requires both "
+                "--distributed-ibv-devices and --distributed-jaccl-coordinator.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
     # Ensure mlx.launch is on PATH.
     if shutil.which("mlx.launch") is None:
         print(
@@ -202,11 +217,9 @@ def main() -> None:
             )
             scheduler.join_worker_loop(timeout=300.0)
             if scheduler.worker_timed_out:
-                logger.critical(
-                    "Rank %d: worker loop timed out — force exiting",
-                    dist_ctx.rank,
+                raise RuntimeError(
+                    f"Rank {dist_ctx.rank}: worker loop timed out"
                 )
-                os._exit(1)
 
     except RuntimeError as e:
         logger.critical("Fatal error: %s", e)

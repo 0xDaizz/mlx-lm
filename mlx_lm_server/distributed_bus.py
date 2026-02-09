@@ -132,6 +132,8 @@ class DistributedControlBus:
             mx.eval(buf)
             try:
                 return pickle.loads(bytes(buf))
-            except Exception:
+            except Exception as e:
                 logger.error("Failed to deserialize control event (%d bytes)", size, exc_info=True)
-                return ControlEvent.noop()
+                raise RuntimeError(
+                    f"Failed to deserialize control event ({size} bytes)"
+                ) from e
