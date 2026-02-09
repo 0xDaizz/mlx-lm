@@ -202,6 +202,7 @@ class Scheduler:
 
         # Bus error tracking for resilience (U3)
         self._bus_error_count: int = 0
+        self._bus_unpack_error_count: int = 0
         self._dist_fatal: bool = False
         self._dist_fatal_reason: str = ""
         # Bus retry events for publish failure ordering (U7)
@@ -680,10 +681,11 @@ class Scheduler:
         if raw_event.typ == "batch":
             try:
                 events = raw_event.unpack_batch()
+                self._bus_unpack_error_count = 0
             except Exception:
                 logger.error("Failed to deserialize compound bus event", exc_info=True)
-                self._bus_error_count += 1
-                if self._bus_error_count >= BUS_ERROR_THRESHOLD:
+                self._bus_unpack_error_count += 1
+                if self._bus_unpack_error_count >= BUS_ERROR_THRESHOLD:
                     logger.critical(
                         "Bus error threshold (%d) reached during batch unpack — shutting down distributed",
                         BUS_ERROR_THRESHOLD,
@@ -1791,6 +1793,7 @@ class Scheduler:
         stats["dist_fatal"] = self._dist_fatal
         stats["dist_fatal_reason"] = self._dist_fatal_reason
         stats["dist_bus_error_count"] = self._bus_error_count
+        stats["dist_bus_unpack_error_count"] = self._bus_unpack_error_count
         stats["dist_outbox_size"] = self._bus_outbox.qsize()
         # Shutdown health fields
         stats["shutdown_clean"] = self._shutdown_clean

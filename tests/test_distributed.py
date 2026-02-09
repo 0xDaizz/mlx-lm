@@ -1343,6 +1343,98 @@ class TestBusErrorThreshold:
         scheduler.stop()
 
 
+class TestBusUnpackErrorCounter:
+    """P0-3: Unpack errors accumulate independently of recv errors."""
+
+    def test_unpack_errors_accumulate_independently_of_recv(self):
+        """Mock bus where recv succeeds but unpack always fails.
+
+        Verifies:
+        - _bus_unpack_error_count increments independently of _bus_error_count
+        - _bus_error_count resets to 0 on each successful recv
+        - When _bus_unpack_error_count reaches BUS_ERROR_THRESHOLD, triggers fatal
+        """
+        from mlx_lm_server.scheduler import BUS_ERROR_THRESHOLD
+
+        class RecvSucceedsUnpackFailsBus:
+            """Bus where recv always succeeds but returns a batch event
+            with corrupt payload that will fail to unpack."""
+            def recv(self):
+                # Return a batch event with invalid payload
+                return ControlEvent(typ="batch", payload=b"corrupt-data")
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(
+            config=config, dist_ctx=ctx,
+            control_bus=RecvSucceedsUnpackFailsBus(),
+        )
+        scheduler._running = True
+
+        # Each call: recv succeeds (resets _bus_error_count to 0),
+        # but unpack_batch() fails (increments _bus_unpack_error_count)
+        for i in range(BUS_ERROR_THRESHOLD - 1):
+            result = scheduler._apply_bus_events()
+            assert result is True, f"Should continue at iteration {i}"
+            assert scheduler._bus_error_count == 0, \
+                "recv-only counter should stay 0 after successful recv"
+            assert scheduler._bus_unpack_error_count == i + 1, \
+                f"unpack counter should be {i + 1}"
+            assert scheduler._running is True
+            assert scheduler._dist_fatal is False
+
+        # The threshold-reaching call should trigger fatal
+        result = scheduler._apply_bus_events()
+        assert result is False
+        assert scheduler._running is False
+        assert scheduler._dist_fatal is True
+        assert scheduler._dist_fatal_reason == "bus_error_threshold_unpack"
+        assert scheduler._bus_unpack_error_count == BUS_ERROR_THRESHOLD
+        # recv counter should still be 0 (recv succeeded every time)
+        assert scheduler._bus_error_count == 0
+        scheduler.stop()
+
+    def test_unpack_error_counter_resets_on_success(self):
+        """Successful unpack_batch should reset _bus_unpack_error_count to 0."""
+
+        class FlakeyUnpackBus:
+            """Bus where unpack fails a few times then succeeds."""
+            call_count = 0
+
+            def recv(self):
+                self.call_count += 1
+                if self.call_count <= 3:
+                    # Return corrupt batch payload
+                    return ControlEvent(typ="batch", payload=b"bad")
+                # Return valid batch with noop
+                return ControlEvent.batch([ControlEvent.noop()])
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        bus = FlakeyUnpackBus()
+        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=bus)
+        scheduler._running = True
+
+        # 3 unpack failures
+        for _ in range(3):
+            scheduler._apply_bus_events()
+        assert scheduler._bus_unpack_error_count == 3
+
+        # 1 successful unpack should reset
+        scheduler._apply_bus_events()
+        assert scheduler._bus_unpack_error_count == 0
+        scheduler.stop()
+
+    def test_unpack_error_count_in_stats(self):
+        """get_cache_stats() should include dist_bus_unpack_error_count."""
+        config = ServerConfig()
+        scheduler = Scheduler(config=config)
+        scheduler._bus_unpack_error_count = 7
+        stats = scheduler.get_cache_stats()
+        assert stats["dist_bus_unpack_error_count"] == 7
+        scheduler.stop()
+
+
 class TestWorldSize1FailFast:
     """U4: distributed_mode != 'off' but world_size==1 should fail-fast."""
 
@@ -1895,3 +1987,75 @@ class TestAutoRelaunch:
         # All original args (except argv[0]) should appear in the command
         for arg in original_args[1:]:
             assert arg in cmd
+
+
+# =========================================================================
+# O. RestrictedUnpickler Tests (Commit 7)
+# =========================================================================
+
+
+class TestRestrictedUnpickler:
+    """Test RestrictedUnpickler whitelist enforcement."""
+
+    def test_restricted_unpickler_allows_control_event(self):
+        """Round-trip ControlEvent through pickle.dumps -> restricted_loads."""
+        from mlx_lm_server.distributed_bus import restricted_loads
+
+        event = ControlEvent.submit(InferenceRequest(
+            request_id="safe-event",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=10,
+        ))
+        # Serialize the entire ControlEvent
+        data = pickle.dumps(event)
+        # Deserialize with restricted_loads
+        restored = restricted_loads(data)
+        assert isinstance(restored, ControlEvent)
+        assert restored.typ == "submit"
+        req = restored.unpack_request()
+        assert isinstance(req, InferenceRequest)
+        assert req.request_id == "safe-event"
+        assert req.prompt_tokens == [1, 2, 3]
+        assert req.max_tokens == 10
+
+    def test_restricted_unpickler_blocks_os_system(self):
+        """Craft a pickle payload with os.system -> verify UnpicklingError."""
+        import io as _io
+        from mlx_lm_server.distributed_bus import RestrictedUnpickler
+
+        # Craft a malicious pickle payload that would call os.system("echo pwned")
+        malicious_data = (
+            b'\x80\x05'                          # PROTO 5
+            b'\x8c\x02os'                         # SHORT_BINUNICODE 'os'
+            b'\x8c\x06system'                     # SHORT_BINUNICODE 'system'
+            b'\x93'                               # STACK_GLOBAL
+            b'\x8c\x0aecho pwned'                 # SHORT_BINUNICODE 'echo pwned'
+            b'\x85'                               # TUPLE1
+            b'R'                                  # REDUCE
+            b'.'                                  # STOP
+        )
+
+        with pytest.raises(pickle.UnpicklingError, match="Restricted unpickle"):
+            RestrictedUnpickler(_io.BytesIO(malicious_data)).load()
+
+    def test_restricted_unpickler_allows_inference_request(self):
+        """Round-trip InferenceRequest through restricted_loads."""
+        from mlx_lm_server.distributed_bus import restricted_loads
+
+        req = InferenceRequest(
+            request_id="allowed-req",
+            prompt_tokens=[10, 20, 30],
+            max_tokens=50,
+            temperature=0.8,
+            top_p=0.95,
+            stream=True,
+        )
+        data = pickle.dumps(req)
+        restored = restricted_loads(data)
+        assert isinstance(restored, InferenceRequest)
+        assert restored.request_id == "allowed-req"
+        assert restored.prompt_tokens == [10, 20, 30]
+        assert restored.max_tokens == 50
+        assert restored.temperature == 0.8
+        assert restored.top_p == 0.95
+        assert restored.stream is True
