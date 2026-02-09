@@ -632,7 +632,15 @@ def create_app(
             raise HTTPException(status_code=500, detail="Tokenizer not loaded")
 
         result = _format_chat_messages(body.messages, tok, tokenize=True)
-        prompt_tokens: list[int] = result if isinstance(result, list) else _safe_encode(tok, result)
+        # Handle transformers >= 5.0 BatchEncoding (dict-like with 'input_ids')
+        if isinstance(result, list):
+            prompt_tokens: list[int] = result
+        elif hasattr(result, 'input_ids'):
+            prompt_tokens = result['input_ids']
+            if not isinstance(prompt_tokens, list):
+                prompt_tokens = list(prompt_tokens)
+        else:
+            prompt_tokens: list[int] = _safe_encode(tok, result)
         request_id = _make_request_id()
 
         params = _validate_and_prepare_request(
@@ -922,9 +930,20 @@ def _format_chat_messages(
 
     if hasattr(tokenizer, "apply_chat_template"):
         try:
+            # return_dict=False ensures transformers >= 5.0 returns list[int]
+            # instead of BatchEncoding when tokenize=True.
             return tokenizer.apply_chat_template(
-                msg_dicts, tokenize=tokenize, add_generation_prompt=True
+                msg_dicts, tokenize=tokenize, add_generation_prompt=True,
+                return_dict=False,
             )
+        except TypeError:
+            # Tokenizer doesn't accept return_dict — retry without it
+            try:
+                return tokenizer.apply_chat_template(
+                    msg_dicts, tokenize=tokenize, add_generation_prompt=True,
+                )
+            except Exception as e:
+                logger.warning("apply_chat_template failed: %s, using fallback format", e)
         except Exception as e:
             logger.warning("apply_chat_template failed: %s, using fallback format", e)
 

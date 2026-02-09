@@ -2318,3 +2318,147 @@ class TestAppCreationSmoke:
                     assert kw.arg != "limit_request_body", (
                         "Found limit_request_body in __main__.py uvicorn.run() call"
                     )
+
+
+# ===========================================================================
+# TestBatchEncodingCompat — transformers >= 5.0 BatchEncoding compatibility
+# ===========================================================================
+
+
+class TestBatchEncodingCompat:
+    """DA-C4-C1: Verify chat completions handle transformers 5.x BatchEncoding.
+
+    In transformers >= 5.0, apply_chat_template(tokenize=True) returns a
+    BatchEncoding dict-like object by default instead of list[int].
+    Our code must handle both return types correctly.
+    """
+
+    def test_format_chat_messages_returns_list_with_return_dict_false(self):
+        """apply_chat_template accepting return_dict=False returns list[int]."""
+        from mlx_lm_server.server import _format_chat_messages, ChatMessage
+
+        class ModernTokenizer:
+            """Simulates transformers >= 5.0 tokenizer that accepts return_dict."""
+            def apply_chat_template(self, messages, tokenize=False,
+                                    add_generation_prompt=True, return_dict=True):
+                if tokenize:
+                    tokens = [1, 2, 3, 4, 5]
+                    if return_dict:
+                        # BatchEncoding-like dict
+                        return {"input_ids": tokens, "attention_mask": [1] * len(tokens)}
+                    return tokens
+                return "user: hello\nassistant:"
+
+        msgs = [ChatMessage(role="user", content="hello")]
+        result = _format_chat_messages(msgs, ModernTokenizer(), tokenize=True)
+        assert isinstance(result, list), f"Expected list, got {type(result)}"
+        assert result == [1, 2, 3, 4, 5]
+
+    def test_call_site_handles_batch_encoding_dict(self):
+        """Chat endpoint handles dict-like result with 'input_ids' key."""
+        from mlx_lm_server.server import _format_chat_messages, ChatMessage
+
+        class BatchEncodingResult:
+            """Simulates a BatchEncoding object (has input_ids attribute)."""
+            def __init__(self, ids):
+                self.input_ids = ids
+            def __getitem__(self, key):
+                if key == "input_ids":
+                    return self.input_ids
+                raise KeyError(key)
+
+        class BatchEncodingTokenizer:
+            def apply_chat_template(self, messages, tokenize=False,
+                                    add_generation_prompt=True, **kwargs):
+                if kwargs.get("return_dict") is False:
+                    # Honour return_dict=False
+                    return [10, 20, 30]
+                if tokenize:
+                    return BatchEncodingResult([10, 20, 30])
+                return "user: hello\nassistant:"
+
+        msgs = [ChatMessage(role="user", content="hello")]
+        result = _format_chat_messages(msgs, BatchEncodingTokenizer(), tokenize=True)
+        # With return_dict=False it should return list directly
+        assert isinstance(result, list)
+        assert result == [10, 20, 30]
+
+    def test_legacy_tokenizer_without_return_dict(self):
+        """Legacy tokenizer that does NOT accept return_dict still works."""
+        from mlx_lm_server.server import _format_chat_messages, ChatMessage
+
+        class LegacyTokenizer:
+            def apply_chat_template(self, messages, tokenize=False,
+                                    add_generation_prompt=True):
+                # No return_dict parameter — will raise TypeError if called with it
+                if tokenize:
+                    return [7, 8, 9]
+                return "user: hello\nassistant:"
+
+        msgs = [ChatMessage(role="user", content="hello")]
+        result = _format_chat_messages(msgs, LegacyTokenizer(), tokenize=True)
+        assert isinstance(result, list)
+        assert result == [7, 8, 9]
+
+    @pytest.mark.anyio
+    async def test_chat_endpoint_with_batch_encoding_tokenizer(self, config, mock_scheduler):
+        """Full endpoint test: tokenizer returning BatchEncoding-like object."""
+        from mlx_lm_server.server import create_app
+
+        class BatchEncodingResult:
+            """Simulates transformers BatchEncoding."""
+            def __init__(self, ids):
+                self.input_ids = ids
+            def __getitem__(self, key):
+                if key == "input_ids":
+                    return self.input_ids
+                raise KeyError(key)
+
+        class ModernTokenizer:
+            eos_token_ids: set[int] = set()
+
+            def encode(self, text, add_special_tokens=True):
+                return [ord(c) for c in text]
+
+            def decode(self, ids):
+                return "".join(chr(i) for i in ids if 0 <= i < 0x110000)
+
+            def apply_chat_template(self, messages, tokenize=False,
+                                    add_generation_prompt=True, **kwargs):
+                if kwargs.get("return_dict") is False:
+                    if tokenize:
+                        return [1, 2, 3, 4, 5]
+                    return "user: hello\nassistant:"
+                if tokenize:
+                    return BatchEncodingResult([1, 2, 3, 4, 5])
+                return "user: hello\nassistant:"
+
+        tok = ModernTokenizer()
+        app = create_app(config=config, scheduler=mock_scheduler, tokenizer=tok)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 50,
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "choices" in data
+        assert data["choices"][0]["message"]["content"] == "Hello, world!"
+
+    @pytest.mark.anyio
+    async def test_chat_endpoint_with_simple_tokenizer_still_works(self, client):
+        """Regression: SimpleTokenizer (no return_dict) still works after fix."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 50,
+            },
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["choices"][0]["message"]["content"] == "Hello, world!"
