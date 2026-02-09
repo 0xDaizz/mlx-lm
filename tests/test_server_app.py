@@ -1183,3 +1183,51 @@ class TestMaxTokensCap:
             },
         )
         assert resp.status_code == 200
+
+
+class TestHealthDistributed:
+    """U14: /health endpoint includes distributed info."""
+
+    @pytest.mark.anyio
+    async def test_health_includes_distributed_disabled(self, config, mock_scheduler, tokenizer):
+        """Health endpoint without dist_ctx shows distributed disabled."""
+        app = create_app(config=config, scheduler=mock_scheduler, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "distributed" in data
+        assert data["distributed"]["enabled"] is False
+        assert data["distributed"]["rank"] is None
+        assert data["distributed"]["world_size"] is None
+
+    @pytest.mark.anyio
+    async def test_health_includes_distributed_enabled(self, config, mock_scheduler, tokenizer):
+        """Health endpoint with dist_ctx shows rank and world_size."""
+        from mlx_lm_server.distributed import DistributedContext
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+        app = create_app(config=config, scheduler=mock_scheduler, tokenizer=tokenizer, dist_ctx=ctx)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["distributed"]["enabled"] is True
+        assert data["distributed"]["rank"] == 0
+        assert data["distributed"]["world_size"] == 2
+
+    @pytest.mark.anyio
+    async def test_health_includes_distributed_rank1(self, config, mock_scheduler, tokenizer):
+        """Health endpoint shows correct info for non-rank0."""
+        from mlx_lm_server.distributed import DistributedContext
+        ctx = DistributedContext(enabled=True, rank=1, world_size=4)
+        app = create_app(config=config, scheduler=mock_scheduler, tokenizer=tokenizer, dist_ctx=ctx)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["distributed"]["enabled"] is True
+        assert data["distributed"]["rank"] == 1
+        assert data["distributed"]["world_size"] == 4

@@ -86,24 +86,28 @@ class TestDistributedCLI:
         config = parse_args(["--model", "test-model"])
         assert config.distributed_mode == "off"
 
-    def test_parse_args_ring_mode(self):
+    def test_parse_args_ring_mode(self, tmp_path):
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         config = parse_args([
             "--model", "test-model",
             "--distributed-mode", "ring",
-            "--distributed-hostfile", "/tmp/hosts.json",
+            "--distributed-hostfile", str(hostfile),
         ])
         assert config.distributed_mode == "ring"
-        assert config.distributed_hostfile == "/tmp/hosts.json"
+        assert config.distributed_hostfile == str(hostfile)
 
-    def test_parse_args_jaccl_mode(self):
+    def test_parse_args_jaccl_mode(self, tmp_path):
+        ibv_file = tmp_path / "ibv.json"
+        ibv_file.write_text("{}")
         config = parse_args([
             "--model", "test-model",
             "--distributed-mode", "jaccl",
-            "--distributed-ibv-devices", "/tmp/ibv.json",
+            "--distributed-ibv-devices", str(ibv_file),
             "--distributed-jaccl-coordinator", "10.0.0.1:55000",
         ])
         assert config.distributed_mode == "jaccl"
-        assert config.distributed_ibv_devices == "/tmp/ibv.json"
+        assert config.distributed_ibv_devices == str(ibv_file)
         assert config.distributed_jaccl_coordinator == "10.0.0.1:55000"
 
     def test_parse_args_ring_missing_hostfile_errors(self):
@@ -137,63 +141,75 @@ class TestDistributedCLI:
                 "--distributed-mode", "jaccl",
             ])
 
-    def test_parse_args_distributed_with_adapter_errors(self):
+    def test_parse_args_distributed_with_adapter_errors(self, tmp_path):
         """Distributed mode with --adapter-path should error."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         with pytest.raises(SystemExit):
             parse_args([
                 "--model", "test-model",
                 "--distributed-mode", "ring",
-                "--distributed-hostfile", "/tmp/hosts.json",
+                "--distributed-hostfile", str(hostfile),
                 "--adapter-path", "/tmp/adapter",
             ])
 
-    def test_parse_args_pipeline_sharding_errors(self):
+    def test_parse_args_pipeline_sharding_errors(self, tmp_path):
         """Pipeline sharding should error (not supported in v1)."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         with pytest.raises(SystemExit):
             parse_args([
                 "--model", "test-model",
                 "--distributed-mode", "ring",
-                "--distributed-hostfile", "/tmp/hosts.json",
+                "--distributed-hostfile", str(hostfile),
                 "--distributed-sharding", "pipeline",
             ])
 
-    def test_parse_args_no_distributed_strict(self):
+    def test_parse_args_no_distributed_strict(self, tmp_path):
         """--no-distributed-strict should set strict=False."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         config = parse_args([
             "--model", "test-model",
             "--distributed-mode", "ring",
-            "--distributed-hostfile", "/tmp/hosts.json",
+            "--distributed-hostfile", str(hostfile),
             "--no-distributed-strict",
         ])
         assert config.distributed_strict is False
 
-    def test_parse_args_distributed_strict_default_true(self):
+    def test_parse_args_distributed_strict_default_true(self, tmp_path):
         """Default distributed_strict should be True."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         config = parse_args([
             "--model", "test-model",
             "--distributed-mode", "ring",
-            "--distributed-hostfile", "/tmp/hosts.json",
+            "--distributed-hostfile", str(hostfile),
         ])
         assert config.distributed_strict is True
 
-    def test_parse_args_off_mode_ignores_hostfile(self):
+    def test_parse_args_off_mode_ignores_hostfile(self, tmp_path):
         """off mode with distributed flags should warn but not error."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         # This should not raise -- parse_args just warns
         config = parse_args([
             "--model", "test-model",
             "--distributed-mode", "off",
-            "--distributed-hostfile", "/tmp/hosts.json",
+            "--distributed-hostfile", str(hostfile),
         ])
         assert config.distributed_mode == "off"
         # The hostfile is set on the config even though mode is off
-        assert config.distributed_hostfile == "/tmp/hosts.json"
+        assert config.distributed_hostfile == str(hostfile)
 
-    def test_parse_args_sharding_default_tensor(self):
+    def test_parse_args_sharding_default_tensor(self, tmp_path):
         """Default sharding should be tensor."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
         config = parse_args([
             "--model", "test-model",
             "--distributed-mode", "ring",
-            "--distributed-hostfile", "/tmp/hosts.json",
+            "--distributed-hostfile", str(hostfile),
         ])
         assert config.distributed_sharding == "tensor"
 

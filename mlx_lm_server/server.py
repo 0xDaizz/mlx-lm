@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import queue
 import time
 import uuid
@@ -255,6 +256,7 @@ def create_app(
     config: ServerConfig,
     scheduler: SchedulerProtocol,
     tokenizer: Any = None,
+    dist_ctx: Any = None,
 ) -> FastAPI:
     """Create a FastAPI application wired to the given scheduler.
 
@@ -267,6 +269,8 @@ def create_app(
     tokenizer:
         A tokenizer with ``encode`` and ``decode`` methods.
         Used to convert chat messages to token ids.
+    dist_ctx:
+        Optional DistributedContext for tensor parallel status reporting.
     """
 
     @asynccontextmanager
@@ -284,6 +288,7 @@ def create_app(
     app.state.tokenizer = tokenizer
     app.state.model_name = config.model
     app.state.shutting_down = False
+    app.state.dist_ctx = dist_ctx
 
     # ------------------------------------------------------------------
     # Error handler
@@ -501,7 +506,16 @@ def create_app(
     async def health():
         sched = app.state.scheduler
         cache_stats = sched.get_cache_stats()
-        return {"status": "ok", "cache_stats": cache_stats}
+        dist = app.state.dist_ctx
+        return {
+            "status": "ok",
+            "cache_stats": cache_stats,
+            "distributed": {
+                "enabled": dist.enabled if dist else False,
+                "rank": dist.rank if dist and dist.enabled else None,
+                "world_size": dist.world_size if dist and dist.enabled else None,
+            },
+        }
 
     return app
 
@@ -816,11 +830,11 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.add_argument("--no-distributed-strict",
                             dest="distributed_strict", action="store_false")
         parser.set_defaults(distributed_strict=True)
-    parser.add_argument("--distributed-hostfile", type=str, default=None,
+    parser.add_argument("--distributed-hostfile", type=str, default=os.environ.get("MLX_HOSTFILE"),
                         help="Hostfile path for ring backend")
-    parser.add_argument("--distributed-ibv-devices", type=str, default=None,
+    parser.add_argument("--distributed-ibv-devices", type=str, default=os.environ.get("MLX_IBV_DEVICES"),
                         help="IBV devices path for jaccl backend")
-    parser.add_argument("--distributed-jaccl-coordinator", type=str, default=None,
+    parser.add_argument("--distributed-jaccl-coordinator", type=str, default=os.environ.get("MLX_JACCL_COORDINATOR"),
                         help="JACCL coordinator address (host:port)")
 
     parsed = parser.parse_args(args)
@@ -871,6 +885,11 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
             "Distributed flags (--distributed-hostfile, --distributed-ibv-devices, "
             "--distributed-jaccl-coordinator) are ignored when --distributed-mode=off"
         )
+
+    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is not None and not os.path.exists(parsed.distributed_hostfile):
+        parser.error(f"--distributed-hostfile path does not exist: {parsed.distributed_hostfile}")
+    if parsed.distributed_mode == "jaccl" and parsed.distributed_ibv_devices is not None and not os.path.exists(parsed.distributed_ibv_devices):
+        parser.error(f"--distributed-ibv-devices path does not exist: {parsed.distributed_ibv_devices}")
 
     kwargs: dict[str, Any] = {
         "model": parsed.model,

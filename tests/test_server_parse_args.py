@@ -187,3 +187,80 @@ class TestParseArgsPrefillBatchSize:
     def test_prefill_less_than_max_accepted(self):
         config = parse_args(["--prefill-batch-size", "4", "--max-batch-size", "8"])
         assert config.prefill_batch_size == 4
+
+
+class TestParseArgsDistributedHardening:
+    """U10: Distributed CLI path existence checks."""
+
+    def test_hostfile_not_exists_rejected(self, tmp_path):
+        """Nonexistent --distributed-hostfile should be rejected."""
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--distributed-mode", "ring",
+                "--distributed-hostfile", str(tmp_path / "nonexistent-hosts.json"),
+            ])
+
+    def test_ibv_devices_not_exists_rejected(self, tmp_path):
+        """Nonexistent --distributed-ibv-devices should be rejected."""
+        with pytest.raises(SystemExit):
+            parse_args([
+                "--distributed-mode", "jaccl",
+                "--distributed-ibv-devices", str(tmp_path / "nonexistent-ibv.json"),
+                "--distributed-jaccl-coordinator", "10.0.0.1:55000",
+            ])
+
+    def test_hostfile_exists_accepted(self, tmp_path):
+        """Existing --distributed-hostfile should be accepted."""
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
+        config = parse_args([
+            "--distributed-mode", "ring",
+            "--distributed-hostfile", str(hostfile),
+        ])
+        assert config.distributed_hostfile == str(hostfile)
+
+    def test_ibv_devices_exists_accepted(self, tmp_path):
+        """Existing --distributed-ibv-devices should be accepted."""
+        ibv_file = tmp_path / "ibv.json"
+        ibv_file.write_text("{}")
+        config = parse_args([
+            "--distributed-mode", "jaccl",
+            "--distributed-ibv-devices", str(ibv_file),
+            "--distributed-jaccl-coordinator", "10.0.0.1:55000",
+        ])
+        assert config.distributed_ibv_devices == str(ibv_file)
+
+
+class TestParseArgsEnvFallback:
+    """U11: Environment variable fallback for distributed config."""
+
+    def test_env_fallback_for_distributed_hostfile(self, monkeypatch, tmp_path):
+        """MLX_HOSTFILE env should be used as default for --distributed-hostfile."""
+        hostfile = tmp_path / "env-hosts.json"
+        hostfile.write_text("{}")
+        monkeypatch.setenv("MLX_HOSTFILE", str(hostfile))
+        config = parse_args(["--distributed-mode", "ring"])
+        assert config.distributed_hostfile == str(hostfile)
+
+    def test_env_fallback_for_ibv_and_coordinator(self, monkeypatch, tmp_path):
+        """MLX_IBV_DEVICES and MLX_JACCL_COORDINATOR env should be used as defaults."""
+        ibv_file = tmp_path / "env-ibv.json"
+        ibv_file.write_text("{}")
+        monkeypatch.setenv("MLX_IBV_DEVICES", str(ibv_file))
+        monkeypatch.setenv("MLX_JACCL_COORDINATOR", "10.0.0.2:55000")
+        config = parse_args(["--distributed-mode", "jaccl"])
+        assert config.distributed_ibv_devices == str(ibv_file)
+        assert config.distributed_jaccl_coordinator == "10.0.0.2:55000"
+
+    def test_cli_overrides_env(self, monkeypatch, tmp_path):
+        """CLI args should override environment variables."""
+        env_file = tmp_path / "env-hosts.json"
+        env_file.write_text("{}")
+        cli_file = tmp_path / "cli-hosts.json"
+        cli_file.write_text("{}")
+        monkeypatch.setenv("MLX_HOSTFILE", str(env_file))
+        config = parse_args([
+            "--distributed-mode", "ring",
+            "--distributed-hostfile", str(cli_file),
+        ])
+        assert config.distributed_hostfile == str(cli_file)

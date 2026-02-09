@@ -1599,7 +1599,12 @@ class Scheduler:
         return self.request_queue.size
 
     def get_cache_stats(self) -> dict[str, Any]:
-        """Return cache statistics for the /health endpoint."""
+        """Return a snapshot of cache and scheduler statistics for the /health endpoint.
+
+        The snapshot includes block pool stats, effectiveness counters, SSD tier stats,
+        async writer stats, and shutdown health fields. All counters are read under lock
+        for consistency.
+        """
         stats: dict[str, Any] = {
             "active_sequences": self.num_active_sequences,
             "queued_requests": self.num_queued_requests,

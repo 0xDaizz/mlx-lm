@@ -96,8 +96,8 @@ def main() -> None:
                     durability=config.ssd_durability,
                     max_retries=config.ssd_persistent_max_retries,
                 )
-        except ImportError:
-            pass
+        except ImportError as e:
+            logger.warning("KV cache modules not available: %s", e)
 
         # --- Control bus (for future scheduler integration) ---
         control_bus = None
@@ -130,7 +130,8 @@ def main() -> None:
         if not dist_ctx.enabled or dist_ctx.is_rank0:
             # Rank 0 (or single-machine): run HTTP server
             app = create_app(
-                config=config, scheduler=scheduler, tokenizer=tokenizer
+                config=config, scheduler=scheduler, tokenizer=tokenizer,
+                dist_ctx=dist_ctx,
             )
             uvicorn.run(app, host=config.host, port=config.port)
         else:
