@@ -14,6 +14,7 @@ import os
 import queue
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from queue import Queue
@@ -280,11 +281,25 @@ def create_app(
         Optional DistributedContext for tensor parallel status reporting.
     """
 
+    # ------------------------------------------------------------------
+    # Dedicated thread pool for inference polling
+    # ------------------------------------------------------------------
+    # Prevents executor starvation under concurrent load.
+    # Formula: max(max_concurrent_requests, 32) + 16 headroom.
+    # If max_concurrent_requests=0 (unlimited), use 128 as a sane default.
+    _mcr = config.max_concurrent_requests
+    _pool_size = (max(_mcr, 32) + 16) if _mcr > 0 else 128
+    _inference_executor = ThreadPoolExecutor(
+        max_workers=_pool_size,
+        thread_name_prefix="inference-poll",
+    )
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
         # Shutdown: flush and stop
         app.state.shutting_down = True
+        _inference_executor.shutdown(wait=False)
         scheduler.shutdown()
 
     app = FastAPI(title="mlx-lm-server", version="0.1.0", lifespan=lifespan)
@@ -521,7 +536,7 @@ def create_app(
                 wait = min(poll_interval, remaining) if remaining > 0 else poll_interval
                 try:
                     events = await loop.run_in_executor(
-                        None, lambda t=wait: sched.get_result(request_id, timeout=t)
+                        _inference_executor, lambda t=wait: sched.get_result(request_id, timeout=t)
                     )
                     break  # Got result
                 except TimeoutError:
@@ -618,6 +633,7 @@ def create_app(
                 request_timeout_s=app.state.config.request_timeout_s,
                 first_token_timeout_s=app.state.config.first_token_timeout_s,
                 is_chat=True,
+                executor=_inference_executor,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_chat_response)
@@ -670,6 +686,7 @@ def create_app(
                 request_timeout_s=app.state.config.request_timeout_s,
                 first_token_timeout_s=app.state.config.first_token_timeout_s,
                 is_chat=False,
+                executor=_inference_executor,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_completion_response)
@@ -963,6 +980,7 @@ def _stream_response(
     request_timeout_s: float = 120.0,
     first_token_timeout_s: float | None = None,
     is_chat: bool = False,
+    executor: ThreadPoolExecutor | None = None,
 ) -> StreamingResponse:
     """Unified SSE streaming for both chat and completion endpoints.
 
@@ -972,6 +990,7 @@ def _stream_response(
         request_timeout_s: Per-token timeout in seconds for the stream queue.
         first_token_timeout_s: Timeout for the first token (prefill). If None,
             uses *request_timeout_s* for all tokens.
+        executor: ThreadPoolExecutor for polling. If None, uses the default executor.
     """
     # Register the stream and submit BEFORE creating the generator.
     # This allows us to raise HTTPException (proper 503) for distributed errors
@@ -1021,7 +1040,7 @@ def _stream_response(
                 )
                 try:
                     event: TokenEvent | None = await loop.run_in_executor(
-                        None, lambda t=timeout: token_queue.get(timeout=t)
+                        executor, lambda t=timeout: token_queue.get(timeout=t)
                     )
                 except queue.Empty:
                     error_data = {"error": {"message": f"Stream timeout: no tokens received for {timeout} seconds", "type": "server_error"}}
@@ -1261,6 +1280,14 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         api_key = api_key.strip()
         if not api_key:
             parser.error("--api-key must not be empty")
+
+    # If num_local_ranks is set, hostfile is irrelevant — force clear
+    if parsed.num_local_ranks is not None and parsed.distributed_hostfile is not None:
+        logging.getLogger(__name__).warning(
+            "Both --num-local-ranks and --distributed-hostfile/MLX_HOSTFILE set; "
+            "ignoring hostfile in favor of local ranks"
+        )
+        parsed.distributed_hostfile = None
 
     # Distributed validation
     already_launched = os.environ.get("MLX_RANK") is not None

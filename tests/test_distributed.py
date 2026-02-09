@@ -1438,7 +1438,7 @@ class TestBusUnpackErrorCounter:
 class TestWorldSize1FailFast:
     """U4: distributed_mode != 'off' but world_size==1 should fail-fast."""
 
-    def test_world_size_1_raises_runtime_error(self):
+    def test_world_size_1_raises_runtime_error(self, monkeypatch):
         """init_distributed should raise when world_size==1 with ring/jaccl mode."""
         from unittest.mock import MagicMock, patch
 
@@ -1446,6 +1446,9 @@ class TestWorldSize1FailFast:
             distributed_mode="ring",
             distributed_hostfile="/tmp/hosts.json",
         )
+
+        # Clean up env vars that init_distributed() sets directly
+        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
 
         # Mock mx.distributed.init to return a group with world_size=1
         mock_group = MagicMock()
@@ -1875,6 +1878,7 @@ class TestAutoRelaunch:
         from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
 
         monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.delenv("MLX_HOSTFILE", raising=False)
         monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--distributed-mode", "ring"])
         with pytest.raises(SystemExit) as exc_info:
             _maybe_relaunch_under_mlx_launch()
@@ -1885,6 +1889,8 @@ class TestAutoRelaunch:
         from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
 
         monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
+        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
         monkeypatch.setattr("sys.argv", ["mlx_lm_server", "--distributed-mode", "jaccl"])
         with pytest.raises(SystemExit) as exc_info:
             _maybe_relaunch_under_mlx_launch()
@@ -1945,6 +1951,9 @@ class TestAutoRelaunch:
         from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
 
         monkeypatch.delenv("MLX_RANK", raising=False)
+        # Ensure env vars set by the function are cleaned up after this test
+        monkeypatch.delenv("MLX_IBV_DEVICES", raising=False)
+        monkeypatch.delenv("MLX_JACCL_COORDINATOR", raising=False)
         monkeypatch.setattr("sys.argv", [
             "mlx_lm_server", "--distributed-mode", "jaccl",
             "--distributed-ibv-devices", "/dev/ibv0",
@@ -2155,3 +2164,111 @@ class TestStopIdempotencyAndOrdering:
         scheduler.stop()
         scheduler.stop()  # Should not raise
         assert scheduler._stopped is True
+
+
+# =========================================================================
+# Q. Pre-parser Env Var Support + num-local-ranks Priority (P1-4, P1-5)
+# =========================================================================
+
+
+class TestPreParserEnvVarSupport:
+    """Test that pre-parser reads MLX_HOSTFILE etc. from env vars,
+    and that --num-local-ranks takes priority over env-sourced hostfile."""
+
+    def test_env_hostfile_works_with_ring_mode(self, monkeypatch, tmp_path):
+        """Set MLX_HOSTFILE env, no CLI hostfile -> pre-parser should not error."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setenv("MLX_HOSTFILE", str(hostfile))
+        monkeypatch.setattr("sys.argv", [
+            "mlx_lm_server",
+            "--distributed-mode", "ring",
+            "--model", "test-model",
+        ])
+
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        # Should have reached execvp (not exited with error)
+        assert len(exec_calls) == 1
+        _, cmd = exec_calls[0]
+        assert "--hostfile" in cmd
+        assert str(hostfile) in cmd
+
+    def test_num_local_ranks_overrides_env_hostfile(self, monkeypatch, tmp_path):
+        """Set both MLX_HOSTFILE env and --num-local-ranks -> hostfile should be None."""
+        # Test via parse_args (the full parser in server.py)
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
+
+        monkeypatch.setenv("MLX_HOSTFILE", str(hostfile))
+        monkeypatch.setenv("MLX_RANK", "0")  # Simulate already-launched
+
+        config = parse_args([
+            "--model", "test-model",
+            "--distributed-mode", "ring",
+            "--num-local-ranks", "2",
+        ])
+        # hostfile should have been cleared in favor of num_local_ranks
+        assert config.distributed_hostfile is None
+
+    def test_num_local_ranks_overrides_env_hostfile_in_pre_parser(self, monkeypatch, tmp_path):
+        """Pre-parser: --num-local-ranks should override env MLX_HOSTFILE, using localhost path."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        hostfile = tmp_path / "hosts.json"
+        hostfile.write_text("{}")
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setenv("MLX_HOSTFILE", str(hostfile))
+        monkeypatch.setattr("sys.argv", [
+            "mlx_lm_server",
+            "--distributed-mode", "ring",
+            "--num-local-ranks", "4",
+        ])
+
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        assert len(exec_calls) == 1
+        _, cmd = exec_calls[0]
+        # Should use --hosts localhost -n 4 (not --hostfile)
+        assert "--hosts" in cmd
+        assert "localhost" in cmd
+        assert "-n" in cmd
+        assert "4" in cmd
+        assert "--hostfile" not in cmd
+
+    def test_env_jaccl_vars_work_in_pre_parser(self, monkeypatch):
+        """Set MLX_IBV_DEVICES + MLX_JACCL_COORDINATOR env -> pre-parser accepts jaccl mode."""
+        from unittest.mock import patch
+        from mlx_lm_server.__main__ import _maybe_relaunch_under_mlx_launch
+
+        monkeypatch.delenv("MLX_RANK", raising=False)
+        monkeypatch.setenv("MLX_IBV_DEVICES", "/dev/ibv0")
+        monkeypatch.setenv("MLX_JACCL_COORDINATOR", "192.168.1.1:9000")
+        monkeypatch.setattr("sys.argv", [
+            "mlx_lm_server",
+            "--distributed-mode", "jaccl",
+        ])
+
+        exec_calls = []
+        with patch("shutil.which", return_value="/usr/local/bin/mlx.launch"):
+            with patch("os.execvp", side_effect=lambda p, c: exec_calls.append((p, c))):
+                _maybe_relaunch_under_mlx_launch()
+
+        # Should have reached execvp without error (env vars satisfied requirements)
+        assert len(exec_calls) == 1
+        _, cmd = exec_calls[0]
+        assert "--backend" in cmd
+        assert "jaccl" in cmd

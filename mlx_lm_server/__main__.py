@@ -7,6 +7,7 @@ import logging
 import os
 import shutil
 import sys
+import threading
 
 import uvicorn
 
@@ -30,9 +31,9 @@ def _maybe_relaunch_under_mlx_launch() -> None:
     # Minimal pre-parse — only the flags we need to decide whether to relaunch.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--distributed-mode", default="off")
-    pre.add_argument("--distributed-hostfile", default=None)
-    pre.add_argument("--distributed-ibv-devices", default=None)
-    pre.add_argument("--distributed-jaccl-coordinator", default=None)
+    pre.add_argument("--distributed-hostfile", default=os.environ.get("MLX_HOSTFILE"))
+    pre.add_argument("--distributed-ibv-devices", default=os.environ.get("MLX_IBV_DEVICES"))
+    pre.add_argument("--distributed-jaccl-coordinator", default=os.environ.get("MLX_JACCL_COORDINATOR"))
     pre.add_argument("--num-local-ranks", type=int, default=None)
     args, _ = pre.parse_known_args()
 
@@ -63,6 +64,10 @@ def _maybe_relaunch_under_mlx_launch() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+    # num_local_ranks takes priority over env-sourced hostfile
+    if args.num_local_ranks is not None:
+        args.distributed_hostfile = None  # Ignore env-sourced hostfile
 
     # Build the mlx.launch command.
     cmd: list[str] = ["mlx.launch", "--backend", mode]
@@ -230,12 +235,22 @@ def main() -> None:
         logger.critical("Fatal error: %s", e)
         sys.exit(1)
     finally:
-        if scheduler is not None:
-            try:
-                scheduler.stop()
-            except Exception:
-                logger.warning("Error during scheduler shutdown", exc_info=True)
-        finalize_distributed(dist_ctx)
+        # Guard cleanup with a 10-second timeout. If scheduler.stop() or
+        # finalize_distributed() hangs (stuck collective, stuck thread join),
+        # the daemon timer forces process exit.
+        cleanup_timer = threading.Timer(10.0, lambda: os._exit(1))
+        cleanup_timer.daemon = True
+        cleanup_timer.start()
+        try:
+            if scheduler is not None:
+                try:
+                    scheduler.stop()
+                except Exception:
+                    logger.warning("Error during scheduler shutdown", exc_info=True)
+            if dist_ctx is not None:
+                finalize_distributed(dist_ctx)
+        finally:
+            cleanup_timer.cancel()
 
 
 if __name__ == "__main__":
