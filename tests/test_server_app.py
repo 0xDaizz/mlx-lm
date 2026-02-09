@@ -581,8 +581,13 @@ class TestErrorHandling:
         assert resp2.status_code == 422
 
     @pytest.mark.anyio
-    async def test_streaming_queue_full_returns_error_sse(self, config, tokenizer):
-        """When submit_request raises during streaming, SSE error event is emitted."""
+    async def test_streaming_queue_full_returns_error_http(self, config, tokenizer):
+        """When submit_request raises during streaming, HTTP error is returned.
+
+        Since submit_request is called BEFORE the SSE generator is created
+        (to support proper HTTP status codes), a queue-full RuntimeError
+        results in an HTTP 429 response, not an SSE error event.
+        """
 
         class QueueFullScheduler(MockSchedulerForApp):
             def submit_request(self, request):
@@ -600,24 +605,11 @@ class TestErrorHandling:
                     "stream": True,
                 },
             )
-        # Streaming still returns 200 status, but the SSE body contains the error
-        assert resp.status_code == 200
-        body = resp.text
-        lines = [line for line in body.strip().split("\n") if line.strip()]
-
-        error_found = False
-        for line in lines:
-            if line.startswith("data: ") and line != "data: [DONE]":
-                payload = line[len("data: "):]
-                try:
-                    chunk = json.loads(payload)
-                    if "error" in chunk:
-                        assert "queue" in chunk["error"]["message"].lower()
-                        error_found = True
-                except json.JSONDecodeError:
-                    pass
-
-        assert error_found, "Expected an SSE error event for queue full during streaming"
+        # Submit errors before the stream starts -> proper HTTP error code
+        assert resp.status_code == 429
+        body = resp.json()
+        assert "error" in body
+        assert "queue" in body["error"]["message"].lower()
 
 
 # ===========================================================================

@@ -231,6 +231,8 @@ class Scheduler:
             "total_prefill_tokens": 0,
             "total_cached_tokens": 0,
             "total_requests": 0,
+            "submitted_requests": 0,
+            "accepted_requests": 0,
         }
         self._stats_lock = threading.Lock()
 
@@ -301,59 +303,53 @@ class Scheduler:
     def submit_request(self, request: InferenceRequest) -> None:
         """Submit a new inference request to the scheduler.
 
-        The request is added to the queue and the inference loop is notified.
-        Only creates _results/_results_ready entries for non-streaming requests
-        to prevent resource leaks (streaming requests use register_stream instead).
+        In distributed mode (rank0), this method ONLY enqueues a submit event
+        to the bus outbox. The inference thread's _drain_bus_outbox() will
+        publish the event to all ranks and then do the rank0 local apply
+        (request_queue.add + result buffers). This ensures all ranks see
+        the same events in the same order, preventing rank divergence.
 
-        If request_queue.add() fails, any result buffers are cleaned up to
-        prevent memory leaks.
+        In non-distributed mode, the request is added directly to the queue
+        and result buffers are created immediately.
         """
         if self._dist_fatal:
             raise RuntimeError("Distributed control plane degraded")
 
-        # Set up result storage BEFORE adding to queue (so cleanup paths can find it)
         is_streaming = getattr(request, "stream", False)
-        if not is_streaming:
-            with self._results_lock:
-                self._results[request.request_id] = []
-                self._results_ready[request.request_id] = threading.Event()
 
-        try:
-            self.request_queue.add(request)
-        except Exception:
-            # Clean up result buffers on queue failure
-            if not is_streaming:
-                with self._results_lock:
-                    self._results.pop(request.request_id, None)
-                    self._results_ready.pop(request.request_id, None)
-            raise
-
-        self._inc_stat("total_requests")
-
-        self._new_request_event.set()
-
-        # Queue submit event for broadcast to non-rank0 workers (TP mode)
         if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+            # ===== DISTRIBUTED MODE: outbox enqueue ONLY =====
+            # Do NOT call request_queue.add() here.
+            # Do NOT create result buffers here.
+            # The inference thread's _drain_bus_outbox() will:
+            #   1. publish to all ranks
+            #   2. rank0 local apply (add + buffers)
             from mlx_lm_server.distributed_bus import ControlEvent
             from mlx_lm_server.types import BusOutboxFullError
             if self._bus_outbox.qsize() >= BUS_OUTBOX_MAXSIZE - BUS_OUTBOX_CONTROL_RESERVE:
-                # Undo the queue add and result buffer setup
-                self.request_queue.cancel(request.request_id)
-                if not is_streaming:
-                    with self._results_lock:
-                        self._results.pop(request.request_id, None)
-                        self._results_ready.pop(request.request_id, None)
                 raise BusOutboxFullError(request.request_id)
             try:
                 self._bus_outbox.put_nowait(ControlEvent.submit(request))
             except queue.Full:
-                # TOCTOU: another thread passed qsize check simultaneously
-                self.request_queue.cancel(request.request_id)
+                raise BusOutboxFullError(request.request_id)
+            self._inc_stat("submitted_requests")
+            self._new_request_event.set()
+        else:
+            # ===== NON-DISTRIBUTED MODE: direct add =====
+            if not is_streaming:
+                with self._results_lock:
+                    self._results[request.request_id] = []
+                    self._results_ready[request.request_id] = threading.Event()
+            try:
+                self.request_queue.add(request)
+            except Exception:
                 if not is_streaming:
                     with self._results_lock:
                         self._results.pop(request.request_id, None)
                         self._results_ready.pop(request.request_id, None)
-                raise BusOutboxFullError(request.request_id)
+                raise
+            self._inc_stat("total_requests")
+            self._new_request_event.set()
 
         logger.debug("Submitted request %s", request.request_id)
 
@@ -394,30 +390,42 @@ class Scheduler:
     def cancel_request(self, request_id: str) -> bool:
         """Cancel a request.
 
-        If the request is still in the queue, it is removed.
-        If it is already active, it is marked as cancelled and will
-        be cleaned up at the next schedule step.
+        In distributed mode (rank0), this method ONLY enqueues a cancel event
+        to the bus outbox. The inference thread's _drain_bus_outbox() will
+        publish the event to all ranks and then do the rank0 local apply
+        (queue cancel / _cancelled set). This ensures rank-consistent ordering.
 
-        Returns True if the request was found.
+        In non-distributed mode, the cancel is applied immediately:
+        - If the request is still in the queue, it is removed.
+        - If it is already active, it is marked as cancelled.
+
+        Returns True if the request was found (or queued for distributed cancel).
 
         Lock ordering: _active_lock FIRST, then _cancelled_lock — matches
         schedule_step() to prevent circular-wait deadlock.
         """
+        if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+            # ===== DISTRIBUTED MODE: outbox enqueue ONLY =====
+            # Do NOT call request_queue.cancel() here.
+            # Do NOT manipulate _cancelled directly.
+            # The inference thread's _drain_bus_outbox() will do local apply.
+            from mlx_lm_server.distributed_bus import ControlEvent
+            try:
+                self._bus_outbox.put_nowait(ControlEvent.cancel(request_id))
+            except queue.Full:
+                logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
+                self._dist_fatal = True
+                self._dist_fatal_reason = "bus_outbox_full_cancel"
+                self._running = False
+                self._new_request_event.set()
+            self._new_request_event.set()
+            return True
+
+        # ===== NON-DISTRIBUTED MODE: immediate cancel =====
         # Try removing from queue first (no lock needed for this)
         if self.request_queue.cancel(request_id):
             self._signal_finish(request_id, finish_reason="cancelled")
             self._cleanup_result_buffers(request_id)
-            # Queue cancel event for broadcast to non-rank0 workers (TP mode)
-            if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
-                from mlx_lm_server.distributed_bus import ControlEvent
-                try:
-                    self._bus_outbox.put_nowait(ControlEvent.cancel(request_id))
-                except queue.Full:
-                    logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
-                    self._dist_fatal = True
-                    self._dist_fatal_reason = "bus_outbox_full_cancel"
-                    self._running = False
-                    self._new_request_event.set()
             return True
 
         # Use consistent lock ordering: _active_lock FIRST, then _cancelled_lock
@@ -425,17 +433,6 @@ class Scheduler:
             with self._cancelled_lock:
                 self._cancelled.add(request_id)
             if request_id in self._active_sequences:
-                # Queue cancel event for broadcast to non-rank0 workers (TP mode)
-                if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
-                    from mlx_lm_server.distributed_bus import ControlEvent
-                    try:
-                        self._bus_outbox.put_nowait(ControlEvent.cancel(request_id))
-                    except queue.Full:
-                        logger.critical("Bus outbox full even for cancel event — distributed state is degraded")
-                        self._dist_fatal = True
-                        self._dist_fatal_reason = "bus_outbox_full_cancel"
-                        self._running = False
-                        self._new_request_event.set()
                 return True
 
         # Request not found in queue or active — clean up any stale buffers
@@ -486,7 +483,19 @@ class Scheduler:
         if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
             try:
                 from mlx_lm_server.distributed_bus import ControlEvent
-                self._bus_outbox.put(ControlEvent.shutdown())
+                self._bus_outbox.put_nowait(ControlEvent.shutdown())
+            except queue.Full:
+                logger.warning("Bus outbox full during shutdown, draining first")
+                # Drain a few items to make room
+                for _ in range(min(10, self._bus_outbox.qsize())):
+                    try:
+                        self._bus_outbox.get_nowait()
+                    except queue.Empty:
+                        break
+                try:
+                    self._bus_outbox.put_nowait(ControlEvent.shutdown())
+                except queue.Full:
+                    logger.critical("Cannot enqueue shutdown event even after drain")
             except Exception:
                 logger.warning("Failed to queue shutdown event", exc_info=True)
 
@@ -686,6 +695,11 @@ class Scheduler:
         Uses retry-first pattern: if previous events failed to publish,
         retry those first before draining new events from the outbox.
         This preserves event ordering across retries.
+
+        After successful publish, performs rank0 local apply: adds requests
+        to the local queue, creates result buffers, and handles cancels.
+        This ensures rank0 only applies events that were successfully
+        broadcast to all ranks, preventing rank divergence.
         """
         if self._control_bus is None:
             return
@@ -738,6 +752,52 @@ class Scheduler:
                     self._bus_retry_events = real_events
                     # Signal quick retry
                     self._new_request_event.set()
+            # CRITICAL: Do NOT do local apply if publish failed — that would
+            # diverge rank0 from workers who never received these events.
+            return
+
+        # ===== Rank0 local apply (after successful publish) =====
+        compensation_events: list[ControlEvent] = []
+        for ev in events:
+            if ev.typ == "submit":
+                request = ev.unpack_request()
+                if request is not None:
+                    is_streaming = getattr(request, "stream", False)
+                    try:
+                        self.request_queue.add(request)
+                        if not is_streaming:
+                            with self._results_lock:
+                                self._results[request.request_id] = []
+                                self._results_ready[request.request_id] = threading.Event()
+                        self._inc_stat("total_requests")
+                        self._inc_stat("accepted_requests")
+                    except Exception:
+                        logger.exception("Rank0 local add failed for %s", request.request_id)
+                        self._cleanup_result_buffers(request.request_id)
+                        compensation_events.append(ControlEvent.cancel(request.request_id))
+            elif ev.typ == "cancel":
+                request_id = ev.unpack_request_id()
+                if request_id is not None:
+                    if not self.request_queue.cancel(request_id):
+                        with self._cancelled_lock:
+                            self._cancelled.add(request_id)
+                    else:
+                        # Request was in queue — signal finish and clean up buffers
+                        self._signal_finish(request_id, finish_reason="cancelled")
+                        self._cleanup_result_buffers(request_id)
+            # "shutdown" and "noop" — no local apply needed
+            # (shutdown is handled in _apply_bus_events path or directly)
+
+        # Enqueue compensation cancels for failed adds
+        for cev in compensation_events:
+            try:
+                self._bus_outbox.put_nowait(cev)
+            except queue.Full:
+                logger.critical("Control outbox full while enqueuing compensation cancel")
+                self._dist_fatal = True
+                self._dist_fatal_reason = "control_outbox_full"
+                self._running = False
+                self._new_request_event.set()
 
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""

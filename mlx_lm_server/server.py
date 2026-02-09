@@ -645,23 +645,23 @@ def _stream_response(
         first_token_timeout_s: Timeout for the first token (prefill). If None,
             uses *request_timeout_s* for all tokens.
     """
-    async def event_generator() -> AsyncIterator[str]:
-        token_queue = scheduler.register_stream(inf_req.request_id)
-        try:
-            try:
-                scheduler.submit_request(inf_req)
-            except BusOutboxFullError:
-                error_data = {"error": {"message": "Server overloaded — distributed bus full", "type": "server_error"}}
-                yield f"data: {json.dumps(error_data)}\n\n"
-                return
-            except RuntimeError as e:
-                if "Distributed control plane degraded" in str(e):
-                    error_data = {"error": {"message": str(e), "type": "server_error"}}
-                else:
-                    error_data = {"error": {"message": str(e), "type": "rate_limit_error"}}
-                yield f"data: {json.dumps(error_data)}\n\n"
-                return
+    # Register the stream and submit BEFORE creating the generator.
+    # This allows us to raise HTTPException (proper 503) for distributed errors
+    # instead of yielding an SSE error payload. Raising HTTPException inside
+    # an async generator doesn't work with Starlette — it bypasses the
+    # exception handler and crashes the stream.
+    token_queue = scheduler.register_stream(inf_req.request_id)
+    try:
+        scheduler.submit_request(inf_req)
+    except BusOutboxFullError:
+        raise HTTPException(status_code=503, detail="Server overloaded — distributed bus full")
+    except RuntimeError as e:
+        if "Distributed control plane degraded" in str(e):
+            raise HTTPException(status_code=503, detail=str(e))
+        raise HTTPException(status_code=429, detail=str(e))
 
+    async def event_generator() -> AsyncIterator[str]:
+        try:
             loop = asyncio.get_running_loop()
             eos_ids = _get_eos_token_ids(tokenizer) if tokenizer else set()
             stop_sequences = inf_req.stop_sequences or []
