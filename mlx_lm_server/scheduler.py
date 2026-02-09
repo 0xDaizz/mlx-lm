@@ -137,6 +137,8 @@ class Scheduler:
         kv_cache_manager=None,
         tiered_cache=None,
         ssd_writer=None,
+        dist_ctx=None,
+        control_bus=None,
     ) -> None:
         self.config = config
         self.model = model
@@ -183,6 +185,12 @@ class Scheduler:
         # Tiered cache (RAM + SSD) — injected via constructor or tests
         self._tiered_cache: Any = tiered_cache
         self._ssd_writer = ssd_writer
+
+        # Distributed context and control bus (tensor parallel)
+        self._dist_ctx = dist_ctx
+        self._control_bus = control_bus
+        # Local queue for events to broadcast (rank0 only, used by inference loop)
+        self._bus_outbox: queue.Queue = queue.Queue()
 
         # SSD pruning counter (prune every N inference steps)
         self._ssd_prune_interval: int = 1000
@@ -298,6 +306,12 @@ class Scheduler:
         self._inc_stat("total_requests")
 
         self._new_request_event.set()
+
+        # Queue submit event for broadcast to non-rank0 workers (TP mode)
+        if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+            from mlx_lm_server.distributed_bus import ControlEvent
+            self._bus_outbox.put(ControlEvent.submit(request))
+
         logger.debug("Submitted request %s", request.request_id)
 
     def register_stream(self, request_id: str) -> queue.Queue[TokenEvent]:
@@ -350,6 +364,10 @@ class Scheduler:
         if self.request_queue.cancel(request_id):
             self._signal_finish(request_id, finish_reason="cancelled")
             self._cleanup_result_buffers(request_id)
+            # Queue cancel event for broadcast to non-rank0 workers (TP mode)
+            if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+                from mlx_lm_server.distributed_bus import ControlEvent
+                self._bus_outbox.put(ControlEvent.cancel(request_id))
             return True
 
         # Use consistent lock ordering: _active_lock FIRST, then _cancelled_lock
@@ -357,6 +375,10 @@ class Scheduler:
             with self._cancelled_lock:
                 self._cancelled.add(request_id)
             if request_id in self._active_sequences:
+                # Queue cancel event for broadcast to non-rank0 workers (TP mode)
+                if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+                    from mlx_lm_server.distributed_bus import ControlEvent
+                    self._bus_outbox.put(ControlEvent.cancel(request_id))
                 return True
 
         # Request not found in queue or active — clean up any stale buffers
@@ -384,9 +406,24 @@ class Scheduler:
             )
             self._inference_thread.start()
 
+    def join_worker_loop(self) -> None:
+        """Block until the inference loop finishes. Used by non-rank0 workers."""
+        if self._inference_thread is not None:
+            self._inference_thread.join()
+        logger.info("Worker loop finished")
+
     def stop(self) -> None:
         """Stop the inference loop and gracefully shut down all subsystems."""
         self._running = False
+
+        # Queue shutdown event for broadcast (TP mode)
+        if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
+            try:
+                from mlx_lm_server.distributed_bus import ControlEvent
+                self._bus_outbox.put(ControlEvent.shutdown())
+            except Exception:
+                logger.warning("Failed to queue shutdown event", exc_info=True)
+
         self._new_request_event.set()
         if self._inference_thread is not None:
             self._inference_thread.join(timeout=5.0)
@@ -477,8 +514,73 @@ class Scheduler:
         # Clean up finished sequences
         self._cleanup_finished()
 
+    def _apply_bus_events(self) -> bool:
+        """Receive and apply control events from the distributed bus.
+
+        Called by non-rank0 workers at the start of each batch inference step.
+        Returns False if shutdown was received.
+        """
+        if self._control_bus is None:
+            return True
+
+        from mlx_lm_server.distributed_bus import ControlEvent
+        event = self._control_bus.recv()
+
+        if event.typ == "submit":
+            request = event.unpack_request()
+            if request is not None:
+                # Apply locally without re-publishing
+                self.request_queue.add(request)
+                with self._results_lock:
+                    self._results[request.request_id] = []
+                    self._results_ready[request.request_id] = threading.Event()
+                self._inc_stat("total_requests")
+                self._new_request_event.set()
+
+        elif event.typ == "cancel":
+            request_id = event.unpack_request_id()
+            if request_id is not None:
+                with self._cancelled_lock:
+                    self._cancelled.add(request_id)
+
+        elif event.typ == "shutdown":
+            self._running = False
+            self._new_request_event.set()
+            return False
+
+        # "noop" — do nothing
+        return True
+
+    def _drain_bus_outbox(self) -> None:
+        """Rank0: broadcast one queued event to all ranks via the control bus.
+
+        Called once per inference step from the inference loop thread.
+        Sends a noop if no events are pending, to keep ranks synchronized.
+        """
+        if self._control_bus is None:
+            return
+
+        from mlx_lm_server.distributed_bus import ControlEvent
+
+        try:
+            event = self._bus_outbox.get_nowait()
+        except queue.Empty:
+            event = ControlEvent.noop()
+
+        self._control_bus.publish(event)
+
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""
+        # Distributed bus synchronization (TP mode)
+        if self._control_bus is not None and self._dist_ctx is not None:
+            if self._dist_ctx.is_rank0:
+                # rank0: broadcast one queued event (or noop)
+                self._drain_bus_outbox()
+            else:
+                # rank>0: receive and apply one event
+                if not self._apply_bus_events():
+                    return  # shutdown received
+
         # Wait for work if idle
         with self._active_lock:
             has_active = bool(self._uid_to_request_id)

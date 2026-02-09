@@ -57,4 +57,12 @@ class ServerConfig:
     first_token_timeout_s: float = 300.0  # Timeout for first token (prefill included)
 
     # Distributed
-    use_distributed: bool = False
+    use_distributed: bool = False  # DEPRECATED: use distributed_mode instead
+
+    # Distributed / Tensor Parallel
+    distributed_mode: str = "off"                          # off | ring | jaccl
+    distributed_sharding: str = "tensor"                   # tensor | pipeline
+    distributed_strict: bool = True
+    distributed_hostfile: str | None = None
+    distributed_ibv_devices: str | None = None
+    distributed_jaccl_coordinator: str | None = None

@@ -779,6 +779,30 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--request-timeout-s", type=float, default=120.0)
     parser.add_argument("--first-token-timeout-s", type=float, default=300.0)
 
+    # Distributed / Tensor Parallel
+    parser.add_argument("--distributed-mode", type=str, default="off",
+                        choices=["off", "ring", "jaccl"],
+                        help="Distributed backend: off (single-machine), ring, or jaccl (RDMA)")
+    parser.add_argument("--distributed-sharding", type=str, default="tensor",
+                        choices=["tensor", "pipeline"],
+                        help="Sharding strategy: tensor or pipeline")
+    if hasattr(argparse, "BooleanOptionalAction"):
+        parser.add_argument("--distributed-strict",
+                            action=argparse.BooleanOptionalAction, default=True,
+                            help="Strict distributed init (default: True)")
+    else:
+        parser.add_argument("--distributed-strict",
+                            dest="distributed_strict", action="store_true")
+        parser.add_argument("--no-distributed-strict",
+                            dest="distributed_strict", action="store_false")
+        parser.set_defaults(distributed_strict=True)
+    parser.add_argument("--distributed-hostfile", type=str, default=None,
+                        help="Hostfile path for ring backend")
+    parser.add_argument("--distributed-ibv-devices", type=str, default=None,
+                        help="IBV devices path for jaccl backend")
+    parser.add_argument("--distributed-jaccl-coordinator", type=str, default=None,
+                        help="JACCL coordinator address (host:port)")
+
     parsed = parser.parse_args(args)
 
     if parsed.ssd_writer_queue_size < 1:
@@ -787,6 +811,34 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--ssd-persistent-max-retries must be >= 0")
     if parsed.ssd_flush_interval_s <= 0:
         parser.error("--ssd-flush-interval-s must be > 0")
+
+    # Distributed validation
+    if parsed.distributed_mode == "ring" and parsed.distributed_hostfile is None:
+        parser.error("--distributed-hostfile is required when --distributed-mode=ring")
+    if parsed.distributed_mode == "jaccl":
+        if parsed.distributed_ibv_devices is None or parsed.distributed_jaccl_coordinator is None:
+            parser.error(
+                "--distributed-ibv-devices and --distributed-jaccl-coordinator "
+                "are required when --distributed-mode=jaccl"
+            )
+    if parsed.distributed_mode != "off" and parsed.adapter_path is not None:
+        parser.error("Distributed mode does not support adapter_path")
+    if parsed.distributed_sharding == "pipeline":
+        parser.error(
+            "Pipeline sharding is not supported in v1. "
+            "Use --distributed-sharding tensor"
+        )
+    if parsed.distributed_mode == "off" and any(
+        v is not None for v in (
+            parsed.distributed_hostfile,
+            parsed.distributed_ibv_devices,
+            parsed.distributed_jaccl_coordinator,
+        )
+    ):
+        logging.getLogger(__name__).warning(
+            "Distributed flags (--distributed-hostfile, --distributed-ibv-devices, "
+            "--distributed-jaccl-coordinator) are ignored when --distributed-mode=off"
+        )
 
     kwargs: dict[str, Any] = {
         "model": parsed.model,
@@ -813,7 +865,17 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "max_prompt_tokens": parsed.max_prompt_tokens,
         "request_timeout_s": parsed.request_timeout_s,
         "first_token_timeout_s": parsed.first_token_timeout_s,
+        "distributed_mode": parsed.distributed_mode,
+        "distributed_sharding": parsed.distributed_sharding,
+        "distributed_strict": parsed.distributed_strict,
     }
+
+    if parsed.distributed_hostfile is not None:
+        kwargs["distributed_hostfile"] = parsed.distributed_hostfile
+    if parsed.distributed_ibv_devices is not None:
+        kwargs["distributed_ibv_devices"] = parsed.distributed_ibv_devices
+    if parsed.distributed_jaccl_coordinator is not None:
+        kwargs["distributed_jaccl_coordinator"] = parsed.distributed_jaccl_coordinator
 
     if parsed.adapter_path is not None:
         kwargs["adapter_path"] = parsed.adapter_path
