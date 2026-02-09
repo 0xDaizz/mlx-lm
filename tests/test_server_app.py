@@ -2165,8 +2165,13 @@ class TestRequestSizeGuard:
 
     @pytest.mark.anyio
     async def test_large_body_without_content_length_rejected(self, tokenizer, tmp_path):
-        """A POST body that exceeds max_request_bytes is rejected even
-        without a Content-Length header (simulates chunked transfer)."""
+        """Oversized body with forged Content-Length should be rejected with 413.
+
+        httpx always auto-sets Content-Length, so we can't truly omit it.
+        Instead we send a forged (small) Content-Length header while sending
+        a large body.  This bypasses the fast-path Content-Length check but
+        triggers the slow-path byte-counting guard.
+        """
         cfg = ServerConfig(
             model="mlx-community/Qwen3-4B-4bit",
             block_size=4,
@@ -2179,17 +2184,20 @@ class TestRequestSizeGuard:
         app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
         transport = ASGITransport(app=app)
 
-        # Build a body larger than 64 bytes, send WITHOUT Content-Length
-        oversized_body = b'{"prompt":"' + b'A' * 200 + b'","max_tokens":10}'
+        # Body larger than 64-byte limit, but forged Content-Length claims 10
+        large_body = b"x" * 200
         async with AsyncClient(transport=transport, base_url="http://test") as ac:
             resp = await ac.post(
-                "/v1/completions",
-                content=oversized_body,
-                headers={"Content-Type": "application/json"},
+                "/v1/chat/completions",
+                content=large_body,
+                headers={
+                    "content-type": "application/json",
+                    "content-length": "10",
+                },
             )
-        # Should be rejected with 413 (not 422 validation error or 200 success)
+        # Should be rejected with 413 (not 422 validation error or 500)
         assert resp.status_code == 413, (
-            f"Expected 413 for oversized body without Content-Length, got {resp.status_code}"
+            f"Expected 413 for oversized body with forged Content-Length, got {resp.status_code}"
         )
 
     @pytest.mark.anyio

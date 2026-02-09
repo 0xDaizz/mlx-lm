@@ -410,7 +410,9 @@ def create_app(
         1. Fast-path: reject immediately if Content-Length header exceeds limit.
         2. Slow-path: wrap the ASGI receive callable to count actual bytes
            received, catching chunked transfers and missing/forged
-           Content-Length headers.
+           Content-Length headers.  Uses a flag instead of raising inside
+           the receive wrapper (Starlette's BaseHTTPMiddleware does not
+           propagate exceptions from receive wrappers correctly).
         """
         if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/v1/"):
             max_bytes = app.state.config.max_request_bytes
@@ -431,24 +433,42 @@ def create_app(
                         )
                 except ValueError:
                     pass
-            # Wrap the ASGI receive to count actual bytes
+            # Slow-path: wrap the ASGI receive to count actual bytes.
+            # When the limit is exceeded we set a flag and return an empty
+            # body with more_body=False to terminate the stream early,
+            # then replace the handler response with a 413 after call_next.
             received = 0
+            oversized = False
             original_receive = request._receive
 
             async def counting_receive():
-                nonlocal received
+                nonlocal received, oversized
+                if oversized:
+                    # Already detected oversized — return empty to stop reads
+                    return {"type": "http.request", "body": b"", "more_body": False}
                 message = await original_receive()
                 if message.get("type") == "http.request":
                     body = message.get("body", b"")
                     received += len(body)
                     if received > max_bytes:
-                        raise HTTPException(
-                            status_code=413,
-                            detail="Request body too large",
-                        )
+                        oversized = True
+                        return {"type": "http.request", "body": b"", "more_body": False}
                 return message
 
             request._receive = counting_receive
+            response = await call_next(request)
+            if oversized:
+                return JSONResponse(
+                    status_code=413,
+                    content=ErrorResponse(
+                        error=ErrorDetail(
+                            message=f"Request body too large (max {max_bytes} bytes)",
+                            type="invalid_request_error",
+                            code="request_too_large",
+                        )
+                    ).model_dump(),
+                )
+            return response
         return await call_next(request)
 
     # ------------------------------------------------------------------
