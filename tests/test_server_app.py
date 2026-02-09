@@ -14,6 +14,7 @@ from queue import Queue
 from typing import Any
 
 import pytest
+import uvicorn
 from httpx import ASGITransport, AsyncClient
 
 from mlx_lm_server.config import ServerConfig
@@ -2148,3 +2149,164 @@ class TestExecutorPool:
         assert barrier_passed.is_set(), (
             "Barrier was never satisfied — threads did not run concurrently"
         )
+
+
+# ===========================================================================
+# TestRequestSizeGuard — P0-2: ASGI receive-wrapping body size enforcement
+# ===========================================================================
+
+
+class TestRequestSizeGuard:
+    """P0-2: Body size limit enforced at ASGI layer via receive wrapping.
+
+    Verifies that large request bodies are rejected even when the
+    Content-Length header is missing or forged (chunked transfer).
+    """
+
+    @pytest.mark.anyio
+    async def test_large_body_without_content_length_rejected(self, tokenizer, tmp_path):
+        """A POST body that exceeds max_request_bytes is rejected even
+        without a Content-Length header (simulates chunked transfer)."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_request_bytes=64,
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        # Build a body larger than 64 bytes, send WITHOUT Content-Length
+        oversized_body = b'{"prompt":"' + b'A' * 200 + b'","max_tokens":10}'
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/completions",
+                content=oversized_body,
+                headers={"Content-Type": "application/json"},
+            )
+        # Should be rejected with 413 (not 422 validation error or 200 success)
+        assert resp.status_code == 413, (
+            f"Expected 413 for oversized body without Content-Length, got {resp.status_code}"
+        )
+
+    @pytest.mark.anyio
+    async def test_body_exactly_at_limit_succeeds(self, tokenizer, tmp_path):
+        """A body exactly at the byte limit should succeed (not off-by-one)."""
+        # Build a body that is just under the limit
+        small_body = b'{"prompt":"Hi","max_tokens":10}'
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_request_bytes=len(small_body) + 1,  # just above body size
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/completions",
+                content=small_body,
+                headers={"Content-Type": "application/json"},
+            )
+        assert resp.status_code == 200, (
+            f"Expected 200 for body within limit, got {resp.status_code}"
+        )
+
+    @pytest.mark.anyio
+    async def test_small_body_within_limit_succeeds(self, tokenizer, tmp_path):
+        """A normal-sized body under the limit should succeed."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_request_bytes=4096,
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/completions",
+                json={"prompt": "Hello", "max_tokens": 10},
+            )
+        assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_non_v1_path_bypasses_size_guard(self, tokenizer, tmp_path):
+        """Requests to non-/v1/ paths should not be subject to size guard."""
+        cfg = ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+            max_request_bytes=64,
+        )
+        app = create_app(config=cfg, scheduler=MockSchedulerForApp(), tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            # /health is a GET and not under /v1/, should bypass
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+
+
+# ===========================================================================
+# TestAppCreationSmoke — smoke test to prevent startup crashes
+# ===========================================================================
+
+
+class TestAppCreationSmoke:
+    """Smoke test: verify the app can be created without errors."""
+
+    def test_create_app_returns_fastapi_instance(self, config, mock_scheduler, tokenizer):
+        """create_app() returns a FastAPI instance without raising."""
+        app = create_app(config=config, scheduler=mock_scheduler, tokenizer=tokenizer)
+        assert app is not None
+        assert hasattr(app, "state")
+        assert app.state.config is config
+        assert app.state.scheduler is mock_scheduler
+        assert app.state.tokenizer is tokenizer
+        assert app.state.shutting_down is False
+
+    @pytest.mark.anyio
+    async def test_app_serves_health_endpoint(self, config, mock_scheduler, tokenizer):
+        """Smoke test: freshly created app can serve /health."""
+        app = create_app(config=config, scheduler=mock_scheduler, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.get("/health")
+        assert resp.status_code == 200
+
+    def test_uvicorn_run_call_has_no_invalid_params(self):
+        """Verify the uvicorn.run() call in __main__.py does not use
+        unsupported parameters (regression test for P0-1 crash)."""
+        import inspect
+        sig = inspect.signature(uvicorn.run)
+        # limit_request_body is NOT a valid uvicorn parameter
+        assert "limit_request_body" not in sig.parameters, (
+            "uvicorn.run() should not have limit_request_body parameter"
+        )
+
+        # Also verify the source code doesn't pass it
+        import ast
+        source_path = "/Users/hw/mlx-lm/mlx_lm_server/__main__.py"
+        with open(source_path) as f:
+            tree = ast.parse(f.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                for kw in node.keywords:
+                    assert kw.arg != "limit_request_body", (
+                        "Found limit_request_body in __main__.py uvicorn.run() call"
+                    )

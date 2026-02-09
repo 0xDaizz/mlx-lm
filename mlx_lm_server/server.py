@@ -288,7 +288,7 @@ def create_app(
     # Formula: max(max_concurrent_requests, 32) + 16 headroom.
     # If max_concurrent_requests=0 (unlimited), use 128 as a sane default.
     _mcr = config.max_concurrent_requests
-    _pool_size = (max(_mcr, 32) + 16) if _mcr > 0 else 128
+    _pool_size = min((max(_mcr, 32) + 16) if _mcr > 0 else 128, 256)
     _inference_executor = ThreadPoolExecutor(
         max_workers=_pool_size,
         thread_name_prefix="inference-poll",
@@ -377,7 +377,6 @@ def create_app(
 
         auth = request.headers.get("authorization")
         if auth is None or not auth.startswith("Bearer "):
-            await asyncio.sleep(0.05)
             return JSONResponse(
                 status_code=401,
                 content=ErrorResponse(
@@ -391,7 +390,6 @@ def create_app(
 
         provided = auth[len("Bearer "):].strip()
         if not hmac.compare_digest(provided, api_key):
-            await asyncio.sleep(0.05)
             return JSONResponse(
                 status_code=401,
                 content=ErrorResponse(
@@ -406,16 +404,17 @@ def create_app(
 
     @app.middleware("http")
     async def request_size_guard(request: Request, call_next):
-        """Fast-path Content-Length check for well-behaved clients.
+        """Enforce request body size limit at the ASGI layer.
 
-        Uvicorn's ``limit_request_body`` (set in __main__.py) enforces the
-        actual body size limit at the transport layer, covering chunked
-        transfers and requests without a Content-Length header.  This
-        middleware provides an early 413 for clients that advertise a
-        Content-Length exceeding the limit, avoiding unnecessary I/O.
+        Two-phase enforcement:
+        1. Fast-path: reject immediately if Content-Length header exceeds limit.
+        2. Slow-path: wrap the ASGI receive callable to count actual bytes
+           received, catching chunked transfers and missing/forged
+           Content-Length headers.
         """
         if request.method in {"POST", "PUT", "PATCH"} and request.url.path.startswith("/v1/"):
             max_bytes = app.state.config.max_request_bytes
+            # Fast-path: reject based on Content-Length header if present
             content_length = request.headers.get("content-length")
             if content_length is not None:
                 try:
@@ -432,6 +431,24 @@ def create_app(
                         )
                 except ValueError:
                     pass
+            # Wrap the ASGI receive to count actual bytes
+            received = 0
+            original_receive = request._receive
+
+            async def counting_receive():
+                nonlocal received
+                message = await original_receive()
+                if message.get("type") == "http.request":
+                    body = message.get("body", b"")
+                    received += len(body)
+                    if received > max_bytes:
+                        raise HTTPException(
+                            status_code=413,
+                            detail="Request body too large",
+                        )
+                return message
+
+            request._receive = counting_receive
         return await call_next(request)
 
     # ------------------------------------------------------------------

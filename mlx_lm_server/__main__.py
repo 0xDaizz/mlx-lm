@@ -217,7 +217,6 @@ def main() -> None:
                 app,
                 host=config.host,
                 port=config.port,
-                limit_request_body=config.max_request_bytes,
             )
         else:
             # Rank > 0: no HTTP server, wait for inference loop to finish
