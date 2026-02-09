@@ -511,11 +511,20 @@ def create_app(
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        # Format validation errors without leaking internal file paths
+        # (str(exc) includes absolute paths from Pydantic internals)
+        errors = exc.errors()
+        parts = []
+        for e in errors:
+            loc = " -> ".join(str(l) for l in e.get("loc", []))
+            msg = e.get("msg", "validation error")
+            parts.append(f"{loc}: {msg}" if loc else msg)
+        message = "; ".join(parts) if parts else "Validation error"
         return JSONResponse(
             status_code=422,
             content=ErrorResponse(
                 error=ErrorDetail(
-                    message=str(exc),
+                    message=message,
                     type="invalid_request_error",
                     code="validation_error",
                 )

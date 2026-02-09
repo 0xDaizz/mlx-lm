@@ -592,6 +592,24 @@ class TestErrorHandling:
         assert resp2.status_code == 422
 
     @pytest.mark.anyio
+    async def test_validation_error_does_not_leak_paths(self, client):
+        """422 error messages must not expose internal file paths (DA-C6-M1)."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={"bad_field": 123},
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        error_msg = body["error"]["message"]
+        # Must not contain absolute file paths or .py references
+        assert ".py" not in error_msg, f"Error leaks .py path: {error_msg}"
+        # Check no absolute paths (Unix or Windows style)
+        import re
+        assert not re.search(r"(/[a-zA-Z0-9_.\-]+){3,}", error_msg), (
+            f"Error leaks absolute path: {error_msg}"
+        )
+
+    @pytest.mark.anyio
     async def test_streaming_queue_full_returns_error_http(self, config, tokenizer):
         """When submit_request raises during streaming, HTTP error is returned.
 
