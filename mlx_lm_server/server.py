@@ -662,6 +662,9 @@ def _stream_response(
         if "Distributed control plane degraded" in str(e):
             raise HTTPException(status_code=503, detail=str(e))
         raise HTTPException(status_code=429, detail=str(e))
+    except Exception:
+        scheduler.unregister_stream(inf_req.request_id)
+        raise
 
     async def event_generator() -> AsyncIterator[str]:
         try:

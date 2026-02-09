@@ -360,6 +360,7 @@ class Scheduler:
                         self._results_ready.pop(request.request_id, None)
                 raise
             self._inc_stat("total_requests")
+            self._inc_stat("accepted_requests")
             self._new_request_event.set()
 
         logger.debug("Submitted request %s", request.request_id)
@@ -434,6 +435,7 @@ class Scheduler:
                 self._dist_fatal_reason = "bus_outbox_full_cancel"
                 self._running = False
                 self._new_request_event.set()
+                return False  # Cancel was NOT enqueued
             self._new_request_event.set()
             return True
 
@@ -502,12 +504,19 @@ class Scheduler:
                 self._bus_outbox.put_nowait(ControlEvent.shutdown())
             except queue.Full:
                 logger.warning("Bus outbox full during shutdown, draining first")
-                # Drain a few items to make room
+                drained = []
                 for _ in range(min(10, self._bus_outbox.qsize())):
                     try:
-                        self._bus_outbox.get_nowait()
+                        drained.append(self._bus_outbox.get_nowait())
                     except queue.Empty:
                         break
+                # Unblock callers for any discarded submit events
+                for ev in drained:
+                    if ev.typ == "submit":
+                        req = ev.unpack_request()
+                        if req is not None:
+                            self._signal_finish(req.request_id, finish_reason="error")
+                            self._cleanup_result_buffers(req.request_id)
                 try:
                     self._bus_outbox.put_nowait(ControlEvent.shutdown())
                 except queue.Full:
@@ -773,7 +782,6 @@ class Scheduler:
             return
 
         # ===== Rank0 local apply (after successful publish) =====
-        compensation_events: list[ControlEvent] = []
         for ev in events:
             if ev.typ == "submit":
                 request = ev.unpack_request()
@@ -789,9 +797,17 @@ class Scheduler:
                         self._inc_stat("total_requests")
                         self._inc_stat("accepted_requests")
                     except Exception:
-                        logger.exception("Rank0 local add failed for %s", request.request_id)
+                        logger.exception("Rank0 local add failed for %s — cancelling immediately", request.request_id)
+                        # Create result buffers so _signal_finish can notify waiters
+                        if not is_streaming:
+                            with self._results_lock:
+                                self._results.setdefault(request.request_id, [])
+                                self._results_ready.setdefault(request.request_id, threading.Event())
+                        # Mark cancelled so schedule_step removes it before collective ops
+                        with self._cancelled_lock:
+                            self._cancelled.add(request.request_id)
+                        self._signal_finish(request_id=request.request_id, finish_reason="error")
                         self._cleanup_result_buffers(request.request_id)
-                        compensation_events.append(ControlEvent.cancel(request.request_id))
             elif ev.typ == "cancel":
                 request_id = ev.unpack_request_id()
                 if request_id is not None:
@@ -812,17 +828,6 @@ class Scheduler:
                         self._cleanup_result_buffers(request_id)
             # "shutdown" and "noop" — no local apply needed
             # (shutdown is handled in _apply_bus_events path or directly)
-
-        # Enqueue compensation cancels for failed adds
-        for cev in compensation_events:
-            try:
-                self._bus_outbox.put_nowait(cev)
-            except queue.Full:
-                logger.critical("Control outbox full while enqueuing compensation cancel")
-                self._dist_fatal = True
-                self._dist_fatal_reason = "control_outbox_full"
-                self._running = False
-                self._new_request_event.set()
 
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""

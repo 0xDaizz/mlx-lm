@@ -636,6 +636,38 @@ class TestErrorHandling:
         assert len(sched.streams) == 0
 
     @pytest.mark.anyio
+    async def test_streaming_unexpected_submit_exception_cleans_stream(self, config, tokenizer):
+        """If submit_request() raises an unexpected exception (not RuntimeError or
+        BusOutboxFullError), the pre-registered stream must still be cleaned up.
+
+        This is the V1 stream registration leak fix: a catch-all ``except Exception``
+        in ``_stream_response`` ensures ``unregister_stream()`` is always called.
+        """
+
+        class ExplodingScheduler(MockSchedulerForApp):
+            def submit_request(self, request):
+                raise ValueError("Totally unexpected kaboom")
+
+        sched = ExplodingScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/chat/completions",
+                json={
+                    "messages": [{"role": "user", "content": "Hi"}],
+                    "max_tokens": 10,
+                    "stream": True,
+                },
+            )
+        # The ValueError propagates as an unhandled 500
+        assert resp.status_code == 500
+        # Critical assertion: stream registration must be cleaned up
+        assert len(sched.streams) == 0, (
+            f"Stream leak: {len(sched.streams)} stream(s) still registered after exception"
+        )
+
+    @pytest.mark.anyio
     async def test_distributed_nonstream_submit_does_not_raise_keyerror(self, tokenizer, tmp_path):
         """Distributed non-stream submit should not raise KeyError before local apply.
 
