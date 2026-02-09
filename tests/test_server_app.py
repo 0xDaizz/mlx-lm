@@ -204,13 +204,20 @@ class TestChatCompletions:
         assert "text/event-stream" in resp.headers["content-type"]
 
         chunks, has_done = _parse_sse_body(resp.text)
-        assert len(chunks) == 4, f"Expected 4 token chunks, got {len(chunks)}"
+        # First chunk is role delta, then 4 content chunks
+        assert len(chunks) == 5, f"Expected 5 chunks (1 role + 4 content), got {len(chunks)}"
+
+        # Verify role delta is first
+        assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
 
         for chunk in chunks:
             assert chunk["object"] == "chat.completion.chunk"
             assert chunk["id"].startswith("chatcmpl-")
             assert len(chunk["choices"]) == 1
             assert "delta" in chunk["choices"][0]
+
+        # Content chunks (skip role delta) must have "content" in delta
+        for chunk in chunks[1:]:
             assert "content" in chunk["choices"][0]["delta"]
 
     @pytest.mark.anyio
@@ -251,7 +258,9 @@ class TestChatCompletions:
             },
         )
         chunks, _ = _parse_sse_body(resp_stream.text)
-        stream_content = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        # Skip role delta chunk (first chunk has {"role": "assistant"} but no "content")
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+        stream_content = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
 
         assert stream_content == sync_content, (
             f"Stream content {stream_content!r} != non-stream {sync_content!r}"
@@ -875,8 +884,9 @@ class TestC1StreamingStopBuffer:
             )
         assert resp.status_code == 200
         chunks, has_done = _parse_sse_body(resp.text)
-        # Collect all text
-        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        # Collect all text (skip role delta chunk which has no "content")
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
         assert "STOP" not in all_text, f"Stop sequence should not appear in output: {all_text!r}"
         assert "after" not in all_text, f"Text after stop should not appear: {all_text!r}"
         assert all_text == "Hell", f"Expected 'Hell' before stop, got {all_text!r}"
@@ -926,7 +936,8 @@ class TestC1StreamingStopBuffer:
                 },
             )
         chunks, _ = _parse_sse_body(resp.text)
-        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
         # "abcENDINGx" — "END" appears first at position 3
         assert "END" not in all_text
         assert all_text == "abc", f"Expected 'abc' before 'END', got {all_text!r}"
@@ -973,7 +984,8 @@ class TestC1StreamingStopBuffer:
                 },
             )
         chunks, _ = _parse_sse_body(resp.text)
-        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
         assert "\u505c\u6b62" not in all_text
         assert all_text == "abc", f"Expected 'abc' before stop, got {all_text!r}"
 
@@ -989,8 +1001,10 @@ class TestC1StreamingStopBuffer:
             },
         )
         chunks, has_done = _parse_sse_body(resp.text)
-        assert len(chunks) == 4
-        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        # 1 role delta + 4 content chunks
+        assert len(chunks) == 5
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
         assert all_text == "Hello, world!"
 
 
@@ -1127,7 +1141,8 @@ class TestC2EosTokenId:
                 },
             )
         chunks, _ = _parse_sse_body(resp.text)
-        all_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+        all_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
         assert "</s>" not in all_text
         assert all_text == "Hello"
 

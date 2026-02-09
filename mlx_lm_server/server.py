@@ -19,8 +19,9 @@ from queue import Queue
 from typing import Any, AsyncIterator, Protocol
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import InferenceRequest, TokenEvent, BusOutboxFullError
@@ -77,8 +78,12 @@ class SchedulerProtocol(Protocol):
 
 
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="allow")
     role: str
-    content: str
+    content: str | list | None = None
+    name: str | None = None
+    tool_calls: list[dict] | None = None
+    tool_call_id: str | None = None
 
 
 class ChatCompletionRequest(BaseModel):
@@ -322,6 +327,19 @@ def create_app(
             ).model_dump(),
         )
 
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content=ErrorResponse(
+                error=ErrorDetail(
+                    message=str(exc),
+                    type="invalid_request_error",
+                    code="validation_error",
+                )
+            ).model_dump(),
+        )
+
     # ------------------------------------------------------------------
     # Common non-streaming inference helper
     # ------------------------------------------------------------------
@@ -446,6 +464,7 @@ def create_app(
                 format_chunk=_format_chat_chunk,
                 request_timeout_s=app.state.config.request_timeout_s,
                 first_token_timeout_s=app.state.config.first_token_timeout_s,
+                is_chat=True,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_chat_response)
@@ -485,6 +504,7 @@ def create_app(
                 format_chunk=_format_completion_chunk,
                 request_timeout_s=app.state.config.request_timeout_s,
                 first_token_timeout_s=app.state.config.first_token_timeout_s,
+                is_chat=False,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_completion_response)
@@ -538,7 +558,30 @@ def _format_chat_messages(
 
     Returns either ``str`` or ``list[int]``.
     """
-    msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+    msg_dicts = []
+    for m in messages:
+        d: dict[str, Any] = {"role": m.role}
+        if m.content is not None:
+            if isinstance(m.content, list):
+                # Multi-part content: extract text parts
+                text_parts = []
+                for part in m.content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        text_parts.append(part.get("text", ""))
+                    elif isinstance(part, str):
+                        text_parts.append(part)
+                d["content"] = "".join(text_parts)
+            else:
+                d["content"] = m.content
+        else:
+            d["content"] = ""
+        if m.name is not None:
+            d["name"] = m.name
+        if m.tool_calls is not None:
+            d["tool_calls"] = m.tool_calls
+        if m.tool_call_id is not None:
+            d["tool_call_id"] = m.tool_call_id
+        msg_dicts.append(d)
 
     if hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -550,8 +593,8 @@ def _format_chat_messages(
 
     # Fallback: simple formatting
     parts: list[str] = []
-    for m in messages:
-        parts.append(f"{m.role}: {m.content}")
+    for m in msg_dicts:
+        parts.append(f"{m['role']}: {m.get('content', '')}")
     parts.append("assistant:")
     return "\n".join(parts)
 
@@ -636,6 +679,7 @@ def _stream_response(
     format_chunk=None,
     request_timeout_s: float = 120.0,
     first_token_timeout_s: float | None = None,
+    is_chat: bool = False,
 ) -> StreamingResponse:
     """Unified SSE streaming for both chat and completion endpoints.
 
@@ -668,6 +712,17 @@ def _stream_response(
 
     async def event_generator() -> AsyncIterator[str]:
         try:
+            # Emit role delta as first chunk for chat completions (OpenAI spec)
+            if is_chat:
+                role_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(role_chunk)}\n\n"
+
             loop = asyncio.get_running_loop()
             eos_ids = _get_eos_token_ids(tokenizer) if tokenizer else set()
             stop_sequences = inf_req.stop_sequences or []
@@ -807,6 +862,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--ssd-writer-queue-size", type=int, default=512)
     parser.add_argument("--ssd-persistent-max-retries", type=int, default=3)
     parser.add_argument("--ssd-flush-interval-s", type=float, default=1.0)
+    parser.add_argument("--ssd-max-size-gb", type=float, default=50.0,
+                        help="Maximum SSD cache size in GB (0 = unlimited)")
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--prefill-batch-size", type=int, default=4)
     parser.add_argument("--max-queue-size", type=int, default=128)
@@ -851,6 +908,8 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         parser.error("--ssd-persistent-max-retries must be >= 0")
     if parsed.ssd_flush_interval_s <= 0:
         parser.error("--ssd-flush-interval-s must be > 0")
+    if parsed.ssd_max_size_gb < 0:
+        parser.error("--ssd-max-size-gb must be >= 0")
 
     # Core numeric parameter validation
     if parsed.block_size <= 0:
@@ -913,6 +972,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "ssd_writer_queue_size": parsed.ssd_writer_queue_size,
         "ssd_persistent_max_retries": parsed.ssd_persistent_max_retries,
         "ssd_flush_interval_s": parsed.ssd_flush_interval_s,
+        "ssd_max_size_gb": parsed.ssd_max_size_gb,
         "max_batch_size": parsed.max_batch_size,
         "prefill_batch_size": parsed.prefill_batch_size,
         "max_queue_size": parsed.max_queue_size,

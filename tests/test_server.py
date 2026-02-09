@@ -7,6 +7,7 @@ import threading
 import unittest
 
 import mlx.core as mx
+import pytest
 import requests
 
 from mlx_lm.models.cache import KVCache
@@ -474,6 +475,106 @@ class TestLRUPromptCache(unittest.TestCase):
         c, t = cache.fetch_nearest_cache(model, [3, 4])
         self.assertEqual(c, ["test3"])
         self.assertEqual(t, [])
+
+
+class TestAPICompliance:
+    """Tests for OpenAI API compliance (T2.1, T2.2, T2.3)."""
+
+    @pytest.mark.anyio
+    async def test_tool_calling_message(self, app_with_mock):
+        """T2.1: ChatMessage accepts tool-calling fields."""
+        from httpx import ASGITransport, AsyncClient
+        app, sched = app_with_mock
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/v1/chat/completions", json={
+                "messages": [
+                    {"role": "user", "content": "Call the weather tool"},
+                    {"role": "assistant", "content": None, "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}
+                    ]},
+                    {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 72F"},
+                ],
+                "max_tokens": 10,
+            })
+            assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_multipart_content_message(self, app_with_mock):
+        """T2.1: ChatMessage accepts list content (multi-part)."""
+        from httpx import ASGITransport, AsyncClient
+        app, sched = app_with_mock
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/v1/chat/completions", json={
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "What is this?"},
+                    ]},
+                ],
+                "max_tokens": 10,
+            })
+            assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_streaming_role_delta(self, app_with_mock):
+        """T2.2: Streaming chat response starts with role delta."""
+        from httpx import ASGITransport, AsyncClient
+        app, sched = app_with_mock
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/v1/chat/completions", json={
+                "messages": [{"role": "user", "content": "Hello"}],
+                "max_tokens": 10,
+                "stream": True,
+            })
+            assert resp.status_code == 200
+            lines = [l for l in resp.text.split("\n") if l.startswith("data: ") and l != "data: [DONE]"]
+            assert len(lines) >= 1
+            first_chunk = json.loads(lines[0].removeprefix("data: "))
+            assert first_chunk["choices"][0]["delta"] == {"role": "assistant"}
+
+    @pytest.mark.anyio
+    async def test_completion_streaming_no_role_delta(self, app_with_mock):
+        """T2.2: Streaming completion response does NOT have role delta."""
+        from httpx import ASGITransport, AsyncClient
+        app, sched = app_with_mock
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/v1/completions", json={
+                "prompt": "Hello world",
+                "max_tokens": 10,
+                "stream": True,
+            })
+            assert resp.status_code == 200
+            lines = [l for l in resp.text.split("\n") if l.startswith("data: ") and l != "data: [DONE]"]
+            assert len(lines) >= 1
+            first_chunk = json.loads(lines[0].removeprefix("data: "))
+            # Completion chunks should have "text", not "delta" with "role"
+            assert "delta" not in first_chunk["choices"][0] or "role" not in first_chunk["choices"][0].get("delta", {})
+
+    @pytest.mark.anyio
+    async def test_pydantic_422_error_format(self, app_with_mock):
+        """T2.3: Pydantic validation errors return OpenAI-compatible format."""
+        from httpx import ASGITransport, AsyncClient
+        app, sched = app_with_mock
+
+        transport = ASGITransport(app=app, raise_app_exceptions=False)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Send invalid request (messages is empty list)
+            resp = await client.post("/v1/chat/completions", json={
+                "messages": [],
+                "max_tokens": 10,
+            })
+            assert resp.status_code == 422
+            body = resp.json()
+            assert "error" in body
+            assert body["error"]["type"] == "invalid_request_error"
+            assert body["error"]["code"] == "validation_error"
 
 
 if __name__ == "__main__":

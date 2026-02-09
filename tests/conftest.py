@@ -105,12 +105,12 @@ class SimpleTokenizer:
 
     def apply_chat_template(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tokenize: bool = False,
         add_generation_prompt: bool = True,
     ) -> str:
         """Simple chat template: concatenate role: content lines."""
-        parts = [f"{m['role']}: {m['content']}" for m in messages]
+        parts = [f"{m['role']}: {m.get('content', '')}" for m in messages]
         if add_generation_prompt:
             parts.append("assistant:")
         return "\n".join(parts)

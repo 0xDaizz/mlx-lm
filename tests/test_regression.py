@@ -668,9 +668,10 @@ class TestMNEW2EOSFilterStreaming:
             payload = line[len("data: "):]
             chunks.append(json.loads(payload))
 
-        # Concatenate all content
+        # Concatenate all content (skip role delta chunk which has no "content")
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
         full_content = "".join(
-            c["choices"][0]["delta"]["content"] for c in chunks
+            c["choices"][0]["delta"]["content"] for c in content_chunks
         )
 
         assert eos_text not in full_content, (

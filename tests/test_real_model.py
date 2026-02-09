@@ -561,8 +561,10 @@ class TestHTTPReal:
                 continue
             payload_str = line[len("data: "):]
             chunks.append(json.loads(payload_str))
+        # Skip role delta chunk (first chunk has {"role": "assistant"} but no "content")
+        content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
         stream_content = "".join(
-            c["choices"][0]["delta"]["content"] for c in chunks
+            c["choices"][0]["delta"]["content"] for c in content_chunks
         )
 
         # Both should produce non-empty text

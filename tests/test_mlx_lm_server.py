@@ -219,17 +219,25 @@ async def test_chat_streaming(client):
         chunk = json.loads(payload)
         chunks.append(chunk)
 
-    assert len(chunks) == 4  # 4 tokens
+    assert len(chunks) == 5  # 1 role delta + 4 content tokens
+
+    # First chunk is role delta
+    assert chunks[0]["choices"][0]["delta"] == {"role": "assistant"}
+
     # Verify chunk structure
     for chunk in chunks:
         assert chunk["object"] == "chat.completion.chunk"
         assert chunk["id"].startswith("chatcmpl-")
         assert len(chunk["choices"]) == 1
         assert "delta" in chunk["choices"][0]
+
+    # Content chunks (skip role delta) must have "content" in delta
+    content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+    for chunk in content_chunks:
         assert "content" in chunk["choices"][0]["delta"]
 
     # Concatenated content matches non-streaming
-    full_text = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+    full_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
     assert full_text == "Hello, world!"
 
     # Last chunk should have finish_reason
@@ -406,7 +414,9 @@ async def test_stream_parity(client):
         payload = line[len("data: "):]
         chunks.append(json.loads(payload))
 
-    stream_content = "".join(c["choices"][0]["delta"]["content"] for c in chunks)
+    # Skip role delta chunk (first chunk has {"role": "assistant"} but no "content")
+    content_chunks = [c for c in chunks if "content" in c["choices"][0].get("delta", {})]
+    stream_content = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
 
     assert sync_content == stream_content
 
