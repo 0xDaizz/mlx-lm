@@ -1039,8 +1039,11 @@ class TestCancelActiveQueuesOutbox:
 
         # Simulate a request that's already active (not in queue)
         # Need to set up the active sequence properly
+        class MockSeq:
+            is_finished = False
+            block_ids = []
         with scheduler._active_lock:
-            scheduler._active_sequences["active-req"] = object()
+            scheduler._active_sequences["active-req"] = MockSeq()
 
         # Drain any existing outbox items from init
         while not scheduler._bus_outbox.empty():

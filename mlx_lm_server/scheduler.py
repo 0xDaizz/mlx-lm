@@ -443,7 +443,6 @@ class Scheduler:
         # Try removing from queue first (no lock needed for this)
         if self.request_queue.cancel(request_id):
             self._signal_finish(request_id, finish_reason="cancelled")
-            self._cleanup_result_buffers(request_id)
             return True
 
         # Use consistent lock ordering: _active_lock FIRST, then _cancelled_lock
@@ -496,6 +495,20 @@ class Scheduler:
     def stop(self) -> None:
         """Stop the inference loop and gracefully shut down all subsystems."""
         self._running = False
+
+        # Signal all active sequences with error so waiters don't hang
+        with self._active_lock:
+            for rid, seq in list(self._active_sequences.items()):
+                if not seq.is_finished:
+                    self._signal_finish(rid, finish_reason="error")
+
+        # Drain queued requests
+        while True:
+            reqs = self.request_queue.pop_batch(128)
+            if not reqs:
+                break
+            for req in reqs:
+                self._signal_finish(req.request_id, finish_reason="error")
 
         # Queue shutdown event for broadcast (TP mode)
         if self._control_bus is not None and self._dist_ctx is not None and self._dist_ctx.is_rank0:
@@ -823,9 +836,8 @@ class Scheduler:
                             self._cleanup_result_buffers(request_id)
                             self.unregister_stream(request_id)
                     else:
-                        # Request was in queue — signal finish and clean up buffers
+                        # Request was in queue — signal finish (get_result pops buffers)
                         self._signal_finish(request_id, finish_reason="cancelled")
-                        self._cleanup_result_buffers(request_id)
             # "shutdown" and "noop" — no local apply needed
             # (shutdown is handled in _apply_bus_events path or directly)
 
@@ -1069,7 +1081,6 @@ class Scheduler:
                 if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)
                 self._signal_finish(rid, finish_reason="cancelled")
-                self._cleanup_result_buffers(rid)
             with self._cancelled_lock:
                 self._cancelled.discard(rid)
 

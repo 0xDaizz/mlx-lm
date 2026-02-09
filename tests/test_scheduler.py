@@ -993,10 +993,9 @@ class TestCancelGetResultContract:
     def test_cancel_queued_then_get_result(self):
         """Cancel a queued (not yet active) request, then call get_result.
 
-        For queued requests, cancel_request() calls _signal_finish() then
-        _cleanup_result_buffers() synchronously, so by the time cancel_request()
-        returns, the result buffers are already gone. get_result() should
-        raise KeyError.
+        After T1.3 fix: cancel_request() calls _signal_finish() but no longer
+        calls _cleanup_result_buffers(), so get_result() should always return
+        the cancelled finish event (buffers stay until get_result pops them).
         """
         config = _make_config(max_batch_size=1)
         s = _make_scheduler(config)
@@ -1025,25 +1024,16 @@ class TestCancelGetResultContract:
         # queued-cancel should still be in the queue
         assert s.cancel_request("queued-cancel") is True
 
-        # After cancel_request returns for a queued request, buffers are cleaned up
-        # synchronously, so get_result should raise KeyError
-        try:
-            tokens = s.get_result("queued-cancel", timeout=1.0)
-            # If we get here, the cancelled event was retrieved before cleanup --
-            # still acceptable
-            if len(tokens) > 0:
-                assert any(
-                    t.finish_reason == "cancelled" for t in tokens
-                ), f"Expected cancelled finish_reason, got {[t.finish_reason for t in tokens]}"
-        except KeyError:
-            # Expected: buffers already cleaned up
-            pass
-        except TimeoutError:
-            # Also acceptable
-            pass
-        finally:
-            gate.set()
-            s.stop()
+        # After T1.3 fix: buffers are NOT cleaned up, so get_result returns
+        # the cancelled finish event reliably.
+        tokens = s.get_result("queued-cancel", timeout=2.0)
+        assert len(tokens) > 0
+        assert any(
+            t.finish_reason == "cancelled" for t in tokens
+        ), f"Expected cancelled finish_reason, got {[t.finish_reason for t in tokens]}"
+
+        gate.set()
+        s.stop()
 
 
 # ---------------------------------------------------------------------------
@@ -1328,3 +1318,248 @@ class TestKVBlockLeakGuard:
 
         # Verify blocks were freed
         mock_kv.free_blocks.assert_called_with([10, 11, 12])
+
+
+# ---------------------------------------------------------------------------
+# T1.3  signal_finish + cleanup race fix
+# ---------------------------------------------------------------------------
+
+
+class TestCancelGetResultRace:
+    """Tests for signal_finish + cleanup race fix (T1.3)."""
+
+    def test_cancel_queued_get_result_gets_finish(self):
+        """Cancel a queued request, then get_result() should get a finish event.
+
+        Uses max_batch_size=1 with a blocker request to keep the target
+        request in the queue so cancel_request() removes it from queue.
+        """
+        config = _make_config(max_batch_size=1)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        # Block the first request so the second stays queued
+        gate = threading.Event()
+
+        def slow_gen(rid, tids, step):
+            if rid == "blocker" and step == 0:
+                gate.wait(timeout=10.0)
+            if step >= 1:
+                return (step + 1, f"t{step}", "stop")
+            return (step + 1, f"t{step}", None)
+
+        sched._mock_generate = slow_gen
+
+        sched.submit_request(InferenceRequest(
+            request_id="blocker",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=10,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        ))
+        sched.submit_request(InferenceRequest(
+            request_id="race-test",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=10,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        ))
+
+        sched.run_inference_loop()
+
+        # Wait for blocker to become active (race-test stays queued)
+        deadline = time.monotonic() + 3.0
+        while sched.num_active_sequences == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        # Cancel the queued request
+        assert sched.cancel_request("race-test") is True
+
+        # get_result should return finish events (not KeyError/hang)
+        events = sched.get_result("race-test", timeout=5.0)
+        assert any(e.finish_reason is not None for e in events)
+
+        gate.set()
+        sched.stop()
+
+    def test_concurrent_cancel_get_result_no_keyerror(self):
+        """Concurrent cancel + get_result should not raise KeyError.
+
+        Uses max_batch_size=1 with a blocker to ensure the 5 target requests
+        stay in the queue. Each thread cancels its own queued request and
+        then calls get_result(), which should always return the cancelled event.
+        """
+        config = _make_config(max_batch_size=1)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        # Block the first request so subsequent ones stay queued
+        gate = threading.Event()
+
+        def slow_gen(rid, tids, step):
+            if rid == "cc-blocker" and step == 0:
+                gate.wait(timeout=30.0)
+            if step >= 1:
+                return (step + 1, f"t{step}", "stop")
+            return (step + 1, f"t{step}", None)
+
+        sched._mock_generate = slow_gen
+
+        # Submit the blocker
+        sched.submit_request(InferenceRequest(
+            request_id="cc-blocker",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=10,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        ))
+
+        # Submit 5 target requests that will stay queued
+        for i in range(5):
+            sched.submit_request(InferenceRequest(
+                request_id=f"cc-{i}",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=10,
+                temperature=1.0,
+                top_p=1.0,
+                stop_sequences=[],
+                stream=False,
+            ))
+
+        sched.run_inference_loop()
+
+        # Wait for blocker to become active
+        deadline = time.monotonic() + 3.0
+        while sched.num_active_sequences == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        errors = []
+        results = []
+
+        def cancel_and_get(idx):
+            rid = f"cc-{idx}"
+            try:
+                sched.cancel_request(rid)
+                evts = sched.get_result(rid, timeout=5.0)
+                results.append(evts)
+            except Exception as e:
+                errors.append((rid, e))
+
+        threads = [threading.Thread(target=cancel_and_get, args=(i,)) for i in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        gate.set()
+        sched.stop()
+
+        assert len(errors) == 0, f"Got errors: {errors}"
+        assert len(results) == 5
+
+
+# ---------------------------------------------------------------------------
+# T1.4  Shutdown Drain tests
+# ---------------------------------------------------------------------------
+
+
+class TestShutdownDrain:
+    """Tests for shutdown drain (T1.4)."""
+
+    def test_shutdown_signals_active_sequences(self):
+        """stop() signals all active sequences with error."""
+        config = _make_config()
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+        sched.run_inference_loop()
+
+        req = InferenceRequest(
+            request_id="sd-active",
+            prompt_tokens=[1, 2, 3, 4],
+            max_tokens=100,  # Long enough to still be running at shutdown
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        )
+        sched.submit_request(req)
+        time.sleep(0.1)  # Let it start processing
+
+        sched.stop()
+
+        # get_result should return (not hang)
+        events = sched.get_result("sd-active", timeout=5.0)
+        assert len(events) > 0
+        assert any(e.finish_reason is not None for e in events)
+
+    def test_shutdown_signals_queued_requests(self):
+        """stop() drains and signals queued requests."""
+        config = _make_config(max_batch_size=1)
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        # Don't start inference loop — requests stay in queue
+        req1 = InferenceRequest(
+            request_id="sd-q1",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=10,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        )
+        req2 = InferenceRequest(
+            request_id="sd-q2",
+            prompt_tokens=[4, 5, 6],
+            max_tokens=10,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        )
+        sched.submit_request(req1)
+        sched.submit_request(req2)
+
+        sched.stop()
+
+        # Both should get error finish events
+        for rid in ["sd-q1", "sd-q2"]:
+            events = sched.get_result(rid, timeout=2.0)
+            assert len(events) > 0
+            assert events[-1].finish_reason is not None
+
+    def test_shutdown_stream_gets_error(self):
+        """stop() signals streaming requests with error."""
+        config = _make_config()
+        sched = Scheduler(config=config, model=None, tokenizer=None)
+
+        req = InferenceRequest(
+            request_id="sd-stream",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=100,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=True,
+        )
+        stream_q = sched.register_stream("sd-stream")
+        sched.submit_request(req)
+
+        sched.stop()
+
+        # Stream should eventually receive a finish event
+        events = []
+        while True:
+            try:
+                e = stream_q.get(timeout=2.0)
+                if e is None:
+                    break
+                events.append(e)
+                if e.finish_reason is not None:
+                    break
+            except queue.Empty:
+                break
+
+        assert any(e.finish_reason is not None for e in events)
