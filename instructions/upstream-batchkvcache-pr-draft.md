@@ -89,10 +89,10 @@ No changes to `create_causal_mask()` — it already supports the `right_padding`
 
 This change is fully backward-compatible:
 
-- **Normal decode (batch or single):** All offsets remain equal to each other and to `_idx`. `max(offset) == _idx`, so the return slice is unchanged. `right_padding` is all-zeros, so we pass `None` — `create_causal_mask()` receives the same arguments as before.
-- **Existing `trim(n)` usage:** `trim()` decrements both `_idx` and all offsets uniformly. The invariant `max(offset) == _idx` is preserved. No behavior change.
+- **Normal decode (batch or single):** All offsets remain equal to each other and to `_idx`. `max(left_padding + offset) == _idx`, so the return slice is unchanged. `right_padding` is all-zeros, so we pass `None` — `create_causal_mask()` receives the same arguments as before.
+- **Existing `trim(n)` usage:** `trim()` decrements both `_idx` and all offsets uniformly. The invariant `max(left_padding + offset) == _idx` is preserved. No behavior change.
 - **`speculative_generate_step()` (batch=1):** Continues to work identically since there is only one sequence.
-- **`filter()`, `extend()`, `extract()`, `merge()`:** These methods use `_idx` for buffer management. The `_idx` value is unchanged by this PR; only the return slice and mask computation use `max(offset)` when offsets diverge.
+- **`filter()`, `extend()`, `extract()`, `merge()`:** These methods use `_idx` for buffer management. The `_idx` value is unchanged by this PR; only the return slice and mask computation use `max(left_padding + offset)` when offsets diverge.
 
 ### Test Plan
 
@@ -121,8 +121,8 @@ This change is fully backward-compatible:
 
 ## Checklist
 - [ ] Minimal diff (~25 lines added in cache.py, 0 lines in other files)
-- [ ] Backward compatible (non-spec-decode paths identical — `max(offset) == _idx` when offsets are uniform)
-- [ ] Leverages existing `right_padding` support in `create_causal_mask()` — no new API surface
+- [ ] Backward compatible (non-spec-decode paths identical — `max(left_padding + offset) == _idx` when offsets are uniform)
+- [ ] Leverages existing `right_padding` support in `create_causal_mask()` — one new public method (`trim_per_sequence`)
 - [ ] Test with real model validates per-sequence trim correctness
 - [ ] No performance regression for normal decode (zero-cost when offsets are uniform)
 - [ ] Self-contained in one file (`mlx_lm/models/cache.py`)
