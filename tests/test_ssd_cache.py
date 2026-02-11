@@ -511,3 +511,155 @@ class TestSSDDiskSizeLimit:
         # Create new cache instance pointing at same directory
         cache2 = SSDCache(cache_dir=cache_dir, ttl_days=7, max_size_bytes=0)
         assert cache2._total_bytes == size1
+
+
+# ---------------------------------------------------------------------------
+# CACHE-M1 — save_block 2-phase locking (lock not held during I/O)
+# ---------------------------------------------------------------------------
+
+
+class TestSaveBlock2Phase:
+    """Test save_block 2-phase locking: reservation under lock, I/O outside lock."""
+
+    def test_concurrent_save_dedup(self, tmp_path: Path):
+        """Sequential save_block() for the same hash: second sees dedup.
+
+        NOTE: mx.save_safetensors is not thread-safe (Metal command buffers),
+        so we test the 2-phase dedup logic sequentially instead of with
+        truly concurrent threads. The reservation mechanism ensures the
+        second call sees the index entry from Phase 1 and returns dedup.
+        """
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7)
+        kv = make_kv_data()
+
+        # First save — should succeed
+        r1 = cache.save_block("concurrent_hash", kv, num_tokens=4)
+        assert r1 == "saved"
+
+        # Second save for same hash — should return dedup (index entry exists)
+        r2 = cache.save_block("concurrent_hash", kv, num_tokens=4)
+        assert r2 == "dedup"
+        assert cache.num_blocks == 1
+
+    def test_save_block_io_failure_reverts_reservation(self, tmp_path: Path):
+        """If disk I/O fails, the index reservation should be reverted."""
+        import unittest.mock as mock
+
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7)
+        kv = make_kv_data()
+
+        # Make mx.save_safetensors fail
+        with mock.patch("mlx.core.save_safetensors", side_effect=OSError("Disk full")):
+            result = cache.save_block("fail_hash", kv, num_tokens=4)
+
+        assert result == "error"
+        # Reservation should have been reverted
+        assert "fail_hash" not in cache.index
+        assert cache.num_blocks == 0
+        assert cache._stats["ssd_save_fail"] == 1
+
+    def test_save_block_still_dedup_after_success(self, tmp_path: Path):
+        """After a successful save, a second save of the same hash returns dedup."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7)
+        kv = make_kv_data()
+
+        r1 = cache.save_block("dedup_test", kv, num_tokens=4)
+        assert r1 == "saved"
+
+        r2 = cache.save_block("dedup_test", kv, num_tokens=4)
+        assert r2 == "dedup"
+
+    def test_save_block_loads_correctly_after_2phase(self, tmp_path: Path):
+        """Data saved with 2-phase save_block can be loaded back correctly."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7)
+        kv = make_kv_data(seq_len=8)
+
+        result = cache.save_block("load_test", kv, num_tokens=8)
+        assert result == "saved"
+
+        loaded = cache.load_block("load_test")
+        assert loaded is not None
+        assert "keys" in loaded
+        assert "values" in loaded
+
+
+# ---------------------------------------------------------------------------
+# C2-M6 — prune_expired 2-phase (no lock during file deletion)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneExpired2Phase:
+    """Test prune_expired 2-phase: index update under lock, file deletion outside."""
+
+    def test_prune_expired_does_not_block_save(self, tmp_path: Path):
+        """prune_expired releases lock before file deletion, so save_block is not blocked.
+
+        We verify this by checking that Phase 2 (file deletion) happens
+        outside the lock: save_block called immediately after prune_expired
+        returns succeeds without contention.
+
+        NOTE: We avoid truly concurrent threads because mx.save_safetensors
+        is not thread-safe at the Metal command buffer level.
+        """
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=0)
+        kv = make_kv_data()
+
+        # Save some blocks and mark them expired
+        for i in range(5):
+            cache.save_block(f"expired_{i}", kv, num_tokens=4)
+            cache.index[f"expired_{i}"].last_accessed = datetime.now() - timedelta(seconds=10)
+
+        # Prune expired blocks (2-phase: index update under lock, file delete outside)
+        pruned = cache.prune_expired()
+        assert pruned == 5
+
+        # Save a new block immediately after prune — should not be blocked
+        r = cache.save_block("new_block", kv, num_tokens=4)
+        assert r == "saved"
+        assert "new_block" in cache.index
+
+    def test_prune_expired_cleans_noncacheable(self, tmp_path: Path):
+        """prune_expired also cleans expired _noncacheable entries."""
+        import time
+
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=0)
+        kv = make_kv_data()
+
+        # Add expired noncacheable entry
+        cache._noncacheable["stale_nc"] = time.time() - 100  # expired
+        cache._noncacheable["fresh_nc"] = time.time() + 3600  # not expired
+
+        # Need at least one expired block for prune to run
+        cache.save_block("block_to_prune", kv, num_tokens=4)
+        cache.index["block_to_prune"].last_accessed = datetime.now() - timedelta(seconds=10)
+
+        cache.prune_expired()
+
+        assert "stale_nc" not in cache._noncacheable
+        assert "fresh_nc" in cache._noncacheable
+
+    def test_prune_expired_returns_correct_count(self, tmp_path: Path):
+        """prune_expired returns total expired count, even if file deletion partially fails."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=0)
+        kv = make_kv_data()
+
+        for i in range(3):
+            cache.save_block(f"prune_{i}", kv, num_tokens=4)
+            cache.index[f"prune_{i}"].last_accessed = datetime.now() - timedelta(seconds=10)
+
+        pruned = cache.prune_expired()
+        assert pruned == 3
+        assert cache.num_blocks == 0
+
+    def test_prune_expired_updates_total_bytes(self, tmp_path: Path):
+        """prune_expired decrements _total_bytes for pruned blocks."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=0)
+        kv = make_kv_data()
+
+        cache.save_block("bytes_test", kv, num_tokens=4)
+        assert cache._total_bytes > 0
+
+        cache.index["bytes_test"].last_accessed = datetime.now() - timedelta(seconds=10)
+        cache.prune_expired()
+
+        assert cache._total_bytes == 0

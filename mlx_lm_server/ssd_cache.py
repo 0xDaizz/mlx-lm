@@ -44,6 +44,13 @@ class SSDCache:
         self.cache_dir = Path(cache_dir)
         self.ttl_days = ttl_days
         self._lock = threading.Lock()
+        # Separate lock for mx.save_safetensors I/O: Metal command buffers
+        # are not thread-safe, so concurrent save_safetensors calls crash.
+        # This lock serializes only I/O while the main _lock is released.
+        self._io_lock = threading.Lock()
+        # Tracks block hashes currently being written in Phase 2 (outside _lock).
+        # Used to distinguish in-progress writes from stale index entries.
+        self._in_progress_writes: set[str] = set()
         self.index: dict[str, SSDBlockMeta] = {}
 
         # Batch flush state: defer save_index() until flush interval
@@ -90,6 +97,12 @@ class SSDCache:
     def save_block(self, block_hash: str, kv_data: list[dict[str, mx.array]] | dict[str, mx.array], num_tokens: int | None = None) -> str:
         """Save K/V tensors for a block to disk as a safetensors file.
 
+        Uses a 3-phase approach to minimize lock hold time:
+        Phase 1 (under lock): Validate, check dedup/collision, prepare metadata,
+            reserve index entry (acts as "write lock" for this hash).
+        Phase 2 (outside lock): Perform disk I/O (write temp file + os.replace).
+        Phase 3 (under lock): Finalize — if I/O failed, revert index entry.
+
         Args:
             block_hash: The hash identifying this block.
             kv_data: Either a list[dict] (one dict per layer, each with 'keys'
@@ -102,6 +115,33 @@ class SSDCache:
         Returns:
             One of: ``"saved"``, ``"dedup"``, ``"collision"``, ``"error"``.
         """
+        # Compute num_tokens from kv_data if not provided (no lock needed — read-only on input)
+        computed_num_tokens: int
+        if isinstance(kv_data, list):
+            computed_num_tokens = 0
+            for layer_dict in kv_data:
+                if computed_num_tokens == 0 and "keys" in layer_dict:
+                    computed_num_tokens = layer_dict["keys"].shape[2]
+                    break
+        else:
+            computed_num_tokens = kv_data["keys"].shape[2] if "keys" in kv_data else 0
+
+        if num_tokens is None:
+            num_tokens = computed_num_tokens
+
+        # Flatten list[dict] format to a single dict for safetensors (no lock needed)
+        if isinstance(kv_data, list):
+            flat: dict[str, mx.array] = {}
+            for i, layer_dict in enumerate(kv_data):
+                for key, val in layer_dict.items():
+                    flat[f"layer_{i}_{key}"] = val
+        else:
+            flat = kv_data
+
+        # Phase 1: validate, dedup check, reserve index entry
+        filename = f"block_{block_hash}.safetensors"
+        filepath = self.cache_dir / filename
+
         with self._lock:
             # Non-cacheable check (collision isolation)
             if block_hash in self._noncacheable:
@@ -110,26 +150,16 @@ class SSDCache:
                 else:
                     del self._noncacheable[block_hash]
 
-            # Compute num_tokens from kv_data if not provided
-            computed_num_tokens: int
-            if isinstance(kv_data, list):
-                computed_num_tokens = 0
-                for layer_dict in kv_data:
-                    if computed_num_tokens == 0 and "keys" in layer_dict:
-                        computed_num_tokens = layer_dict["keys"].shape[2]
-                        break
-            else:
-                computed_num_tokens = kv_data["keys"].shape[2] if "keys" in kv_data else 0
-
-            if num_tokens is None:
-                num_tokens = computed_num_tokens
-
-            # Dedup guard: check if already saved
+            # Dedup guard: check if already saved (or in-progress by another thread)
             if block_hash in self.index:
                 entry = self.index[block_hash]
-                filepath = Path(entry.filepath) if not isinstance(entry.filepath, Path) else entry.filepath
+                entry_filepath = Path(entry.filepath) if not isinstance(entry.filepath, Path) else entry.filepath
 
-                if not filepath.exists():
+                if not entry_filepath.exists():
+                    if block_hash in self._in_progress_writes:
+                        # Another thread is writing this block (Phase 2 in progress)
+                        self._stats["ssd_save_dedup_skip"] += 1
+                        return "dedup"
                     # Stale index entry — clean up, fall through to re-save
                     del self.index[block_hash]
                     self._stats["ssd_stale_index_cleaned"] += 1
@@ -152,23 +182,28 @@ class SSDCache:
                     self._stats["ssd_save_dedup_skip"] += 1
                     return "dedup"
 
-            filename = f"block_{block_hash}.safetensors"
-            filepath = self.cache_dir / filename
-
-            # Flatten list[dict] format to a single dict for safetensors
-            if isinstance(kv_data, list):
-                flat: dict[str, mx.array] = {}
-                for i, layer_dict in enumerate(kv_data):
-                    for key, val in layer_dict.items():
-                        flat[f"layer_{i}_{key}"] = val
-            else:
-                flat = kv_data
-
             # Check capacity and prune if needed
             if self._max_size_bytes > 0 and self._total_bytes >= self._max_size_bytes:
                 self._prune_lru_for_space(self._max_size_bytes // 10)  # free ~10% space
 
-            # Atomic write: save to temp file, then rename
+            # Reserve: write index entry now so concurrent save_block() for the
+            # same hash sees "dedup" and skips. I/O happens outside the lock.
+            meta = SSDBlockMeta(
+                block_hash=block_hash,
+                filepath=filepath,
+                last_accessed=datetime.now(),
+                num_tokens=num_tokens,
+            )
+            self.index[block_hash] = meta
+
+        # Phase 2: disk I/O outside _lock (but under _io_lock to serialize
+        # mx.save_safetensors which is not thread-safe at the Metal layer).
+        # Track in-progress writes so concurrent save_block() for the same
+        # hash returns "dedup" instead of treating the reservation as stale.
+        with self._lock:
+            self._in_progress_writes.add(block_hash)
+        io_success = False
+        try:
             try:
                 tmp_fd, tmp_path = tempfile.mkstemp(dir=str(self.cache_dir), suffix='.safetensors')
             except OSError as e:
@@ -178,8 +213,10 @@ class SSDCache:
             try:
                 os.close(tmp_fd)
                 os.unlink(tmp_path)  # mx.save_safetensors needs to create the file itself
-                mx.save_safetensors(tmp_path, flat)
+                with self._io_lock:
+                    mx.save_safetensors(tmp_path, flat)
                 os.replace(tmp_path, str(filepath))
+                io_success = True
             except Exception as e:
                 try:
                     os.unlink(tmp_path)
@@ -188,27 +225,25 @@ class SSDCache:
                 self._stats["ssd_save_fail"] += 1
                 logger.error("Failed to save block %s to SSD: %s", block_hash, e)
                 return "error"
+        finally:
+            # Clean up reservation on failure; finalize on success
+            with self._lock:
+                self._in_progress_writes.discard(block_hash)
+                if not io_success:
+                    self.index.pop(block_hash, None)
 
-            # Track file size
+        # Phase 3 (success): finalize — update total_bytes, save index
+        with self._lock:
             try:
                 file_size = filepath.stat().st_size
                 self._total_bytes += file_size
             except OSError:
                 pass
-
-            # last_accessed is set at save time (not enqueue time for async writes).
-            # TTL granularity is days, so seconds of async delay are negligible.
-            self.index[block_hash] = SSDBlockMeta(
-                block_hash=block_hash,
-                filepath=filepath,
-                last_accessed=datetime.now(),
-                num_tokens=num_tokens,
-            )
             self._save_index()  # Immediate flush: new block must be indexed for durability
             self._stats["ssd_save_success"] += 1
 
-            logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
-            return "saved"
+        logger.debug("Saved block %s to SSD: %s", block_hash, filepath)
+        return "saved"
 
     def load_block(self, block_hash: str) -> list[dict[str, mx.array]] | dict[str, mx.array] | None:
         """Load K/V tensors for a block from disk.
@@ -289,33 +324,55 @@ class SSDCache:
     def prune_expired(self) -> int:
         """Delete blocks that have exceeded their TTL.
 
+        Uses a 2-phase approach to avoid holding the lock during file I/O:
+        Phase 1 (under lock): collect expired entries, remove from index, save index.
+        Phase 2 (outside lock): delete actual files on disk.
+
         Returns:
             Number of blocks pruned.
         """
+        # Phase 1: collect expired entries and update index under lock
+        to_delete: list[tuple[str, Path, int]] = []  # (hash, filepath, estimated_size)
         with self._lock:
             cutoff = datetime.now() - timedelta(days=self.ttl_days)
-            to_prune = [
+            expired_hashes = [
                 bh for bh, meta in self.index.items() if meta.last_accessed < cutoff
             ]
 
-            for block_hash in to_prune:
+            for block_hash in expired_hashes:
                 meta = self.index[block_hash]
+                filepath = meta.filepath if isinstance(meta.filepath, Path) else Path(meta.filepath)
+                # Estimate file size while under lock for _total_bytes tracking
                 file_size = 0
                 try:
-                    if meta.filepath.exists():
-                        file_size = meta.filepath.stat().st_size
-                        meta.filepath.unlink()
-                        logger.debug("Pruned expired block %s: %s", block_hash, meta.filepath)
-                except OSError as e:
-                    logger.warning("Failed to delete expired block file %s: %s", meta.filepath, e)
-                    file_size = 0  # Don't subtract if delete failed
+                    if filepath.exists():
+                        file_size = filepath.stat().st_size
+                except OSError:
+                    pass
+                to_delete.append((block_hash, filepath, file_size))
                 self._total_bytes = max(0, self._total_bytes - file_size)
                 del self.index[block_hash]
 
-            if to_prune:
+            # Also clean expired _noncacheable entries while we hold the lock
+            now_ts = time.time()
+            expired_nc = [h for h, exp in self._noncacheable.items() if now_ts >= exp]
+            for h in expired_nc:
+                del self._noncacheable[h]
+
+            if expired_hashes:
                 self._save_index()
 
-            return len(to_prune)
+        # Phase 2: delete files outside lock (doesn't block other SSD operations)
+        deleted = 0
+        for block_hash, filepath, _ in to_delete:
+            try:
+                filepath.unlink(missing_ok=True)
+                deleted += 1
+                logger.debug("Pruned expired block %s: %s", block_hash, filepath)
+            except OSError as e:
+                logger.warning("Failed to delete expired block file %s: %s", filepath, e)
+
+        return len(to_delete)
 
     def _prune_lru_for_space(self, bytes_to_free: int) -> int:
         """Prune least-recently-accessed blocks to free disk space.

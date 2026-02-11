@@ -342,6 +342,13 @@ def create_app(
 
         Returns True if acquired, False if no permits available.
         This avoids the TOCTOU gap between locked() and await acquire().
+
+        NOTE: sem._value is a CPython implementation detail (not in the public API).
+        This is a deliberate choice to avoid TOCTOU race in middleware: we need
+        an atomic check-and-decrement without blocking. asyncio.Semaphore.locked()
+        only tells us if the value is 0, not if our decrement will succeed.
+        If this breaks in a future Python version, fall back to try/acquire with
+        a short timeout: try: await asyncio.wait_for(sem.acquire(), timeout=0) ...
         """
         if sem._value <= 0:
             return False

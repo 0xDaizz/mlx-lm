@@ -13,6 +13,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+MAX_BUS_PAYLOAD_BYTES = 16 * 1024 * 1024  # 16 MB
+
 _ALLOWED_MODULES = {
     "mlx_lm_server.distributed_bus": {"ControlEvent"},
     "mlx_lm_server.types": {"InferenceRequest"},
@@ -130,9 +132,15 @@ class DistributedControlBus:
     def _broadcast_object(self, obj: ControlEvent) -> ControlEvent:
         """Rank0 sends object via all_sum (pickle + size broadcast)."""
         assert self.rank == 0, "_broadcast_object must only be called from rank 0"
+        raw = pickle.dumps(obj)
+        if len(raw) > MAX_BUS_PAYLOAD_BYTES:
+            raise ValueError(
+                f"Bus payload too large: {len(raw)} bytes "
+                f"(max {MAX_BUS_PAYLOAD_BYTES})"
+            )
         mx = self._mx
         with mx.stream(self._stream):
-            data = mx.array(pickle.dumps(obj), dtype=mx.uint8)
+            data = mx.array(raw, dtype=mx.uint8)
             size_arr = mx.array([data.size], dtype=mx.int32)
             size_arr = mx.distributed.all_sum(size_arr, group=self.group)
             mx.eval(size_arr)

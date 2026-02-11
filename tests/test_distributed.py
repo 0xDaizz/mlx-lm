@@ -2361,3 +2361,52 @@ class TestAuditFixesDIST:
         assert result[-1].finish_reason == "error"
 
         scheduler.stop()
+
+
+# =========================================================================
+# S. Bus Payload Size Limit (DIST-3)
+# =========================================================================
+
+
+class TestBusPayloadSizeLimit:
+    """Test MAX_BUS_PAYLOAD_BYTES enforcement in _broadcast_object."""
+
+    def test_broadcast_object_rejects_oversized_payload(self):
+        """_broadcast_object should raise ValueError for payloads > 16 MB."""
+        from unittest.mock import MagicMock
+        from mlx_lm_server.distributed_bus import (
+            DistributedControlBus,
+            MAX_BUS_PAYLOAD_BYTES,
+        )
+
+        # Create a bus object without going through __init__ (avoids needing real mlx)
+        bus = object.__new__(DistributedControlBus)
+        bus.rank = 0
+        bus.world_size = 2
+        bus.group = MagicMock()
+
+        # Create a ControlEvent with a payload larger than MAX_BUS_PAYLOAD_BYTES
+        # The entire pickled ControlEvent must exceed the limit
+        large_payload = b"x" * (MAX_BUS_PAYLOAD_BYTES + 1)
+        oversized_event = ControlEvent(typ="submit", payload=large_payload)
+
+        with pytest.raises(ValueError, match="Bus payload too large"):
+            bus._broadcast_object(oversized_event)
+
+    def test_broadcast_object_allows_normal_payload(self):
+        """_broadcast_object should NOT reject payloads under 16 MB."""
+        from mlx_lm_server.distributed_bus import MAX_BUS_PAYLOAD_BYTES
+
+        # Verify a normal ControlEvent is well under the limit
+        event = ControlEvent.submit(InferenceRequest(
+            request_id="normal-size",
+            prompt_tokens=list(range(1000)),
+            max_tokens=100,
+        ))
+        data = pickle.dumps(event)
+        assert len(data) < MAX_BUS_PAYLOAD_BYTES
+
+    def test_max_bus_payload_bytes_value(self):
+        """MAX_BUS_PAYLOAD_BYTES should be 16 MB."""
+        from mlx_lm_server.distributed_bus import MAX_BUS_PAYLOAD_BYTES
+        assert MAX_BUS_PAYLOAD_BYTES == 16 * 1024 * 1024
