@@ -1948,3 +1948,55 @@ class TestRollbackAllocationsLocked:
         assert mgr.pool.blocks[reused_bid].ref_count == 1
         # Fresh block: returned to pool, hash removed
         assert "fresh_hash" not in mgr.hash_table
+
+
+class TestDoubleReturnBlock:
+    """Tests for BlockPool double-return guard (CACHE-M4)."""
+
+    def test_double_return_block_ignored(self):
+        """Returning the same block twice should not create duplicates in free_queue."""
+        config = make_config(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+
+        # Allocate a block
+        with mgr.lock:
+            block = mgr.pool.get_free_block()
+            bid = block.block_id
+
+        free_before = mgr.pool.num_free
+
+        # Return once — should succeed
+        mgr.pool.return_block(bid)
+        assert mgr.pool.num_free == free_before + 1
+
+        # Return again — should be ignored (double-return guard)
+        mgr.pool.return_block(bid)
+        assert mgr.pool.num_free == free_before + 1  # No change
+
+        # Verify free_queue has no duplicates
+        assert list(mgr.pool.free_queue).count(bid) == 1
+
+
+class TestGetBlockAccessor:
+    """Tests for KVCacheManager.get_block() accessor (SCHED-13)."""
+
+    def test_get_block_accessor(self):
+        """get_block() returns the correct block object."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        bid = ids[0]
+
+        block = mgr.get_block(bid)
+        assert block.block_id == bid
+        assert block is mgr.pool.blocks[bid]
+
+    def test_get_block_matches_pool(self):
+        """get_block() returns same object as pool.blocks[]."""
+        config = make_config(block_size=4, num_blocks=4)
+        mgr = KVCacheManager(config)
+
+        for i in range(config.num_blocks):
+            assert mgr.get_block(i) is mgr.pool.blocks[i]

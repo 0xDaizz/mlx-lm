@@ -72,12 +72,11 @@ class TestDistributedConfig:
         config = ServerConfig(distributed_strict=False)
         assert config.distributed_strict is False
 
-    def test_config_use_distributed_deprecated(self):
-        """use_distributed field exists but is deprecated."""
-        config = ServerConfig(use_distributed=True)
-        assert config.use_distributed is True
-        # The new field should still default to "off"
-        assert config.distributed_mode == "off"
+    def test_config_use_distributed_removed(self):
+        """use_distributed deprecated field has been removed (SRV-9)."""
+        assert not hasattr(ServerConfig, "use_distributed")
+        config = ServerConfig()
+        assert not hasattr(config, "use_distributed")
 
 
 class TestDistributedCLI:
@@ -1344,17 +1343,15 @@ class TestBusErrorThreshold:
 
 
 class TestBusUnpackErrorCounter:
-    """P0-3: Unpack errors accumulate independently of recv errors."""
+    """P0-3 + DIST-4: First deserialization failure is immediately fatal."""
 
-    def test_unpack_errors_accumulate_independently_of_recv(self):
-        """Mock bus where recv succeeds but unpack always fails.
+    def test_unpack_error_immediately_fatal(self):
+        """Mock bus where recv succeeds but unpack fails.
 
-        Verifies:
-        - _bus_unpack_error_count increments independently of _bus_error_count
-        - _bus_error_count resets to 0 on each successful recv
-        - When _bus_unpack_error_count reaches BUS_ERROR_THRESHOLD, triggers fatal
+        DIST-4: A single deserialization failure is immediately fatal
+        because the worker has permanently missed events, causing rank
+        divergence. No threshold accumulation needed.
         """
-        from mlx_lm_server.scheduler import BUS_ERROR_THRESHOLD
 
         class RecvSucceedsUnpackFailsBus:
             """Bus where recv always succeeds but returns a batch event
@@ -1371,58 +1368,15 @@ class TestBusUnpackErrorCounter:
         )
         scheduler._running = True
 
-        # Each call: recv succeeds (resets _bus_error_count to 0),
-        # but unpack_batch() fails (increments _bus_unpack_error_count)
-        for i in range(BUS_ERROR_THRESHOLD - 1):
-            result = scheduler._apply_bus_events()
-            assert result is True, f"Should continue at iteration {i}"
-            assert scheduler._bus_error_count == 0, \
-                "recv-only counter should stay 0 after successful recv"
-            assert scheduler._bus_unpack_error_count == i + 1, \
-                f"unpack counter should be {i + 1}"
-            assert scheduler._running is True
-            assert scheduler._dist_fatal is False
-
-        # The threshold-reaching call should trigger fatal
+        # First deserialization failure is immediately fatal
         result = scheduler._apply_bus_events()
         assert result is False
         assert scheduler._running is False
         assert scheduler._dist_fatal is True
-        assert scheduler._dist_fatal_reason == "bus_error_threshold_unpack"
-        assert scheduler._bus_unpack_error_count == BUS_ERROR_THRESHOLD
-        # recv counter should still be 0 (recv succeeded every time)
+        assert scheduler._dist_fatal_reason == "deserialization_failure"
+        assert scheduler._bus_unpack_error_count == 1
+        # recv counter should be 0 (recv succeeded)
         assert scheduler._bus_error_count == 0
-        scheduler.stop()
-
-    def test_unpack_error_counter_resets_on_success(self):
-        """Successful unpack_batch should reset _bus_unpack_error_count to 0."""
-
-        class FlakeyUnpackBus:
-            """Bus where unpack fails a few times then succeeds."""
-            call_count = 0
-
-            def recv(self):
-                self.call_count += 1
-                if self.call_count <= 3:
-                    # Return corrupt batch payload
-                    return ControlEvent(typ="batch", payload=b"bad")
-                # Return valid batch with noop
-                return ControlEvent.batch([ControlEvent.noop()])
-
-        config = ServerConfig()
-        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
-        bus = FlakeyUnpackBus()
-        scheduler = Scheduler(config=config, dist_ctx=ctx, control_bus=bus)
-        scheduler._running = True
-
-        # 3 unpack failures
-        for _ in range(3):
-            scheduler._apply_bus_events()
-        assert scheduler._bus_unpack_error_count == 3
-
-        # 1 successful unpack should reset
-        scheduler._apply_bus_events()
-        assert scheduler._bus_unpack_error_count == 0
         scheduler.stop()
 
     def test_unpack_error_count_in_stats(self):
@@ -2272,3 +2226,138 @@ class TestPreParserEnvVarSupport:
         _, cmd = exec_calls[0]
         assert "--backend" in cmd
         assert "jaccl" in cmd
+
+
+# =========================================================================
+# R. Audit Fixes — DIST-1,2,4,6,8
+# =========================================================================
+
+
+class TestAuditFixesDIST:
+    """Tests for audit findings DIST-1, DIST-2, DIST-4, DIST-6, DIST-8."""
+
+    def test_restricted_unpickler_blocks_malicious(self):
+        """DIST-related: Verify RestrictedUnpickler blocks subprocess.Popen."""
+        import io as _io
+        from mlx_lm_server.distributed_bus import RestrictedUnpickler
+
+        # Craft a pickle payload that tries to instantiate subprocess.Popen
+        malicious_data = (
+            b'\x80\x05'                          # PROTO 5
+            b'\x8c\x0asubprocess'                 # SHORT_BINUNICODE 'subprocess'
+            b'\x8c\x05Popen'                      # SHORT_BINUNICODE 'Popen'
+            b'\x93'                               # STACK_GLOBAL
+            b'\x8c\x07echo hi'                    # SHORT_BINUNICODE 'echo hi'
+            b'\x85'                               # TUPLE1
+            b'R'                                  # REDUCE
+            b'.'                                  # STOP
+        )
+
+        with pytest.raises(pickle.UnpicklingError, match="Restricted unpickle"):
+            RestrictedUnpickler(_io.BytesIO(malicious_data)).load()
+
+    def test_broadcast_object_rank0_assertion(self):
+        """DIST-2: _broadcast_object asserts rank == 0."""
+        from unittest.mock import MagicMock
+
+        # Create a mock DistributedContext with rank=1
+        mock_ctx = MagicMock()
+        mock_ctx.rank = 1
+        mock_ctx.world_size = 2
+        mock_ctx.group = MagicMock()
+
+        from mlx_lm_server.distributed_bus import DistributedControlBus
+
+        # Patch the __init__ to avoid needing real mlx
+        bus = object.__new__(DistributedControlBus)
+        bus.rank = 1
+        bus.world_size = 2
+        bus.group = mock_ctx.group
+
+        event = ControlEvent.noop()
+        with pytest.raises(AssertionError, match="_broadcast_object must only be called from rank 0"):
+            bus._broadcast_object(event)
+
+    def test_deserialization_failure_sets_fatal(self):
+        """DIST-4: A single deserialization failure in _apply_bus_events
+        sets _dist_fatal = True immediately (not after threshold)."""
+
+        class CorruptBatchBus:
+            def recv(self):
+                return ControlEvent(typ="batch", payload=b"not-valid-pickle")
+
+        config = ServerConfig()
+        ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+        scheduler = Scheduler(
+            config=config, dist_ctx=ctx,
+            control_bus=CorruptBatchBus(),
+        )
+        scheduler._running = True
+
+        result = scheduler._apply_bus_events()
+        assert result is False
+        assert scheduler._dist_fatal is True
+        assert scheduler._dist_fatal_reason == "deserialization_failure"
+        assert scheduler._running is False
+        assert scheduler._bus_unpack_error_count == 1
+        scheduler.stop()
+
+    def test_local_apply_failure_preserves_result_buffer(self):
+        """DIST-6: After _signal_finish on local apply failure,
+        get_result() can still read the error event (buffer not cleaned up)."""
+        import queue as _queue
+
+        config = ServerConfig()
+        # Rank0 distributed mode (needs bus for _drain_bus_outbox)
+        ctx = DistributedContext(enabled=True, rank=0, world_size=2)
+
+        class AlwaysSuccessPublishBus:
+            """Bus that always succeeds publish."""
+            def publish(self, event):
+                pass
+
+        scheduler = Scheduler(
+            config=config, dist_ctx=ctx,
+            control_bus=AlwaysSuccessPublishBus(),
+        )
+        scheduler._running = True
+
+        # Create a request
+        request = InferenceRequest(
+            request_id="dist6-test",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=10,
+            stream=False,
+        )
+
+        # Pre-register result buffers (simulating what submit_request does)
+        import threading
+        with scheduler._results_lock:
+            scheduler._results["dist6-test"] = []
+            scheduler._results_ready["dist6-test"] = threading.Event()
+
+        # Make request_queue.add raise to trigger the error path
+        original_add = scheduler.request_queue.add
+        def failing_add(req):
+            raise RuntimeError("Queue full simulation")
+        scheduler.request_queue.add = failing_add
+
+        # Put a submit event into the outbox
+        from mlx_lm_server.distributed_bus import ControlEvent as _CE
+        scheduler._bus_outbox.put(_CE.submit(request))
+
+        # Drain the outbox (publish succeeds, local apply fails)
+        scheduler._drain_bus_outbox()
+
+        # The result buffer should still be accessible for get_result()
+        # because _cleanup_result_buffers was removed from the error path
+        with scheduler._results_lock:
+            assert "dist6-test" in scheduler._results
+            assert "dist6-test" in scheduler._results_ready
+
+        # get_result should return the error finish event
+        result = scheduler.get_result("dist6-test", timeout=1.0)
+        assert len(result) >= 1
+        assert result[-1].finish_reason == "error"
+
+        scheduler.stop()

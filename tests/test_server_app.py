@@ -2498,3 +2498,122 @@ class TestBatchEncodingCompat:
         assert resp.status_code == 200
         data = resp.json()
         assert data["choices"][0]["message"]["content"] == "Hello, world!"
+
+
+# ===========================================================================
+# TestSRV: Audit finding fixes (SRV-5, SRV-9, SRV-11, SRV-14)
+# ===========================================================================
+
+
+class TestSRVAuditFixes:
+    """Tests for server audit findings SRV-5, SRV-9, SRV-11, SRV-14."""
+
+    @pytest.mark.anyio
+    async def test_metrics_content_type(self, client):
+        """SRV-14: /metrics response has correct content-type including charset."""
+        resp = await client.get("/metrics")
+        assert resp.status_code == 200
+        ct = resp.headers["content-type"]
+        assert "text/plain" in ct
+        assert "version=0.0.4" in ct
+        assert "charset=utf-8" in ct
+
+    @pytest.mark.anyio
+    async def test_completion_tokens_with_stop_sequence(self, config, tokenizer):
+        """SRV-11: completion_tokens reflects truncated output, not pre-truncation count."""
+
+        class StopSeqScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                # Tokens: "One" "Two" "STOP" "Three" -- stop at "STOP"
+                self.response_tokens = ["One", "Two", "STOP", "Three"]
+
+            def get_result(self, request_id, timeout=None):
+                events = []
+                for i, tok_text in enumerate(self.response_tokens):
+                    is_last = i == len(self.response_tokens) - 1
+                    events.append(
+                        TokenEvent(
+                            request_id=request_id,
+                            token_id=i,
+                            token_text=tok_text,
+                            finish_reason="stop" if is_last else None,
+                        )
+                    )
+                return events
+
+        sched = StopSeqScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            resp = await ac.post(
+                "/v1/completions",
+                json={
+                    "prompt": "Hello",
+                    "max_tokens": 50,
+                    "stop": ["STOP"],
+                },
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        # The output text should be truncated before "STOP"
+        assert data["choices"][0]["text"] == "OneTwo"
+        # completion_tokens should reflect the truncated text length,
+        # not the original 4 events. SimpleTokenizer encodes per-character,
+        # so "OneTwo" = 6 tokens.
+        assert data["usage"]["completion_tokens"] == len(tokenizer.encode("OneTwo"))
+
+    @pytest.mark.anyio
+    async def test_streaming_disconnect_cleanup(self, config, tokenizer):
+        """Non-streaming disconnect triggers cancel_request for cleanup.
+
+        When a non-streaming request is cancelled (e.g., client disconnect),
+        the finally block in _do_inference calls cancel_request to free
+        scheduler resources.
+        """
+        import asyncio
+
+        class SlowGetResultScheduler(MockSchedulerForApp):
+            def __init__(self):
+                super().__init__()
+                self.cancelled: list[str] = []
+
+            def get_result(self, request_id, timeout=None):
+                import time
+                time.sleep(2.0)
+                return super().get_result(request_id, timeout)
+
+            def cancel_request(self, request_id: str) -> bool:
+                self.cancelled.append(request_id)
+                return True
+
+        sched = SlowGetResultScheduler()
+        app = create_app(config=config, scheduler=sched, tokenizer=tokenizer)
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            try:
+                resp = await asyncio.wait_for(
+                    ac.post(
+                        "/v1/completions",
+                        json={"prompt": "Hello", "max_tokens": 50},
+                    ),
+                    timeout=0.3,
+                )
+            except (asyncio.TimeoutError, Exception):
+                pass
+        # Allow background cleanup to run
+        await asyncio.sleep(0.2)
+        # cancel_request should have been called by the finally block
+        assert len(sched.cancelled) >= 1, (
+            "cancel_request should be called on disconnect/timeout"
+        )
+
+    def test_deprecated_config_removed(self):
+        """SRV-9: ServerConfig no longer has use_distributed attribute."""
+        assert not hasattr(ServerConfig, "use_distributed"), (
+            "use_distributed should be removed from ServerConfig"
+        )
+        config = ServerConfig()
+        assert not hasattr(config, "use_distributed"), (
+            "use_distributed instance attribute should not exist"
+        )

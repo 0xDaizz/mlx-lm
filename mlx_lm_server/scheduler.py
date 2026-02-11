@@ -19,7 +19,6 @@ Pass model=None and tokenizer=None for mock-based tests.
 from __future__ import annotations
 
 import logging
-import pickle
 import queue
 import threading
 import time
@@ -184,6 +183,11 @@ class Scheduler:
 
         # BatchGenerator state (real model path)
         self._batch_generator: Any = None
+        # === Inference-thread-owned mappings ===
+        # _request_id_to_uid and _uid_to_request_id are ONLY modified by the
+        # inference thread (never from HTTP handlers). They do NOT need lock
+        # protection. HTTP handlers access _active_sequences (protected by
+        # _active_lock) for cross-thread operations.
         self._uid_to_request_id: dict[int, str] = {}
         self._request_id_to_uid: dict[str, int] = {}
         self._sequence_cache: SequenceCacheStore | None = None
@@ -364,6 +368,7 @@ class Scheduler:
                 raise
             self._inc_stat("total_requests")
             self._inc_stat("accepted_requests")
+            self._inc_stat("submitted_requests")
             self._new_request_event.set()
 
         logger.debug("Submitted request %s", request.request_id)
@@ -510,6 +515,10 @@ class Scheduler:
         self._new_request_event.set()
 
         # 3. Signal active sequences and drain queue
+        # NOTE: _signal_finish is safe to call multiple times for the same
+        # request_id — it appends events to the result buffer. Callers
+        # may receive duplicate finish events during shutdown, which is
+        # benign (get_result returns all accumulated events).
         with self._active_lock:
             for rid, seq in list(self._active_sequences.items()):
                 if not seq.is_finished:
@@ -693,19 +702,13 @@ class Scheduler:
                 events = raw_event.unpack_batch()
                 self._bus_unpack_error_count = 0
             except Exception:
-                logger.error("Failed to deserialize compound bus event", exc_info=True)
+                logger.error("FATAL: rank divergence imminent — failed to deserialize compound bus event", exc_info=True)
                 self._bus_unpack_error_count += 1
-                if self._bus_unpack_error_count >= BUS_ERROR_THRESHOLD:
-                    logger.critical(
-                        "Bus error threshold (%d) reached during batch unpack — shutting down distributed",
-                        BUS_ERROR_THRESHOLD,
-                    )
-                    self._dist_fatal = True
-                    self._dist_fatal_reason = "bus_error_threshold_unpack"
-                    self._running = False
-                    self._new_request_event.set()
-                    return False
-                return True
+                self._dist_fatal = True
+                self._dist_fatal_reason = "deserialization_failure"
+                self._running = False
+                self._new_request_event.set()
+                return False
         else:
             # Single event (backward compat or noop fallback)
             events = [raw_event]
@@ -801,7 +804,7 @@ class Scheduler:
                 # Best-effort shutdown broadcast
                 try:
                     from mlx_lm_server.distributed_bus import ControlEvent as _CE
-                    self._control_bus.publish(ControlEvent(typ="batch", payload=pickle.dumps([_CE.shutdown()])))
+                    self._control_bus.publish(_CE.batch([_CE.shutdown()]))
                 except Exception:
                     pass
                 self._dist_fatal = True
@@ -845,7 +848,6 @@ class Scheduler:
                         with self._cancelled_lock:
                             self._cancelled.add(request.request_id)
                         self._signal_finish(request_id=request.request_id, finish_reason="error")
-                        self._cleanup_result_buffers(request.request_id)
             elif ev.typ == "cancel":
                 request_id = ev.unpack_request_id()
                 if request_id is not None:
@@ -1157,7 +1159,7 @@ class Scheduler:
                             block_data = []
                             all_blocks_valid = True
                             for bid in block_ids:
-                                block = self.kv_cache_manager.pool.blocks[bid]
+                                block = self.kv_cache_manager.get_block(bid)
                                 if block.kv_data is not None:
                                     block_data.append(block.kv_data)
                                 else:

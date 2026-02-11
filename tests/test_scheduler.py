@@ -1563,3 +1563,41 @@ class TestShutdownDrain:
                 break
 
         assert any(e.finish_reason is not None for e in events)
+
+
+class TestSubmittedRequestsStat:
+    """Tests for submitted_requests stat in non-distributed mode (SCHED-10)."""
+
+    def test_submitted_requests_stat_nondistributed(self):
+        """submit_request in non-distributed mode should increment submitted_requests."""
+        config = _make_config()
+        sched = _make_scheduler(config)
+
+        req = InferenceRequest(
+            request_id="stat-test",
+            prompt_tokens=[1, 2, 3],
+            max_tokens=5,
+            temperature=1.0,
+            top_p=1.0,
+            stop_sequences=[],
+            stream=False,
+        )
+        sched.submit_request(req)
+
+        assert sched._stats["submitted_requests"] == 1
+        assert sched._stats["total_requests"] == 1
+        assert sched._stats["accepted_requests"] == 1
+
+
+class TestDoubleStopIdempotent:
+    """Tests for stop() idempotency (SCHED-7)."""
+
+    def test_double_stop_idempotent(self):
+        """Calling stop() twice should not raise or hang."""
+        config = _make_config()
+        sched = _make_scheduler(config)
+        sched.run_inference_loop()
+        time.sleep(0.05)
+
+        sched.stop()
+        sched.stop()  # Second call should be a no-op

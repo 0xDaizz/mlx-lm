@@ -80,7 +80,6 @@ def init_distributed(config) -> DistributedContext:
         raise ValueError(
             "Pipeline sharding is not supported in v1. Use distributed_sharding='tensor'."
         )
-    pipeline_group = group if sharding == "pipeline" and world_size > 1 else None
     tensor_group = group if sharding == "tensor" and world_size > 1 else None
 
     logger.info(
@@ -93,7 +92,7 @@ def init_distributed(config) -> DistributedContext:
         group=group,
         rank=rank,
         world_size=world_size,
-        pipeline_group=pipeline_group,
+        pipeline_group=None,
         tensor_group=tensor_group,
         backend=mode,
     )

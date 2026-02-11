@@ -64,9 +64,6 @@ class ServerConfig:
     max_concurrent_requests: int = 64  # Max concurrent inference requests (0 = unlimited)
     memory_pressure_threshold: float = 0.9  # Reject requests when block utilization >= this
 
-    # Distributed
-    use_distributed: bool = False  # DEPRECATED: use distributed_mode instead
-
     # Distributed / Tensor Parallel
     distributed_mode: str = "off"                          # off | ring | jaccl
     distributed_sharding: str = "tensor"                   # tensor | pipeline

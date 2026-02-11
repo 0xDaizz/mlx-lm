@@ -129,6 +129,7 @@ class DistributedControlBus:
 
     def _broadcast_object(self, obj: ControlEvent) -> ControlEvent:
         """Rank0 sends object via all_sum (pickle + size broadcast)."""
+        assert self.rank == 0, "_broadcast_object must only be called from rank 0"
         mx = self._mx
         with mx.stream(self._stream):
             data = mx.array(pickle.dumps(obj), dtype=mx.uint8)

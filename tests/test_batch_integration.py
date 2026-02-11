@@ -27,6 +27,7 @@ class MockResponse:
     finish_reason: str | None = None
     _prompt_cache: Any = None
 
+    @property
     def prompt_cache(self):
         return self._prompt_cache
 
@@ -326,3 +327,18 @@ class TestBatchIntegration:
             assert events[-1].finish_reason == "length"
         finally:
             sched.stop()
+
+
+class TestMockResponseProperty:
+    """Tests for MockResponse.prompt_cache property (SCHED-1)."""
+
+    def test_mock_response_prompt_cache_none(self):
+        """prompt_cache=None should evaluate as None, not a truthy method object."""
+        r = MockResponse(uid=0, token=1, _prompt_cache=None)
+        assert r.prompt_cache is None
+
+    def test_mock_response_prompt_cache_value(self):
+        """prompt_cache with a value should return that value."""
+        sentinel = object()
+        r = MockResponse(uid=0, token=1, _prompt_cache=sentinel)
+        assert r.prompt_cache is sentinel

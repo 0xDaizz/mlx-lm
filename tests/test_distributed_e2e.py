@@ -247,7 +247,18 @@ class TestDistributedE2E:
         # Drain outbox: publish succeeds, but local apply fails (queue full)
         scheduler._drain_bus_outbox()
 
-        # Result buffers should have been cleaned up after signal_finish
+        # DIST-6: Result buffers are preserved so get_result() can read the
+        # error finish event. They are cleaned up naturally when get_result()
+        # pops them.
+        assert "overflow-req" in scheduler._results
+        assert "overflow-req" in scheduler._results_ready
+
+        # get_result should return the error event
+        result = scheduler.get_result("overflow-req", timeout=1.0)
+        assert len(result) >= 1
+        assert result[-1].finish_reason == "error"
+
+        # After get_result pops, buffers are cleaned up
         assert "overflow-req" not in scheduler._results
         assert "overflow-req" not in scheduler._results_ready
 

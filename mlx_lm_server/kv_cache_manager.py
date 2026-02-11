@@ -56,6 +56,7 @@ class BlockPool:
             KVCacheBlock(block_id=i) for i in range(num_blocks)
         ]
         self.free_queue: deque[int] = deque(range(num_blocks))
+        self._free_set: set[int] = set(range(num_blocks))
 
     def get_free_block(self) -> KVCacheBlock:
         """Get a free block from the pool.
@@ -71,6 +72,7 @@ class BlockPool:
                 f"Block pool exhausted: all {self.num_blocks} blocks are in use"
             )
         block_id = self.free_queue.popleft()
+        self._free_set.discard(block_id)
         return self.blocks[block_id]
 
     def return_block(self, block_id: int) -> None:
@@ -87,6 +89,10 @@ class BlockPool:
         block.ref_count = 0
         block.last_accessed = 0.0
         block.kv_data = None
+        if block_id in self._free_set:
+            logger.warning("BlockPool: double-return of block %d ignored", block_id)
+            return
+        self._free_set.add(block_id)
         self.free_queue.append(block_id)
 
     @property
@@ -238,6 +244,10 @@ class KVCacheManager:
         Delegates to the module-level compute_block_hash function.
         """
         return compute_block_hash(prefix_tokens, block_tokens)
+
+    def get_block(self, block_id: int) -> KVCacheBlock:
+        """Get a block by its ID. The block must be allocated (ref_count > 0)."""
+        return self.pool.blocks[block_id]
 
     def find_cached_prefix(self, token_ids: list[int]) -> int:
         """Find how many leading tokens are already cached (block-aligned).

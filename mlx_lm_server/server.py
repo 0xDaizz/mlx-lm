@@ -601,8 +601,10 @@ def create_app(
                         detail=f"Request state unavailable for {request_id}",
                     ) from e
 
-            if not events:
+            if events is None:
                 raise HTTPException(status_code=504, detail="Request timed out")
+            if not events:
+                raise HTTPException(status_code=504, detail="Request produced no output")
 
             # Exclude EOS token from output if present (by token_id, not text)
             filtered_events = events
@@ -615,14 +617,21 @@ def create_app(
             # Truncate stop-sequence text from output (the scheduler truncates
             # seq.output_text, but individual TokenEvent.token_text values still
             # carry the raw text, so the joined string may contain the stop sequence).
+            stop_text_found = False
             if finish_reason == "stop" and inf_req.stop_sequences:
                 for stop_seq in inf_req.stop_sequences:
                     idx = completion_text.find(stop_seq)
                     if idx != -1:
                         completion_text = completion_text[:idx]
+                        stop_text_found = True
                         break
 
             completion_tokens = len(filtered_events)
+            if stop_text_found and tok is not None:
+                try:
+                    completion_tokens = len(tok.encode(completion_text))
+                except Exception:
+                    pass  # Keep original count as fallback
 
             result = format_response(
                 request_id, app.state.model_name, completion_text,
@@ -897,7 +906,7 @@ def create_app(
             "# TYPE mlx_lm_server_shutdown_clean gauge",
             f"mlx_lm_server_shutdown_clean {_metric_value(stats.get('shutdown_clean', True))}",
         ]
-        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4")
+        return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
     return app
 
