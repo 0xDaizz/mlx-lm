@@ -182,9 +182,10 @@ class SSDCache:
                     self._stats["ssd_save_dedup_skip"] += 1
                     return "dedup"
 
-            # Check capacity and prune if needed
+            # Check capacity and prune if needed (Phase 1 only: index update)
+            prune_files: list[tuple[str, Path]] = []
             if self._max_size_bytes > 0 and self._total_bytes >= self._max_size_bytes:
-                self._prune_lru_for_space(self._max_size_bytes // 10)  # free ~10% space
+                _, prune_files = self._prune_lru_for_space(self._max_size_bytes // 10)  # free ~10% space
 
             # Reserve: write index entry now so concurrent save_block() for the
             # same hash sees "dedup" and skips. I/O happens outside the lock.
@@ -195,6 +196,14 @@ class SSDCache:
                 num_tokens=num_tokens,
             )
             self.index[block_hash] = meta
+
+        # Phase 1.5: delete pruned files outside the lock (2-phase I/O pattern)
+        for pruned_hash, pruned_path in prune_files:
+            try:
+                pruned_path.unlink(missing_ok=True)
+                logger.info("LRU-pruned block %s", pruned_hash)
+            except OSError as e:
+                logger.warning("Failed to LRU-prune block file %s: %s", pruned_path, e)
 
         # Phase 2: disk I/O outside _lock (but under _io_lock to serialize
         # mx.save_safetensors which is not thread-safe at the Metal layer).
@@ -374,8 +383,13 @@ class SSDCache:
 
         return len(to_delete)
 
-    def _prune_lru_for_space(self, bytes_to_free: int) -> int:
+    def _prune_lru_for_space(self, bytes_to_free: int) -> tuple[int, list[tuple[str, Path]]]:
         """Prune least-recently-accessed blocks to free disk space.
+
+        Uses a 2-phase approach (matching prune_expired()):
+        Phase 1 (under lock — this method): Collect LRU entries, remove from
+            index, update _total_bytes and stats, save index.
+        Phase 2 (caller, outside lock): Delete actual files on disk.
 
         Called internally when disk usage exceeds max_size_bytes.
         Must be called with self._lock held.
@@ -384,10 +398,12 @@ class SSDCache:
             bytes_to_free: Target number of bytes to free.
 
         Returns:
-            Number of bytes actually freed.
+            Tuple of (bytes_freed, files_to_delete) where files_to_delete is
+            a list of (block_hash, filepath) pairs for the caller to unlink
+            outside the lock.
         """
         if not self.index:
-            return 0
+            return 0, []
 
         # Sort by last_accessed (oldest first)
         sorted_blocks = sorted(
@@ -396,23 +412,22 @@ class SSDCache:
         )
 
         freed = 0
-        pruned_hashes = []
+        pruned_hashes: list[str] = []
+        files_to_delete: list[tuple[str, Path]] = []
         for block_hash, meta in sorted_blocks:
             if freed >= bytes_to_free:
                 break
+            p = Path(meta.filepath) if not isinstance(meta.filepath, Path) else meta.filepath
             file_size = 0
             try:
-                p = Path(meta.filepath) if not isinstance(meta.filepath, Path) else meta.filepath
                 if p.exists():
                     file_size = p.stat().st_size
-                    p.unlink()
-                    logger.info("LRU-pruned block %s (%d bytes)", block_hash, file_size)
-            except OSError as e:
-                logger.warning("Failed to LRU-prune block %s: %s", block_hash, e)
-                continue
+            except OSError:
+                pass
             freed += file_size
             self._total_bytes = max(0, self._total_bytes - file_size)
             pruned_hashes.append(block_hash)
+            files_to_delete.append((block_hash, p))
 
         for bh in pruned_hashes:
             del self.index[bh]
@@ -422,7 +437,7 @@ class SSDCache:
             self._stats["ssd_lru_prune_count"] += len(pruned_hashes)
             self._stats["ssd_lru_prune_bytes"] += freed
 
-        return freed
+        return freed, files_to_delete
 
     def _mark_dirty(self) -> None:
         """Mark index as dirty; flush after mutation count or time threshold."""

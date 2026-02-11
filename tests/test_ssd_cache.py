@@ -455,11 +455,15 @@ class TestSSDDiskSizeLimit:
         cache.index["hash_1"].last_accessed = datetime.now() - timedelta(days=2)
         cache.index["hash_2"].last_accessed = datetime.now() - timedelta(days=1)
 
-        # Prune with small target
+        # Prune with small target (2-phase: index update under lock, file deletion outside)
         with cache._lock:
-            freed = cache._prune_lru_for_space(1)  # Just free 1 byte minimum
+            freed, files_to_delete = cache._prune_lru_for_space(1)  # Just free 1 byte minimum
 
-        # Oldest block should be gone
+        # Phase 2: delete files outside lock
+        for _, fpath in files_to_delete:
+            fpath.unlink(missing_ok=True)
+
+        # Oldest block should be gone from index
         assert "hash_0" not in cache.index
         assert "hash_2" in cache.index  # newest kept
         assert freed > 0
@@ -663,3 +667,103 @@ class TestPruneExpired2Phase:
         cache.prune_expired()
 
         assert cache._total_bytes == 0
+
+
+# ---------------------------------------------------------------------------
+# _prune_lru_for_space 2-phase I/O pattern (no lock during file deletion)
+# ---------------------------------------------------------------------------
+
+
+class TestPruneLruForSpace2Phase:
+    """Tests for the 2-phase _prune_lru_for_space: index update under lock,
+    file deletion outside lock."""
+
+    def test_prune_lru_for_space_does_not_block(self, tmp_path: Path):
+        """Verify concurrent save_block works during LRU pruning file deletion.
+
+        The 2-phase pattern ensures _prune_lru_for_space only updates the index
+        under lock (Phase 1), and file deletion happens outside the lock,
+        allowing concurrent save_block operations to proceed without blocking.
+        """
+        import threading
+        import time as time_mod
+
+        # Use a small max_size to trigger pruning
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=500)
+
+        # Save several blocks to fill up the cache
+        for i in range(5):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            cache.save_block(f"fill_{i}", kv, num_tokens=4)
+
+        # Manually call _prune_lru_for_space under lock and verify it returns
+        # files_to_delete without doing I/O
+        with cache._lock:
+            initial_count = len(cache.index)
+            freed, files_to_delete = cache._prune_lru_for_space(200)
+
+            # Index should have been modified (blocks removed)
+            assert len(cache.index) < initial_count
+            # Files should be listed for deletion
+            assert len(files_to_delete) > 0
+            # But files should still exist on disk (no I/O under lock)
+            for _, fpath in files_to_delete:
+                assert fpath.exists(), f"File {fpath} should still exist (not deleted under lock)"
+
+        # Phase 2: delete files outside lock
+        for _, fpath in files_to_delete:
+            fpath.unlink(missing_ok=True)
+
+        # Verify files are now gone
+        for _, fpath in files_to_delete:
+            assert not fpath.exists()
+
+    def test_prune_lru_returns_correct_files(self, tmp_path: Path):
+        """_prune_lru_for_space returns the correct files matching pruned entries."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=0)
+
+        # Save 3 blocks with known access times
+        for i in range(3):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            cache.save_block(f"hash_{i}", kv, num_tokens=4)
+
+        cache.index["hash_0"].last_accessed = datetime.now() - timedelta(days=3)
+        cache.index["hash_1"].last_accessed = datetime.now() - timedelta(days=2)
+        cache.index["hash_2"].last_accessed = datetime.now() - timedelta(days=1)
+
+        with cache._lock:
+            freed, files_to_delete = cache._prune_lru_for_space(1)
+
+        # Should have pruned the oldest (hash_0)
+        assert len(files_to_delete) >= 1
+        pruned_hashes = [h for h, _ in files_to_delete]
+        assert "hash_0" in pruned_hashes
+        assert freed > 0
+
+        # Files should still exist until caller deletes them
+        for _, fpath in files_to_delete:
+            assert fpath.exists()
+
+        # Clean up
+        for _, fpath in files_to_delete:
+            fpath.unlink(missing_ok=True)
+
+    def test_save_block_triggers_2phase_prune(self, tmp_path: Path):
+        """save_block properly performs 2-phase prune: files deleted outside lock."""
+        cache = SSDCache(cache_dir=tmp_path / "cache", ttl_days=7, max_size_bytes=500)
+
+        # Fill cache to trigger pruning on next save
+        for i in range(5):
+            kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+            cache.save_block(f"old_{i}", kv, num_tokens=4)
+
+        # Make some blocks old so they get pruned
+        for i in range(3):
+            if f"old_{i}" in cache.index:
+                cache.index[f"old_{i}"].last_accessed = datetime.now() - timedelta(days=10)
+
+        # Save a new block — should trigger LRU prune and succeed
+        kv = {"keys": mx.ones((1, 1, 4, 8)), "values": mx.ones((1, 1, 4, 8))}
+        result = cache.save_block("new_block", kv, num_tokens=4)
+        assert result == "saved"
+        assert "new_block" in cache.index

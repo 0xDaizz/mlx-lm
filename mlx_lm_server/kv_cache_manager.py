@@ -993,7 +993,7 @@ class TieredKVCache:
         """Evict LRU blocks from RAM, saving them to SSD first.
 
         Uses 2-phase pattern to avoid holding ram.lock during SSD I/O:
-        Phase 1 (under lock): select candidates, extract data references
+        Phase 1 (under lock): select candidates via eviction heap
         Phase 2 (no lock): save to SSD
         Phase 3 (under lock): re-check and evict confirmed saves from RAM
 
@@ -1004,20 +1004,54 @@ class TieredKVCache:
         Returns:
             List of evicted block_ids.
         """
-        # --- Phase 1: select candidates under lock ---
+        # --- Phase 1: select candidates under lock using heap ---
         candidates_to_save: list[tuple[KVCacheBlock, str, list]] = []
         direct_evict: list[KVCacheBlock] = []
 
         with self.ram.lock:
-            raw_candidates: list[KVCacheBlock] = []
-            for block_hash, block_id in self.ram.hash_table.items():
+            # Rebuild heap if stale entries likely dominate
+            if self.ram._heap_pushes > max(len(self.ram.hash_table) * 2, 100):
+                self.ram._rebuild_eviction_heap()
+
+            selected: list[KVCacheBlock] = []
+            skipped: list[tuple[float, int]] = []
+
+            while len(selected) < num_blocks and self.ram._eviction_heap:
+                ts, block_id = heapq.heappop(self.ram._eviction_heap)
                 block = self.ram.pool.blocks[block_id]
-                if block.ref_count == 0 and (exclude_ids is None or block.block_id not in exclude_ids):
-                    raw_candidates.append(block)
 
-            raw_candidates.sort(key=lambda b: b.last_accessed)
+                # Skip stale entries (same logic as _evict_lru_locked)
+                if block.ref_count != 0:
+                    continue
+                if block.block_hash is None:
+                    continue
+                if block.last_accessed != ts:
+                    continue
+                if exclude_ids is not None and block_id in exclude_ids:
+                    skipped.append((ts, block_id))
+                    continue
 
-            for block in raw_candidates[:num_blocks]:
+                selected.append(block)
+
+            # Re-push skipped (excluded) blocks back onto the heap
+            for entry in skipped:
+                heapq.heappush(self.ram._eviction_heap, entry)
+                self.ram._heap_pushes += 1
+
+            # Fallback: if heap was all stale but there are still evictable blocks
+            if len(selected) < num_blocks:
+                selected_ids = {b.block_id for b in selected}
+                fallback_candidates: list[KVCacheBlock] = []
+                for bh, bid in self.ram.hash_table.items():
+                    block = self.ram.pool.blocks[bid]
+                    if (block.ref_count == 0
+                            and (exclude_ids is None or bid not in exclude_ids)
+                            and bid not in selected_ids):
+                        fallback_candidates.append(block)
+                fallback_candidates.sort(key=lambda b: b.last_accessed)
+                selected.extend(fallback_candidates[:num_blocks - len(selected)])
+
+            for block in selected[:num_blocks]:
                 if (
                     self.ssd is not None
                     and block.kv_data is not None

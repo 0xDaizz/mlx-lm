@@ -2000,3 +2000,137 @@ class TestGetBlockAccessor:
 
         for i in range(config.num_blocks):
             assert mgr.get_block(i) is mgr.pool.blocks[i]
+
+
+# ---------------------------------------------------------------------------
+# evict_to_ssd heap-based candidate selection
+# ---------------------------------------------------------------------------
+
+
+class TestEvictToSSDHeap:
+    """Tests for TieredKVCache.evict_to_ssd() using heap-based LRU selection."""
+
+    def _make_kv_data(self) -> dict[str, mx.array]:
+        return {
+            "keys": mx.random.normal((1, 2, 4, 8)),
+            "values": mx.random.normal((1, 2, 4, 8)),
+        }
+
+    def test_evict_to_ssd_uses_heap_efficiently(self, tmp_path):
+        """Verify evict_to_ssd produces correct LRU ordering via heap.
+
+        Allocates multiple blocks with explicit last_accessed timestamps,
+        evicts a subset, and verifies the oldest blocks are evicted first.
+        """
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        # Allocate 5 blocks with distinct tokens
+        all_tokens = [
+            [1, 2, 3, 4],
+            [5, 6, 7, 8],
+            [9, 10, 11, 12],
+            [13, 14, 15, 16],
+            [17, 18, 19, 20],
+        ]
+
+        all_ids = []
+        for tokens in all_tokens:
+            ids = mgr.allocate_blocks(tokens)
+            assert len(ids) == 1
+            block = mgr.pool.blocks[ids[0]]
+            block.kv_data = self._make_kv_data()
+            all_ids.append(ids[0])
+
+        # Free all blocks so they're evictable
+        mgr.free_blocks(all_ids)
+
+        # Set explicit timestamps: block 0 oldest, block 4 newest
+        for i, bid in enumerate(all_ids):
+            mgr.pool.blocks[bid].last_accessed = 100.0 + i * 100.0
+
+        # Rebuild heap so timestamps are fresh
+        mgr._rebuild_eviction_heap()
+
+        # Save hashes before eviction
+        hashes = [mgr.pool.blocks[bid].block_hash for bid in all_ids]
+
+        # Evict 3 blocks — should pick the 3 oldest (blocks 0, 1, 2)
+        evicted = tiered.evict_to_ssd(num_blocks=3)
+        assert len(evicted) == 3
+
+        # Verify the 3 oldest blocks were evicted
+        assert all_ids[0] in evicted, "Oldest block (ts=100) should be evicted"
+        assert all_ids[1] in evicted, "Second oldest block (ts=200) should be evicted"
+        assert all_ids[2] in evicted, "Third oldest block (ts=300) should be evicted"
+
+        # Newest blocks should still be in RAM
+        assert hashes[3] in mgr.hash_table, "Block 3 should still be in RAM"
+        assert hashes[4] in mgr.hash_table, "Block 4 should still be in RAM"
+
+        # Evicted blocks should be on SSD
+        for i in range(3):
+            assert ssd.has_block(hashes[i]), f"Block {i} should be on SSD"
+
+    def test_evict_to_ssd_respects_exclude_ids_via_heap(self, tmp_path):
+        """evict_to_ssd with heap skips excluded blocks and re-pushes them."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens_a = [1, 2, 3, 4]
+        tokens_b = [5, 6, 7, 8]
+        tokens_c = [9, 10, 11, 12]
+
+        ids_a = mgr.allocate_blocks(tokens_a)
+        ids_b = mgr.allocate_blocks(tokens_b)
+        ids_c = mgr.allocate_blocks(tokens_c)
+
+        for ids in [ids_a, ids_b, ids_c]:
+            mgr.pool.blocks[ids[0]].kv_data = self._make_kv_data()
+
+        mgr.free_blocks(ids_a + ids_b + ids_c)
+
+        # A is oldest, B middle, C newest
+        mgr.pool.blocks[ids_a[0]].last_accessed = 100.0
+        mgr.pool.blocks[ids_b[0]].last_accessed = 200.0
+        mgr.pool.blocks[ids_c[0]].last_accessed = 300.0
+
+        mgr._rebuild_eviction_heap()
+
+        # Protect block A from eviction
+        protected = {ids_a[0]}
+
+        # Evict 2 — should skip A, evict B and C
+        evicted = tiered.evict_to_ssd(num_blocks=2, exclude_ids=protected)
+        assert len(evicted) == 2
+        assert ids_a[0] not in evicted
+        assert ids_b[0] in evicted
+        assert ids_c[0] in evicted
+
+        # Block A should still be in RAM
+        block_a = mgr.pool.blocks[ids_a[0]]
+        assert block_a.block_hash in mgr.hash_table
+
+    def test_evict_to_ssd_heap_fallback(self, tmp_path):
+        """evict_to_ssd falls back to linear scan when heap is empty/stale."""
+        config = make_config(block_size=4, num_blocks=8)
+        mgr = KVCacheManager(config)
+        ssd = SSDCache(cache_dir=tmp_path / "cache")
+        tiered = TieredKVCache(ram=mgr, ssd=ssd)
+
+        tokens = [1, 2, 3, 4]
+        ids = mgr.allocate_blocks(tokens)
+        mgr.pool.blocks[ids[0]].kv_data = self._make_kv_data()
+        mgr.free_blocks(ids)
+
+        # Clear the heap to force fallback path
+        mgr._eviction_heap.clear()
+
+        # Eviction should still work via fallback linear scan
+        evicted = tiered.evict_to_ssd(num_blocks=1)
+        assert len(evicted) == 1
+        assert ids[0] in evicted

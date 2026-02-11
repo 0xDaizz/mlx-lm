@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.server import parse_args
 
 
@@ -264,3 +265,62 @@ class TestParseArgsEnvFallback:
             "--distributed-hostfile", str(cli_file),
         ])
         assert config.distributed_hostfile == str(cli_file)
+
+
+class TestConfigDefaultsMatchCliDefaults:
+    """Config defaults unification: CLI defaults must match ServerConfig defaults."""
+
+    def test_config_defaults_match_cli_defaults(self):
+        """All parse_args defaults should match ServerConfig() defaults."""
+        defaults = ServerConfig()
+        parsed = parse_args([])
+
+        # Fields that have a direct 1:1 mapping between ServerConfig and parse_args
+        fields_to_check = [
+            "model",
+            "host",
+            "port",
+            "max_request_bytes",
+            "block_size",
+            "num_blocks",
+            "kv_bits",
+            "kv_group_size",
+            "ssd_ttl_days",
+            "ssd_enabled",
+            "ssd_policy",
+            "ssd_durability",
+            "ssd_async_writes",
+            "ssd_writer_queue_size",
+            "ssd_persistent_max_retries",
+            "ssd_flush_interval_s",
+            "ssd_max_size_gb",
+            "max_batch_size",
+            "prefill_batch_size",
+            "max_queue_size",
+            "default_max_tokens",
+            "completion_batch_size",
+            "sequence_cache_size",
+            "max_prompt_tokens",
+            "max_generation_tokens",
+            "request_timeout_s",
+            "first_token_timeout_s",
+            "max_concurrent_requests",
+            "memory_pressure_threshold",
+            "distributed_mode",
+            "distributed_sharding",
+            "distributed_strict",
+        ]
+
+        mismatches = []
+        for field in fields_to_check:
+            config_val = getattr(defaults, field)
+            parsed_val = getattr(parsed, field)
+            if config_val != parsed_val:
+                mismatches.append(
+                    f"  {field}: ServerConfig={config_val!r}, parse_args={parsed_val!r}"
+                )
+
+        assert not mismatches, (
+            "CLI defaults diverge from ServerConfig defaults:\n"
+            + "\n".join(mismatches)
+        )

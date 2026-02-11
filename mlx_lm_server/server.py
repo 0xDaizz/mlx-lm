@@ -96,6 +96,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: float = 1.0
     stream: bool = False
     stop: list[str] | str | None = None
+    stream_options: dict | None = None
 
     @field_validator('messages')
     @classmethod
@@ -113,6 +114,7 @@ class CompletionRequest(BaseModel):
     top_p: float = 1.0
     stream: bool = False
     stop: list[str] | str | None = None
+    stream_options: dict | None = None
 
 
 class UsageInfo(BaseModel):
@@ -703,6 +705,10 @@ def create_app(
         )
 
         if body.stream:
+            include_usage = bool(
+                body.stream_options
+                and body.stream_options.get("include_usage")
+            )
             return _stream_response(
                 app.state.scheduler, inf_req, app.state.model_name,
                 request_id, len(prompt_tokens), tok,
@@ -711,6 +717,7 @@ def create_app(
                 first_token_timeout_s=app.state.config.first_token_timeout_s,
                 is_chat=True,
                 executor=_inference_executor,
+                include_usage=include_usage,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_chat_response)
@@ -756,6 +763,10 @@ def create_app(
         )
 
         if body.stream:
+            include_usage = bool(
+                body.stream_options
+                and body.stream_options.get("include_usage")
+            )
             return _stream_response(
                 app.state.scheduler, inf_req, app.state.model_name,
                 request_id, len(prompt_tokens), tok,
@@ -764,6 +775,7 @@ def create_app(
                 first_token_timeout_s=app.state.config.first_token_timeout_s,
                 is_chat=False,
                 executor=_inference_executor,
+                include_usage=include_usage,
             )
 
         return await _do_inference(prompt_tokens, request_id, inf_req, _format_completion_response)
@@ -1069,6 +1081,7 @@ def _stream_response(
     first_token_timeout_s: float | None = None,
     is_chat: bool = False,
     executor: ThreadPoolExecutor | None = None,
+    include_usage: bool = False,
 ) -> StreamingResponse:
     """Unified SSE streaming for both chat and completion endpoints.
 
@@ -1119,6 +1132,7 @@ def _stream_response(
             max_stop_len = max((len(s) for s in stop_sequences), default=0)
             text_buffer = ""
             first_token = True
+            completion_token_count = 0
 
             while True:
                 # C3: use longer timeout for first token (prefill)
@@ -1137,6 +1151,7 @@ def _stream_response(
                 if event is None:
                     break
                 first_token = False
+                completion_token_count += 1
 
                 # C2: Filter EOS token by token_id instead of text comparison
                 token_text = event.token_text
@@ -1191,6 +1206,22 @@ def _stream_response(
                     if event.finish_reason is not None:
                         break
 
+            # Emit usage chunk before [DONE] if stream_options.include_usage is set
+            if include_usage:
+                usage_chunk = {
+                    "id": request_id,
+                    "object": "chat.completion.chunk" if is_chat else "text_completion",
+                    "created": int(time.time()),
+                    "model": model_name,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_token_count,
+                        "total_tokens": prompt_tokens + completion_token_count,
+                    },
+                }
+                yield f"data: {json.dumps(usage_chunk)}\n\n"
+
             yield "data: [DONE]\n\n"
         finally:
             # Always cancel to clean up scheduler resources (stream queue, etc.)
@@ -1213,40 +1244,46 @@ def _stream_response(
 
 
 def parse_args(args: list[str] | None = None) -> ServerConfig:
-    """Parse CLI arguments into a ServerConfig."""
+    """Parse CLI arguments into a ServerConfig.
+
+    CLI defaults are read from a ServerConfig() instance to ensure
+    consistency between the dataclass and argparse definitions.
+    """
     import argparse
 
+    defaults = ServerConfig()
+
     parser = argparse.ArgumentParser(description="mlx-lm-server")
-    parser.add_argument("--model", type=str, default="mlx-community/Qwen3-4B-4bit")
-    parser.add_argument("--adapter-path", type=str, default=None)
-    parser.add_argument("--host", type=str, default="0.0.0.0")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--model", type=str, default=defaults.model)
+    parser.add_argument("--adapter-path", type=str, default=defaults.adapter_path)
+    parser.add_argument("--host", type=str, default=defaults.host)
+    parser.add_argument("--port", type=int, default=defaults.port)
     parser.add_argument("--api-key", type=str, default=os.environ.get("MLX_LM_SERVER_API_KEY"))
     parser.add_argument("--api-key-file", type=str, default=os.environ.get("MLX_LM_SERVER_API_KEY_FILE"))
     parser.add_argument(
         "--max-request-bytes",
         type=int,
-        default=1_048_576,
+        default=defaults.max_request_bytes,
         help="Maximum accepted request body size in bytes",
     )
-    parser.add_argument("--block-size", type=int, default=16)
-    parser.add_argument("--num-blocks", type=int, default=2048)
-    parser.add_argument("--kv-bits", type=int, default=8)
-    parser.add_argument("--kv-group-size", type=int, default=64)
+    parser.add_argument("--block-size", type=int, default=defaults.block_size)
+    parser.add_argument("--num-blocks", type=int, default=defaults.num_blocks)
+    parser.add_argument("--kv-bits", type=int, default=defaults.kv_bits)
+    parser.add_argument("--kv-group-size", type=int, default=defaults.kv_group_size)
     parser.add_argument("--ssd-cache-dir", type=str, default=None)
-    parser.add_argument("--ssd-ttl-days", type=int, default=7)
-    parser.add_argument("--no-ssd", action="store_true", default=False)
+    parser.add_argument("--ssd-ttl-days", type=int, default=defaults.ssd_ttl_days)
+    parser.add_argument("--no-ssd", action="store_true", default=not defaults.ssd_enabled)
     parser.add_argument("--ssd-policy", type=str,
                         choices=["evict_only", "write_through"],
-                        default="evict_only")
+                        default=defaults.ssd_policy)
     parser.add_argument("--ssd-durability", type=str,
                         choices=["best_effort", "persistent"],
-                        default="best_effort")
+                        default=defaults.ssd_durability)
     if hasattr(argparse, "BooleanOptionalAction"):
         parser.add_argument(
             "--ssd-async-writes",
             action=argparse.BooleanOptionalAction,
-            default=True,
+            default=defaults.ssd_async_writes,
         )
     else:
         parser.add_argument(
@@ -1259,45 +1296,45 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
             dest="ssd_async_writes",
             action="store_false",
         )
-        parser.set_defaults(ssd_async_writes=True)
-    parser.add_argument("--ssd-writer-queue-size", type=int, default=512)
-    parser.add_argument("--ssd-persistent-max-retries", type=int, default=3)
-    parser.add_argument("--ssd-flush-interval-s", type=float, default=1.0)
-    parser.add_argument("--ssd-max-size-gb", type=float, default=50.0,
+        parser.set_defaults(ssd_async_writes=defaults.ssd_async_writes)
+    parser.add_argument("--ssd-writer-queue-size", type=int, default=defaults.ssd_writer_queue_size)
+    parser.add_argument("--ssd-persistent-max-retries", type=int, default=defaults.ssd_persistent_max_retries)
+    parser.add_argument("--ssd-flush-interval-s", type=float, default=defaults.ssd_flush_interval_s)
+    parser.add_argument("--ssd-max-size-gb", type=float, default=defaults.ssd_max_size_gb,
                         help="Maximum SSD cache size in GB (0 = unlimited)")
-    parser.add_argument("--max-batch-size", type=int, default=8)
-    parser.add_argument("--prefill-batch-size", type=int, default=4)
-    parser.add_argument("--max-queue-size", type=int, default=128)
-    parser.add_argument("--default-max-tokens", type=int, default=512)
-    parser.add_argument("--completion-batch-size", type=int, default=32)
-    parser.add_argument("--max-kv-size", type=int, default=None)
-    parser.add_argument("--sequence-cache-size", type=int, default=50)
-    parser.add_argument("--max-prompt-tokens", type=int, default=32768)
-    parser.add_argument("--max-generation-tokens", type=int, default=32768)
-    parser.add_argument("--request-timeout-s", type=float, default=120.0)
-    parser.add_argument("--first-token-timeout-s", type=float, default=300.0)
-    parser.add_argument("--max-concurrent-requests", type=int, default=64,
+    parser.add_argument("--max-batch-size", type=int, default=defaults.max_batch_size)
+    parser.add_argument("--prefill-batch-size", type=int, default=defaults.prefill_batch_size)
+    parser.add_argument("--max-queue-size", type=int, default=defaults.max_queue_size)
+    parser.add_argument("--default-max-tokens", type=int, default=defaults.default_max_tokens)
+    parser.add_argument("--completion-batch-size", type=int, default=defaults.completion_batch_size)
+    parser.add_argument("--max-kv-size", type=int, default=defaults.max_kv_size)
+    parser.add_argument("--sequence-cache-size", type=int, default=defaults.sequence_cache_size)
+    parser.add_argument("--max-prompt-tokens", type=int, default=defaults.max_prompt_tokens)
+    parser.add_argument("--max-generation-tokens", type=int, default=defaults.max_generation_tokens)
+    parser.add_argument("--request-timeout-s", type=float, default=defaults.request_timeout_s)
+    parser.add_argument("--first-token-timeout-s", type=float, default=defaults.first_token_timeout_s)
+    parser.add_argument("--max-concurrent-requests", type=int, default=defaults.max_concurrent_requests,
                         help="Max concurrent inference requests (0 = unlimited)")
-    parser.add_argument("--memory-pressure-threshold", type=float, default=0.9,
+    parser.add_argument("--memory-pressure-threshold", type=float, default=defaults.memory_pressure_threshold,
                         help="Reject requests when block utilization >= this (0.0-1.0)")
 
     # Distributed / Tensor Parallel
-    parser.add_argument("--distributed-mode", type=str, default="off",
+    parser.add_argument("--distributed-mode", type=str, default=defaults.distributed_mode,
                         choices=["off", "ring", "jaccl"],
                         help="Distributed backend: off (single-machine), ring, or jaccl (RDMA)")
-    parser.add_argument("--distributed-sharding", type=str, default="tensor",
+    parser.add_argument("--distributed-sharding", type=str, default=defaults.distributed_sharding,
                         choices=["tensor", "pipeline"],
                         help="Sharding strategy: tensor or pipeline")
     if hasattr(argparse, "BooleanOptionalAction"):
         parser.add_argument("--distributed-strict",
-                            action=argparse.BooleanOptionalAction, default=True,
+                            action=argparse.BooleanOptionalAction, default=defaults.distributed_strict,
                             help="Strict distributed init (default: True)")
     else:
         parser.add_argument("--distributed-strict",
                             dest="distributed_strict", action="store_true")
         parser.add_argument("--no-distributed-strict",
                             dest="distributed_strict", action="store_false")
-        parser.set_defaults(distributed_strict=True)
+        parser.set_defaults(distributed_strict=defaults.distributed_strict)
     parser.add_argument("--distributed-hostfile", type=str, default=os.environ.get("MLX_HOSTFILE"),
                         help="Hostfile path for ring backend")
     parser.add_argument("--distributed-ibv-devices", type=str, default=os.environ.get("MLX_IBV_DEVICES"),

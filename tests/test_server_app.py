@@ -2617,3 +2617,142 @@ class TestSRVAuditFixes:
         assert not hasattr(config, "use_distributed"), (
             "use_distributed instance attribute should not exist"
         )
+
+
+# ===========================================================================
+# TestStreamOptionsIncludeUsage — stream_options.include_usage support
+# ===========================================================================
+
+
+class TestStreamOptionsIncludeUsage:
+    """OpenAI stream_options.include_usage compliance tests."""
+
+    @pytest.fixture
+    def mock_scheduler(self):
+        return MockSchedulerForApp()
+
+    @pytest.fixture
+    def tokenizer(self):
+        return SimpleTokenizer()
+
+    @pytest.fixture
+    def config(self, tmp_path):
+        return ServerConfig(
+            model="mlx-community/Qwen3-4B-4bit",
+            block_size=4,
+            num_blocks=64,
+            ssd_cache_dir=tmp_path / "ssd-cache",
+            max_batch_size=2,
+            max_queue_size=8,
+        )
+
+    @pytest.fixture
+    def app(self, config, mock_scheduler, tokenizer):
+        return create_app(config=config, scheduler=mock_scheduler, tokenizer=tokenizer)
+
+    @pytest.fixture
+    async def client(self, app):
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as ac:
+            yield ac
+
+    @pytest.mark.anyio
+    async def test_streaming_chat_with_include_usage(self, client):
+        """stream_options.include_usage emits a usage chunk before [DONE] for chat."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 50,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        assert resp.status_code == 200
+
+        chunks, has_done = _parse_sse_body(resp.text)
+        assert has_done, "Stream must end with [DONE]"
+
+        # The last chunk (before [DONE]) should be the usage chunk
+        usage_chunk = chunks[-1]
+        assert usage_chunk["choices"] == [], "Usage chunk must have empty choices"
+        assert "usage" in usage_chunk, "Usage chunk must contain 'usage' field"
+        usage = usage_chunk["usage"]
+        assert "prompt_tokens" in usage
+        assert "completion_tokens" in usage
+        assert "total_tokens" in usage
+        assert usage["completion_tokens"] == 4  # MockSchedulerForApp produces 4 tokens
+        assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        assert usage_chunk["object"] == "chat.completion.chunk"
+        assert usage_chunk["id"].startswith("chatcmpl-")
+
+    @pytest.mark.anyio
+    async def test_streaming_completion_with_include_usage(self, client):
+        """stream_options.include_usage emits a usage chunk before [DONE] for completions."""
+        resp = await client.post(
+            "/v1/completions",
+            json={
+                "prompt": "Once upon a time",
+                "max_tokens": 50,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
+        )
+        assert resp.status_code == 200
+
+        chunks, has_done = _parse_sse_body(resp.text)
+        assert has_done, "Stream must end with [DONE]"
+
+        # The last chunk should be the usage chunk
+        usage_chunk = chunks[-1]
+        assert usage_chunk["choices"] == [], "Usage chunk must have empty choices"
+        assert "usage" in usage_chunk
+        usage = usage_chunk["usage"]
+        assert usage["completion_tokens"] == 4
+        assert usage["total_tokens"] == usage["prompt_tokens"] + usage["completion_tokens"]
+        assert usage_chunk["object"] == "text_completion"
+        assert usage_chunk["id"].startswith("cmpl-")
+
+    @pytest.mark.anyio
+    async def test_streaming_without_include_usage(self, client):
+        """Without stream_options, no usage chunk is emitted (backward compat)."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 50,
+                "stream": True,
+            },
+        )
+        assert resp.status_code == 200
+
+        chunks, has_done = _parse_sse_body(resp.text)
+        assert has_done
+
+        # No chunk should have empty choices (which is the usage chunk signature)
+        for chunk in chunks:
+            assert chunk["choices"] != [], (
+                "Without stream_options.include_usage, no usage chunk should be emitted"
+            )
+
+    @pytest.mark.anyio
+    async def test_streaming_with_include_usage_false(self, client):
+        """stream_options with include_usage=false should not emit usage chunk."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hi"}],
+                "max_tokens": 50,
+                "stream": True,
+                "stream_options": {"include_usage": False},
+            },
+        )
+        assert resp.status_code == 200
+
+        chunks, has_done = _parse_sse_body(resp.text)
+        assert has_done
+
+        for chunk in chunks:
+            assert chunk["choices"] != [], (
+                "With include_usage=false, no usage chunk should be emitted"
+            )

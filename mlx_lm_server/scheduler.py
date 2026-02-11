@@ -218,12 +218,11 @@ class Scheduler:
         self._ssd_last_prune_time: float = time.time()
         self._ssd_prune_time_interval: float = 3600.0  # Prune at most every 1 hour
 
-        # Track UIDs inserted without cache for early prefill save (G2)
-        # After the first decode step, prefill KV data may be available in
-        # the BatchGenerator's internal caches for these sequences.
-        # TODO: Implement _save_prefill_caches() once BatchGenerator exposes
-        # a public API for accessing per-sequence KV data mid-generation.
-        # Currently BatchGenerator._caches is private and format-dependent.
+        # G2 Prefill Early Save (DEFERRED -- blocked on upstream MLX API)
+        # _pending_cache_saves tracks UIDs with cache misses that would benefit
+        # from early prefill save. Implementation requires BatchGenerator to
+        # expose cache extraction between prefill and decode phases.
+        # Monitor: https://github.com/ml-explore/mlx-lm/issues/548
         self._pending_cache_saves: set[int] = set()
 
         # Cache effectiveness counters

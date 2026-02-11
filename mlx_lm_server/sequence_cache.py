@@ -40,20 +40,35 @@ def _clone_cache_list(cache_list: list) -> list:
     """Create an independent copy of a KV cache list.
 
     Plain KVCache objects (with keys/values mx.arrays and no group_size)
-    get a fast slice-based clone. Everything else (QuantizedKVCache,
-    CacheList, dict, etc.) falls back to copy.deepcopy.
+    get a fast slice-based clone. QuantizedKVCache objects (with group_size
+    and tuple-of-3 keys/values) also get a fast slice-based clone.
+    Everything else (CacheList, dict, etc.) falls back to copy.deepcopy.
     """
     cloned = []
     for obj in cache_list:
-        # Plain KVCache fast path: has keys/values/offset, no group_size
         if (hasattr(obj, 'keys') and hasattr(obj, 'values')
-                and hasattr(obj, 'offset') and not hasattr(obj, 'group_size')):
-            new_obj = copy.copy(obj)
-            new_obj.keys = obj.keys[:, :, :obj.offset, :]
-            new_obj.values = obj.values[:, :, :obj.offset, :]
-            cloned.append(new_obj)
+                and hasattr(obj, 'offset')):
+            if hasattr(obj, 'group_size'):
+                # QuantizedKVCache fast path: keys/values are each a tuple
+                # of 3 arrays (quantized_data, scales, biases).
+                # Slice each component up to offset along the sequence axis.
+                try:
+                    off = obj.offset
+                    new_obj = copy.copy(obj)
+                    new_obj.keys = tuple(a[:, :, :off, :] for a in obj.keys)
+                    new_obj.values = tuple(a[:, :, :off, :] for a in obj.values)
+                    cloned.append(new_obj)
+                except Exception:
+                    # Structure mismatch — fall back to deepcopy for safety
+                    cloned.append(copy.deepcopy(obj))
+            else:
+                # Plain KVCache fast path: keys/values are single mx.arrays
+                new_obj = copy.copy(obj)
+                new_obj.keys = obj.keys[:, :, :obj.offset, :]
+                new_obj.values = obj.values[:, :, :obj.offset, :]
+                cloned.append(new_obj)
         else:
-            # QuantizedKVCache, CacheList, dict, etc. — deepcopy fallback
+            # CacheList, dict, etc. — deepcopy fallback
             cloned.append(copy.deepcopy(obj))
     return cloned
 

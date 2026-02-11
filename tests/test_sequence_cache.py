@@ -313,3 +313,148 @@ class TestDeadCodeBranch:
         result, remaining = store.find_longest_prefix([1, 2, 3])
         assert result is not None
         assert remaining == []
+
+
+# ---------------------------------------------------------------------------
+# QuantizedKVCache fast-path clone tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeQuantizedKVCacheFull:
+    """Mock QuantizedKVCache with tuple-of-3 keys/values (data, scales, biases).
+
+    Uses realistic dimensions: D=128 so that D//el_per_int and D//group_size
+    produce non-zero values matching real QuantizedKVCache layout.
+    """
+
+    def __init__(self, offset, group_size=64, bits=8):
+        import mlx.core as mx
+        B, H, S, D = 1, 2, 16, 128
+        el_per_int = 8 * 4 // bits  # mx.uint32 size = 4 bytes
+        gs = group_size
+        self.offset = offset
+        self.group_size = group_size
+        self.bits = bits
+        # keys = (quantized_data, scales, biases)
+        self.keys = (
+            mx.zeros((B, H, S, D // el_per_int), dtype=mx.uint32),
+            mx.ones((B, H, S, D // gs), dtype=mx.float16),
+            mx.full((B, H, S, D // gs), 0.5, dtype=mx.float16),
+        )
+        self.values = (
+            mx.zeros((B, H, S, D // el_per_int), dtype=mx.uint32),
+            mx.ones((B, H, S, D // gs), dtype=mx.float16),
+            mx.full((B, H, S, D // gs), 0.5, dtype=mx.float16),
+        )
+
+
+class TestCloneQuantizedCacheFastPath:
+    """Tests for QuantizedKVCache fast-path in _clone_cache_list."""
+
+    def test_clone_quantized_cache_fast_path(self):
+        """QuantizedKVCache-like objects are cloned via slice, not deepcopy."""
+        import mlx.core as mx
+
+        obj = _FakeQuantizedKVCacheFull(offset=10, group_size=64, bits=8)
+        original_keys_shapes = [obj.keys[i].shape for i in range(3)]
+
+        cloned = _clone_cache_list([obj])
+        assert len(cloned) == 1
+        c = cloned[0]
+
+        # Clone should be a different object
+        assert c is not obj
+
+        # keys/values tuples should be new tuples
+        assert c.keys is not obj.keys
+        assert c.values is not obj.values
+
+        # Each component should be sliced to offset=10
+        for i in range(3):
+            assert c.keys[i].shape[2] == 10, f"keys[{i}] seq dim should be 10"
+            assert c.values[i].shape[2] == 10, f"values[{i}] seq dim should be 10"
+
+        # Original should be unchanged (each component has its own shape)
+        for i in range(3):
+            assert obj.keys[i].shape == original_keys_shapes[i]
+
+        # Attributes preserved
+        assert c.offset == 10
+        assert c.group_size == 64
+        assert c.bits == 8
+
+    def test_clone_quantized_cache_independence(self):
+        """Modifying original does not affect cloned QuantizedKVCache."""
+        import mlx.core as mx
+
+        obj = _FakeQuantizedKVCacheFull(offset=8, group_size=64, bits=8)
+        cloned = _clone_cache_list([obj])
+        c = cloned[0]
+
+        # Mutate original offset
+        obj.offset = 999
+
+        # Clone should be unaffected (copy.copy copies scalar attrs)
+        # Note: copy.copy shares scalars by value for int, so offset
+        # won't be affected by reassignment on the original
+        assert c.offset == 8
+
+        # The sliced arrays should be independent views
+        assert c.keys[0].shape[2] == 8
+        assert obj.keys[0].shape[2] == 16  # original untouched
+
+    def test_clone_quantized_cache_fallback(self):
+        """Objects with group_size but unexpected keys structure fall back to deepcopy."""
+
+        class _BrokenQuantized:
+            def __init__(self):
+                self.keys = "not_a_tuple"  # Unexpected structure
+                self.values = "not_a_tuple"
+                self.offset = 4
+                self.group_size = 64
+                self.bits = 8
+
+        obj = _BrokenQuantized()
+        # Should not raise — falls back to deepcopy
+        cloned = _clone_cache_list([obj])
+        assert len(cloned) == 1
+        assert cloned[0] is not obj
+        assert cloned[0].group_size == 64
+
+    def test_clone_plain_cache_still_works(self):
+        """Regression: plain KVCache clone still works after QuantizedKVCache changes."""
+        import mlx.core as mx
+
+        keys = mx.zeros((1, 2, 8, 4))
+        values = mx.ones((1, 2, 8, 4))
+        obj = _FakePlainKVCache(keys, values, offset=6)
+
+        cloned = _clone_cache_list([obj])
+        assert len(cloned) == 1
+        c = cloned[0]
+
+        assert c is not obj
+        assert c.keys.shape == (1, 2, 6, 4)
+        assert c.values.shape == (1, 2, 6, 4)
+        assert c.offset == 6
+
+    def test_clone_mixed_plain_and_quantized(self):
+        """Mixed list of plain and quantized caches handled correctly."""
+        import mlx.core as mx
+
+        plain = _FakePlainKVCache(
+            mx.zeros((1, 2, 8, 4)), mx.ones((1, 2, 8, 4)), offset=4
+        )
+        quant = _FakeQuantizedKVCacheFull(offset=6, group_size=64, bits=8)
+
+        cloned = _clone_cache_list([plain, quant])
+        assert len(cloned) == 2
+
+        # Plain should be sliced
+        assert cloned[0].keys.shape == (1, 2, 4, 4)
+        assert not hasattr(cloned[0], 'group_size')
+
+        # Quantized should be sliced
+        for i in range(3):
+            assert cloned[1].keys[i].shape[2] == 6
+        assert cloned[1].group_size == 64
