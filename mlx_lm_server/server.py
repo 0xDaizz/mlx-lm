@@ -667,14 +667,15 @@ def create_app(
 
         result = _format_chat_messages(body.messages, tok, tokenize=True)
         # Handle transformers >= 5.0 BatchEncoding (dict-like with 'input_ids')
+        prompt_tokens: list[int]
         if isinstance(result, list):
-            prompt_tokens: list[int] = result
+            prompt_tokens = result
         elif hasattr(result, 'input_ids'):
             prompt_tokens = result['input_ids']
             if not isinstance(prompt_tokens, list):
                 prompt_tokens = list(prompt_tokens)
         else:
-            prompt_tokens: list[int] = _safe_encode(tok, result)
+            prompt_tokens = _safe_encode(tok, result)
         request_id = _make_request_id()
 
         params = _validate_and_prepare_request(

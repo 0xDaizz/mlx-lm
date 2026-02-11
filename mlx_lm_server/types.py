@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -55,6 +56,10 @@ class SequenceState:
     finish_reason: str | None = None
     output_text: str = ""
     output_tokens: list[int] = field(default_factory=list)
+    # Set by scheduler when detokenizer is available
+    _detokenizer: Any = None
+    # Batch UID assigned by BatchGenerator.insert()
+    _batch_uid: int | None = None
 
 
 @dataclass

@@ -1166,7 +1166,6 @@ class Scheduler:
 
         for req in new_requests:
             seq = None
-            allocated_block_ids: list[int] = []
             try:
                 seq = self._init_sequence(req)
 
@@ -1195,7 +1194,6 @@ class Scheduler:
                             seq.token_ids[:num_cached]
                         )
                         seq.block_ids = block_ids
-                        allocated_block_ids = block_ids
                         # D1+G1: Validate all blocks before reconstruction
                         try:
                             block_data = []

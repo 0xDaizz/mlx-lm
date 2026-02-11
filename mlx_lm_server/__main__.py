@@ -165,6 +165,7 @@ def main() -> None:
                 if config.ssd_policy == "write_through" and config.ssd_async_writes:
                     from mlx_lm_server.ssd_writer import SSDWriterThread
 
+                    assert ssd_cache is not None  # guaranteed by ssd_enabled check above
                     ssd_writer = SSDWriterThread(
                         ssd=ssd_cache,
                         queue_size=config.ssd_writer_queue_size,
