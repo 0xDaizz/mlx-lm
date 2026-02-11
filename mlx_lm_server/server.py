@@ -1592,6 +1592,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "spec_decode_ngram_prompt_lookup": parsed.ngram_prompt_lookup,
         "spec_decode_draft_model": parsed.draft_model_path,
         "spec_decode_draft_quantize": parsed.draft_model_quantize,
+        "spec_decode_draft_context_len": parsed.draft_context_len,
         "spec_decode_dynamic": parsed.spec_decode_dynamic,
         "spec_decode_acceptance_threshold": parsed.spec_decode_acceptance_threshold,
         "spec_decode_adaptive_k": parsed.adaptive_k,

@@ -306,17 +306,33 @@ class Scheduler:
                     ngram_prompt_lookup=config.spec_decode_ngram_prompt_lookup,
                     draft_model_path=config.spec_decode_draft_model,
                     draft_model_quantize=config.spec_decode_draft_quantize,
+                    draft_context_len=config.spec_decode_draft_context_len,
                     dynamic_enabled=config.spec_decode_dynamic,
                     acceptance_rate_threshold=config.spec_decode_acceptance_threshold,
                     adaptive_k=config.spec_decode_adaptive_k,
                 )
                 spec_config.validate()
 
-                proposer = create_proposer(spec_config, target_model=self.model)
+                # D6: draft_model_quantize is ignored in Phase 2
+                if spec_config.draft_model_quantize:
+                    logger.warning(
+                        "--draft-model-quantize is ignored in Phase 2. "
+                        "Use a pre-quantized model path instead (e.g., Qwen3-0.6B-4bit)."
+                    )
+
+                proposer = create_proposer(
+                    spec_config,
+                    target_model=self.model,
+                    target_tokenizer=self.tokenizer,
+                )
                 verifier = NGramVerifier(mode="greedy")  # Phase 1: greedy only
                 controller = DynamicSpecController(spec_config)
 
                 if proposer is not None:
+                    # D7: load draft model and validate vocab compatibility
+                    if spec_config.mode == "draft":
+                        proposer.load(target_tokenizer=self.tokenizer)
+
                     self._spec_engine = SpecDecodeEngine(
                         model=self.model,
                         batch_generator=self._batch_generator,
