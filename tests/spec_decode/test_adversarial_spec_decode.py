@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List
 
 import mlx.core as mx
 import pytest
@@ -762,7 +762,6 @@ class TestEngineAdversarial:
     def test_stop_token_in_first_accepted_token(self):
         """Stop token is the very first accepted token."""
         vocab_size = 200
-        k = 3
 
         draft_tokens = mx.array([[10, 11, 12]], dtype=mx.int32)
         proposal = ProposalResult(
@@ -797,7 +796,6 @@ class TestEngineAdversarial:
     def test_max_tokens_reached_during_spec(self):
         """max_tokens is reached partway through accepted tokens."""
         vocab_size = 200
-        k = 3
 
         draft_tokens = mx.array([[10, 11, 12]], dtype=mx.int32)
         proposal = ProposalResult(
@@ -827,7 +825,6 @@ class TestEngineAdversarial:
     def test_all_sequences_rejected_cache_rollback(self):
         """All sequences reject all drafts -> maximum cache rollback."""
         vocab_size = 200
-        k = 3
 
         # Draft tokens don't match target
         draft_tokens = mx.array([[90, 91, 92]], dtype=mx.int32)
@@ -887,7 +884,6 @@ class TestEngineAdversarial:
         """After speculative_step, batch.y should be an mx.array
         with correct values for all sequences."""
         vocab_size = 200
-        k = 2
 
         draft_tokens = mx.array([[10, 11], [20, 21]], dtype=mx.int32)
         proposal = ProposalResult(
@@ -912,7 +908,7 @@ class TestEngineAdversarial:
 
         engine, bg = _make_engine(batch=batch, model_logits=logits, proposal=proposal)
         seqs = [MockSequenceState("r0"), MockSequenceState("r1")]
-        responses = engine.speculative_step(seqs)
+        engine.speculative_step(seqs)
 
         # batch.y should be mx.array, not a Python list
         assert isinstance(batch.y, mx.array)
@@ -1297,7 +1293,6 @@ class TestPerSequenceTrimAdversarial:
         """When all sequences accept the same number of tokens,
         Result A and Result B should produce identical outputs."""
         vocab_size = 200
-        k = 3
 
         # Both sequences accept all 3 drafts
         draft_tokens = mx.array([[10, 11, 12], [20, 21, 22]], dtype=mx.int32)
@@ -1357,7 +1352,6 @@ class TestPerSequenceTrimAdversarial:
         """One seq accepts all k, another accepts 0.
         Result A: seq0 gets k+1 tokens, seq1 gets 1."""
         vocab_size = 200
-        k = 3
 
         draft_tokens = mx.array([
             [10, 11, 12],
@@ -1400,7 +1394,6 @@ class TestPerSequenceTrimAdversarial:
     def test_single_sequence_result_a_matches_b(self):
         """With batch_size=1, Result A and B produce identical output."""
         vocab_size = 200
-        k = 3
 
         draft_tokens = mx.array([[10, 77, 78]], dtype=mx.int32)
         proposal = ProposalResult(
@@ -1444,7 +1437,6 @@ class TestPerSequenceTrimAdversarial:
     def test_zero_acceptance_all_sequences(self):
         """All sequences accept 0 tokens — each gets 1 correction token."""
         vocab_size = 200
-        k = 3
 
         # All draft tokens mismatch
         draft_tokens = mx.array([
@@ -1488,7 +1480,6 @@ class TestPerSequenceTrimAdversarial:
     def test_all_k_accepted(self):
         """All sequences accept all k tokens — no trim needed."""
         vocab_size = 200
-        k = 3
 
         draft_tokens = mx.array([
             [10, 11, 12],
@@ -1529,7 +1520,6 @@ class TestPerSequenceTrimAdversarial:
     def test_proposal_lens_zero_with_result_a(self):
         """Sequence with proposal_lens=0 still gets 1 token via fallback."""
         vocab_size = 200
-        k = 3
 
         # Seq 0 has proposals, Seq 1 has none
         draft_tokens = mx.array([

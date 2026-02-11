@@ -6,13 +6,10 @@ Covers linear search, suffix index, batched propose(), and edge cases.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import mlx.core as mx
-import pytest
 
 from mlx_lm_server.spec_decode.proposer.ngram import NGramProposer
-from mlx_lm_server.spec_decode.proposer.base import ProposalResult
 
 
 # ---------------------------------------------------------------------------

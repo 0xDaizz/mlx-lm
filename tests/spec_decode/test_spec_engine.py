@@ -8,10 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import mlx.core as mx
-import pytest
 
 from mlx_lm_server.spec_decode.config import SpecDecodeConfig
 from mlx_lm_server.spec_decode.controller import DynamicSpecController
@@ -673,7 +672,6 @@ class TestTargetForward:
 
     def test_temperature_zero_no_scaling(self):
         """temp=0: logits passed through without division."""
-        vocab = 10
         logits = mx.array([[[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
         batch = MockBatch(
             uids=[0],
@@ -692,7 +690,6 @@ class TestTargetForward:
 
     def test_temperature_scaling_applied(self):
         """temp>0: logits are divided by temperature before softmax."""
-        vocab = 10
         logits = mx.array([[[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]]])
         batch = MockBatch(
             uids=[0],
@@ -754,7 +751,6 @@ class TestSpeculativeStep:
     def test_full_step_single_sequence_greedy(self):
         """Full speculative step with 1 sequence, all drafts accepted."""
         vocab_size = 200
-        k = 3
 
         # Draft tokens that match the target model argmax
         draft_tokens = mx.array([[10, 11, 12]], dtype=mx.int32)
@@ -810,7 +806,6 @@ class TestSpeculativeStep:
     def test_full_step_partial_acceptance(self):
         """Full step with partial acceptance: 1 of 3 drafts accepted."""
         vocab_size = 200
-        k = 3
 
         # Draft tokens: only first matches target argmax
         draft_tokens = mx.array([[10, 77, 78]], dtype=mx.int32)
@@ -891,7 +886,6 @@ class TestSpeculativeStep:
         Result A: each sequence keeps its own accepted tokens.
         """
         vocab_size = 200
-        k = 3
 
         # Seq 0: all match, Seq 1: first mismatch
         draft_tokens = mx.array([

@@ -145,6 +145,7 @@ def create_proposer(
         )
     elif config.mode == "draft":
         from mlx_lm_server.spec_decode.proposer.draft_model import DraftModelProposer
+        assert config.draft_model_path is not None  # validated by SpecDecodeConfig.validate()
         return DraftModelProposer(
             model_path=config.draft_model_path,
             context_len=config.draft_context_len,

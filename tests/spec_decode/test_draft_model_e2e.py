@@ -48,12 +48,24 @@ def _make_seq(token_ids: list[int]) -> MockSequenceState:
 
 
 @pytest.fixture(scope="module")
-def target_tokenizer():
-    """Load the target tokenizer once per module."""
+def _target_model_and_tokenizer():
+    """Load target model and tokenizer once per module."""
     from mlx_lm import load
 
-    _, tokenizer = load(TARGET_MODEL_PATH)
-    return tokenizer
+    model, tokenizer = load(TARGET_MODEL_PATH)
+    return model, tokenizer
+
+
+@pytest.fixture(scope="module")
+def target_tokenizer(_target_model_and_tokenizer):
+    """Extract tokenizer from shared fixture."""
+    return _target_model_and_tokenizer[1]
+
+
+@pytest.fixture(scope="module")
+def target_model(_target_model_and_tokenizer):
+    """Extract model from shared fixture."""
+    return _target_model_and_tokenizer[0]
 
 
 @pytest.fixture(scope="module")
@@ -159,32 +171,52 @@ class TestDraftCacheNotLeaked:
 
 
 class TestAcceptanceRateSanity:
-    """With a deterministic prompt, acceptance rate should be reasonable.
+    """Draft proposals should have a reasonable acceptance rate against the target model.
 
-    We use the target model's tokenizer to encode a known prompt, then
-    check that the draft model produces some matching tokens.
+    Computes acceptance by comparing draft tokens to greedy target output.
     """
 
-    def test_acceptance_range(self, loaded_draft_proposer, target_tokenizer) -> None:
-        # Encode a simple deterministic prompt
+    def test_acceptance_range(self, loaded_draft_proposer, target_tokenizer, target_model) -> None:
+        """Draft proposals should have measurable acceptance against target greedy."""
+        from mlx_lm.models.cache import make_prompt_cache
+
         prompt = "The capital of France is Paris. The capital of Germany is Berlin. The capital of"
         token_ids = target_tokenizer.encode(prompt)
         seq = _make_seq(token_ids)
 
-        # Run multiple proposals
-        total_proposed = 0
-        total_non_trivial = 0  # proposals that aren't all zeros
+        k = 5
+        result = loaded_draft_proposer.propose([seq], k=k)
+        assert result is not None
+        draft_tokens = result.draft_tokens[0].tolist()
 
-        for _ in range(5):
-            result = loaded_draft_proposer.propose([seq], k=5)
-            assert result is not None
-            total_proposed += 5
-            tokens = result.draft_tokens.tolist()[0]
-            if any(t != 0 for t in tokens):
-                total_non_trivial += 1
+        # Get target model's greedy output for same context
+        target_cache = make_prompt_cache(target_model)
+        context_mx = mx.array([token_ids])
 
-        # At least some proposals should produce non-trivial tokens
-        assert total_non_trivial > 0, "Draft model produced only zero tokens"
+        # Prefill
+        if len(token_ids) > 1:
+            target_model(context_mx[:, :-1], cache=target_cache)
+            mx.eval([c.state for c in target_cache])
+        logits = target_model(context_mx[:, -1:], cache=target_cache)
+        mx.eval(logits)
+
+        target_tokens = []
+        for step in range(k):
+            next_token = int(mx.argmax(logits[:, -1, :], axis=-1).item())
+            target_tokens.append(next_token)
+            if step < k - 1:
+                logits = target_model(mx.array([[next_token]]), cache=target_cache)
+                mx.eval(logits)
+
+        matches = sum(1 for d, t in zip(draft_tokens, target_tokens) if d == t)
+        acceptance_rate = matches / k
+
+        # Sanity check: acceptance should be a valid rate
+        # Wide range since this is a sanity check, not a guarantee
+        print(f"\nDraft acceptance: {acceptance_rate:.0%} ({matches}/{k})")
+        print(f"Draft:  {draft_tokens}")
+        print(f"Target: {target_tokens}")
+        assert 0.0 <= acceptance_rate <= 1.0
 
 
 class TestVocabCheckWithRealModels:

@@ -7,7 +7,7 @@ at high batch sizes or when acceptance rate is low.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict
 
 from mlx_lm_server.spec_decode.config import SpecDecodeConfig

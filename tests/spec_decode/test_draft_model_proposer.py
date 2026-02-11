@@ -54,7 +54,6 @@ class MockDraftModel:
         # Return logits where token 42 always has the highest score
         logits = mx.zeros((B, S, self.vocab_size))
         # Set token 42 to high value
-        indices = mx.array([42])
         for b in range(B):
             for s in range(S):
                 logits = logits.at[b, s, 42].add(mx.array(10.0))

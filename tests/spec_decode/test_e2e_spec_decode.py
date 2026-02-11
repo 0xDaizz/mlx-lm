@@ -7,18 +7,13 @@ unit-level tests and optionally real model for integration tests.
 
 from __future__ import annotations
 
-import queue
-import threading
-import time
 from dataclasses import dataclass
-from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.scheduler import Scheduler
-from mlx_lm_server.types import InferenceRequest, SequenceState, TokenEvent
+from mlx_lm_server.types import InferenceRequest, SequenceState
 
 
 # ---------------------------------------------------------------------------

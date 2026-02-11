@@ -10,7 +10,6 @@ GATE Result:
 """
 
 import os
-import sys
 
 import mlx.core as mx
 import pytest
@@ -565,7 +564,6 @@ class TestGateDecision:
 
         prompt = "The quick brown fox"
         tokens = mx.array([tokenizer.encode(prompt)])  # [1, seq_len]
-        seq_len = tokens.shape[1]
 
         # Path A: prefill + 1 decode + 3 multi-token + trim 3 + 1 decode
         cache_a = self._make_batch_cache(model, [0])
@@ -650,7 +648,7 @@ class TestGateDecision:
         ind_argmax_1 = mx.argmax(ind_logits_1[:, -1, :], axis=-1).item()
         mx.eval(ind_logits_1)
 
-        print(f"\nBatch vs Individual prefill:")
+        print("\nBatch vs Individual prefill:")
         print(f"  Seq 0: batch={batch_argmax[0].item()}, ind={ind_argmax_0}")
         print(f"  Seq 1: batch={batch_argmax[1].item()}, ind={ind_argmax_1}")
 
@@ -690,7 +688,6 @@ class TestCanPerSeqTrim:
                 ]
 
         # Simulate CacheList by registering it where the check looks
-        layers = [MockCacheList()]
         # The check uses hasattr fallback (getattr 'caches') since
         # MockCacheList is not from mlx_lm.models.cache
         # All children have trim_per_sequence, but the parent MockCacheList
