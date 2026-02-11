@@ -218,11 +218,11 @@ class Scheduler:
         self._ssd_last_prune_time: float = time.time()
         self._ssd_prune_time_interval: float = 3600.0  # Prune at most every 1 hour
 
-        # G2 Prefill Early Save (DEFERRED -- blocked on upstream MLX API)
-        # _pending_cache_saves tracks UIDs with cache misses that would benefit
-        # from early prefill save. Implementation requires BatchGenerator to
-        # expose cache extraction between prefill and decode phases.
-        # Monitor: https://github.com/ml-explore/mlx-lm/issues/548
+        # G2 Prefill Cache Salvage: tracks UIDs with cache misses during insert.
+        # When these UIDs are cancelled or timed out, their prefill KV caches
+        # are extracted via BatchGenerator.remove(return_prompt_caches=True)
+        # and saved to sequence cache + block-level cache, so the prefill
+        # computation is not wasted and can be reused by future requests.
         self._pending_cache_saves: set[int] = set()
 
         # Cache effectiveness counters
@@ -1076,7 +1076,18 @@ class Scheduler:
                     logger.warning("SSD pruning failed: %s", e)
 
     def _process_cancellations_batch(self) -> None:
-        """Remove cancelled requests from BatchGenerator."""
+        """Remove cancelled requests from BatchGenerator.
+
+        G2: When removing cancelled UIDs, extract prompt caches via
+        return_prompt_caches=True. For UIDs that had cache misses during
+        prefill (_pending_cache_saves), store the extracted caches to the
+        sequence cache and block-level cache. This preserves prefill
+        computation so future requests with overlapping prefixes can reuse it.
+
+        All cache extraction happens on the inference thread (this method is
+        called from _batch_inference_step), which is safe because
+        BatchGenerator.remove() is not thread-safe.
+        """
         with self._cancelled_lock:
             cancelled = set(self._cancelled)
 
@@ -1086,11 +1097,43 @@ class Scheduler:
             if uid is not None:
                 uids_to_remove.append(uid)
 
+        # G2: Extract prompt caches before removing from batch.
+        # Only request caches if there are UIDs worth saving (had cache misses).
+        salvageable_uids = self._pending_cache_saves & set(uids_to_remove)
+        returned_caches: dict[int, list] = {}
+
         if uids_to_remove:
             try:
-                self._batch_generator.remove(uids_to_remove)
+                if salvageable_uids:
+                    caches = self._batch_generator.remove(
+                        uids_to_remove, return_prompt_caches=True
+                    )
+                    if caches:
+                        # Only keep caches for UIDs that had cache misses
+                        returned_caches = {
+                            uid: cache
+                            for uid, cache in caches.items()
+                            if uid in salvageable_uids
+                        }
+                else:
+                    self._batch_generator.remove(uids_to_remove)
             except Exception as e:
                 logger.warning("Failed to remove cancelled UIDs: %s", e)
+
+        # G2: Store salvaged caches BEFORE cleaning up UID mappings and
+        # active sequences, because _store_finished_caches reads both
+        # _uid_to_request_id and _active_sequences.
+        if returned_caches:
+            try:
+                self._store_finished_caches(returned_caches)
+                logger.debug(
+                    "G2: Salvaged %d prefill caches from cancelled requests",
+                    len(returned_caches),
+                )
+            except Exception as e:
+                logger.warning(
+                    "G2: Failed to store salvaged caches from cancelled requests: %s", e
+                )
 
         # Clean up mappings and signal finish
         for rid in cancelled:

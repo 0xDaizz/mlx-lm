@@ -767,3 +767,64 @@ class TestPruneLruForSpace2Phase:
         result = cache.save_block("new_block", kv, num_tokens=4)
         assert result == "saved"
         assert "new_block" in cache.index
+
+
+class TestSSDMaxSizeGBWiring:
+    """D-06: Verify ssd_max_size_gb from ServerConfig is correctly wired to SSDCache."""
+
+    def test_ssd_max_size_gb_default_converts_to_bytes(self):
+        """Default ssd_max_size_gb=50.0 converts to 50 * 1024^3 bytes."""
+        from mlx_lm_server.config import ServerConfig
+
+        config = ServerConfig()
+        assert config.ssd_max_size_gb == 50.0
+        expected_bytes = int(50.0 * (1024 ** 3))
+        # Replicate the conversion from __main__.py
+        max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
+        assert max_size_bytes == expected_bytes
+        assert max_size_bytes == 53687091200
+
+    def test_ssd_max_size_gb_zero_means_unlimited(self):
+        """ssd_max_size_gb=0 should produce max_size_bytes=0 (unlimited)."""
+        from mlx_lm_server.config import ServerConfig
+
+        config = ServerConfig(ssd_max_size_gb=0)
+        max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
+        assert max_size_bytes == 0
+
+    def test_ssd_max_size_gb_custom_value(self):
+        """Custom ssd_max_size_gb=10.5 converts correctly."""
+        from mlx_lm_server.config import ServerConfig
+
+        config = ServerConfig(ssd_max_size_gb=10.5)
+        max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
+        expected = int(10.5 * (1024 ** 3))
+        assert max_size_bytes == expected
+
+    def test_ssd_cache_receives_max_size_bytes(self, tmp_path: Path):
+        """SSDCache constructed with converted max_size_bytes has correct _max_size_bytes."""
+        from mlx_lm_server.config import ServerConfig
+
+        config = ServerConfig(ssd_max_size_gb=5.0)
+        max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
+        cache = SSDCache(
+            cache_dir=tmp_path / "cache",
+            ttl_days=config.ssd_ttl_days,
+            flush_interval_s=config.ssd_flush_interval_s,
+            max_size_bytes=max_size_bytes,
+        )
+        assert cache._max_size_bytes == int(5.0 * (1024 ** 3))
+
+    def test_ssd_cache_unlimited_when_zero_gb(self, tmp_path: Path):
+        """SSDCache gets max_size_bytes=0 when ssd_max_size_gb=0 (unlimited)."""
+        from mlx_lm_server.config import ServerConfig
+
+        config = ServerConfig(ssd_max_size_gb=0)
+        max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
+        cache = SSDCache(
+            cache_dir=tmp_path / "cache",
+            ttl_days=config.ssd_ttl_days,
+            flush_interval_s=config.ssd_flush_interval_s,
+            max_size_bytes=max_size_bytes,
+        )
+        assert cache._max_size_bytes == 0

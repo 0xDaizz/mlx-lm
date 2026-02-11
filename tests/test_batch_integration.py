@@ -342,3 +342,364 @@ class TestMockResponseProperty:
         sentinel = object()
         r = MockResponse(uid=0, token=1, _prompt_cache=sentinel)
         assert r.prompt_cache is sentinel
+
+
+# ---------------------------------------------------------------------------
+# G2: Prefill Cache Salvage on Cancel
+# ---------------------------------------------------------------------------
+
+
+class TestG2CancelCacheSalvage:
+    """Tests for G2: saving prefill KV cache when requests are cancelled.
+
+    When a request with a cache miss is cancelled mid-generation, the
+    scheduler should extract the KV cache via BatchGenerator.remove()
+    with return_prompt_caches=True, and store it for future reuse.
+    """
+
+    def test_cancel_salvages_cache_for_pending_saves(self):
+        """Cancelled UIDs in _pending_cache_saves trigger cache extraction and storage."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Track calls to _store_finished_caches
+        stored_caches = []
+        original_store = sched._store_finished_caches
+
+        def tracking_store(caches):
+            stored_caches.append(dict(caches))
+            original_store(caches)
+
+        sched._store_finished_caches = tracking_store
+
+        # Slow down next() so cancel happens while request is active
+        original_next = mock_bg.next
+        def slow_next():
+            time.sleep(0.05)
+            return original_next()
+        mock_bg.next = slow_next
+
+        sched.run_inference_loop()
+
+        try:
+            req = InferenceRequest(
+                request_id="salvage-me",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+            )
+            stream_q = sched.register_stream("salvage-me")
+            sched.submit_request(req)
+
+            # Wait for request to be inserted (enters batch generator)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if sched._request_id_to_uid.get("salvage-me") is not None:
+                    break
+                time.sleep(0.01)
+
+            uid = sched._request_id_to_uid.get("salvage-me")
+            assert uid is not None, "Request should be in batch generator"
+
+            # Verify UID is in pending cache saves (cache miss path)
+            assert uid in sched._pending_cache_saves, \
+                "UID should be in _pending_cache_saves (cache miss insert)"
+
+            # Cancel the request
+            sched.cancel_request("salvage-me")
+
+            # Wait for cancel to be processed
+            deadline = time.time() + 5.0
+            got_finish = False
+            while time.time() < deadline:
+                try:
+                    event = stream_q.get(timeout=0.5)
+                    if event.finish_reason == "cancelled":
+                        got_finish = True
+                        break
+                except queue.Empty:
+                    continue
+
+            assert got_finish, "Should receive cancelled finish event"
+
+            # Verify _store_finished_caches was called with the UID's cache
+            assert len(stored_caches) >= 1, \
+                "Should have called _store_finished_caches for salvaged cache"
+
+            # Check that the stored caches contain the cancelled UID
+            salvaged_uids = set()
+            for call_caches in stored_caches:
+                salvaged_uids.update(call_caches.keys())
+            assert uid in salvaged_uids, \
+                "Salvaged caches should include the cancelled UID"
+        finally:
+            sched.stop()
+
+    def test_cancel_without_pending_save_skips_cache_extraction(self):
+        """Cancelled UIDs NOT in _pending_cache_saves do not trigger cache extraction."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Track calls to _store_finished_caches
+        stored_caches = []
+        original_store = sched._store_finished_caches
+
+        def tracking_store(caches):
+            stored_caches.append(dict(caches))
+            original_store(caches)
+
+        sched._store_finished_caches = tracking_store
+
+        original_next = mock_bg.next
+        def slow_next():
+            time.sleep(0.05)
+            return original_next()
+        mock_bg.next = slow_next
+
+        sched.run_inference_loop()
+
+        try:
+            req = InferenceRequest(
+                request_id="no-salvage",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+            )
+            stream_q = sched.register_stream("no-salvage")
+            sched.submit_request(req)
+
+            # Wait for request to be inserted
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if sched._request_id_to_uid.get("no-salvage") is not None:
+                    break
+                time.sleep(0.01)
+
+            uid = sched._request_id_to_uid.get("no-salvage")
+            assert uid is not None
+
+            # Manually remove from _pending_cache_saves to simulate cache hit path
+            sched._pending_cache_saves.discard(uid)
+
+            sched.cancel_request("no-salvage")
+
+            # Wait for cancel
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                try:
+                    event = stream_q.get(timeout=0.5)
+                    if event.finish_reason == "cancelled":
+                        break
+                except queue.Empty:
+                    continue
+
+            # _store_finished_caches should NOT have been called (no caches to salvage)
+            # Filter out any calls with empty dicts
+            non_empty_stores = [c for c in stored_caches if c]
+            assert len(non_empty_stores) == 0, \
+                "Should not call _store_finished_caches when no UIDs have pending saves"
+        finally:
+            sched.stop()
+
+    def test_cancel_cache_save_failure_does_not_break_cancel(self):
+        """If _store_finished_caches raises during salvage, cancel still completes.
+
+        We only fail on the salvage call (from _process_cancellations_batch),
+        not on the normal decode-path call (from _batch_inference_step step 7),
+        by tracking which call-site triggers the failure.
+        """
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Make _store_finished_caches raise only when called with
+        # specific salvage UIDs (from _process_cancellations_batch).
+        original_store = sched._store_finished_caches
+        fail_for_uids: set[int] = set()
+
+        def conditionally_failing_store(caches):
+            if fail_for_uids & set(caches.keys()):
+                raise RuntimeError("Simulated store failure")
+            return original_store(caches)
+
+        sched._store_finished_caches = conditionally_failing_store
+
+        original_next = mock_bg.next
+        def slow_next():
+            time.sleep(0.05)
+            return original_next()
+        mock_bg.next = slow_next
+
+        sched.run_inference_loop()
+
+        try:
+            req = InferenceRequest(
+                request_id="fail-store",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+            )
+            stream_q = sched.register_stream("fail-store")
+            sched.submit_request(req)
+
+            # Wait for insertion
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if sched._request_id_to_uid.get("fail-store") is not None:
+                    break
+                time.sleep(0.01)
+
+            uid = sched._request_id_to_uid.get("fail-store")
+            assert uid is not None
+            assert uid in sched._pending_cache_saves
+
+            # Now arm the failure for this specific UID
+            fail_for_uids.add(uid)
+
+            sched.cancel_request("fail-store")
+
+            # Cancel should still complete despite store failure
+            deadline = time.time() + 5.0
+            got_finish = False
+            while time.time() < deadline:
+                try:
+                    event = stream_q.get(timeout=0.5)
+                    if event.finish_reason == "cancelled":
+                        got_finish = True
+                        break
+                except queue.Empty:
+                    continue
+
+            assert got_finish, "Cancel should complete even if cache store fails"
+
+            # _pending_cache_saves should be cleaned up
+            assert uid not in sched._pending_cache_saves, \
+                "_pending_cache_saves should be cleaned up after cancel"
+        finally:
+            sched.stop()
+
+    def test_pending_cache_saves_cleaned_up_after_cancel(self):
+        """_pending_cache_saves is cleaned up for all cancelled UIDs."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        original_next = mock_bg.next
+        def slow_next():
+            time.sleep(0.05)
+            return original_next()
+        mock_bg.next = slow_next
+
+        sched.run_inference_loop()
+
+        try:
+            # Submit two requests
+            for i in range(2):
+                req = InferenceRequest(
+                    request_id=f"cleanup-{i}",
+                    prompt_tokens=[1, 2, 3],
+                    max_tokens=100,
+                )
+                sched.register_stream(f"cleanup-{i}")
+                sched.submit_request(req)
+
+            # Wait for both to be inserted
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if (sched._request_id_to_uid.get("cleanup-0") is not None
+                        and sched._request_id_to_uid.get("cleanup-1") is not None):
+                    break
+                time.sleep(0.01)
+
+            uid0 = sched._request_id_to_uid.get("cleanup-0")
+            uid1 = sched._request_id_to_uid.get("cleanup-1")
+            assert uid0 is not None and uid1 is not None
+
+            # Both should be in pending cache saves
+            assert uid0 in sched._pending_cache_saves
+            assert uid1 in sched._pending_cache_saves
+
+            # Cancel both
+            sched.cancel_request("cleanup-0")
+            sched.cancel_request("cleanup-1")
+
+            # Wait for cleanup
+            time.sleep(1.0)
+
+            # Both should be cleaned from pending saves
+            assert uid0 not in sched._pending_cache_saves, \
+                "UID 0 should be removed from _pending_cache_saves"
+            assert uid1 not in sched._pending_cache_saves, \
+                "UID 1 should be removed from _pending_cache_saves"
+
+            # Active sequences should be empty
+            with sched._active_lock:
+                assert len(sched._active_sequences) == 0
+        finally:
+            sched.stop()
+
+    def test_cancel_salvage_calls_remove_with_return_prompt_caches(self):
+        """Verify BatchGenerator.remove() is called with return_prompt_caches=True
+        when there are salvageable UIDs."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Patch remove to track call args
+        remove_calls = []
+        original_remove = mock_bg.remove
+
+        def tracking_remove(uids, return_prompt_caches=False):
+            remove_calls.append({
+                "uids": list(uids),
+                "return_prompt_caches": return_prompt_caches,
+            })
+            return original_remove(uids, return_prompt_caches=return_prompt_caches)
+
+        mock_bg.remove = tracking_remove
+
+        original_next = mock_bg.next
+        def slow_next():
+            time.sleep(0.05)
+            return original_next()
+        mock_bg.next = slow_next
+
+        sched.run_inference_loop()
+
+        try:
+            req = InferenceRequest(
+                request_id="track-remove",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=100,
+            )
+            stream_q = sched.register_stream("track-remove")
+            sched.submit_request(req)
+
+            # Wait for insertion
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                if sched._request_id_to_uid.get("track-remove") is not None:
+                    break
+                time.sleep(0.01)
+
+            uid = sched._request_id_to_uid.get("track-remove")
+            assert uid is not None
+            assert uid in sched._pending_cache_saves
+
+            sched.cancel_request("track-remove")
+
+            # Wait for cancel
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                try:
+                    event = stream_q.get(timeout=0.5)
+                    if event.finish_reason == "cancelled":
+                        break
+                except queue.Empty:
+                    continue
+
+            # Verify remove was called with return_prompt_caches=True
+            cancel_removes = [c for c in remove_calls if c["return_prompt_caches"]]
+            assert len(cancel_removes) >= 1, \
+                "remove() should be called with return_prompt_caches=True for salvageable UIDs"
+        finally:
+            sched.stop()

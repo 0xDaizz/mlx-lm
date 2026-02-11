@@ -151,10 +151,12 @@ def main() -> None:
                     adapter_path=config.adapter_path,
                 )
                 ssd_dir = ssd_cache_dir / fingerprint
+                max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
                 ssd_cache = SSDCache(
                     ssd_dir,
                     config.ssd_ttl_days,
                     flush_interval_s=config.ssd_flush_interval_s,
+                    max_size_bytes=max_size_bytes,
                 )
                 ssd_for_manager = ssd_cache
             kv_cache_manager = KVCacheManager(config, ssd=ssd_for_manager)
