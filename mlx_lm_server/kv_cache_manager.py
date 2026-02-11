@@ -637,7 +637,7 @@ class KVCacheManager:
             candidates.sort(key=lambda b: b.last_accessed)
 
             for block in candidates[:num_blocks - len(evicted_ids)]:
-                saved_hash = block.block_hash
+                saved_hash = block.block_hash  # type: ignore[assignment]  # re-use variable for same purpose in fallback loop
                 if saved_hash is not None and saved_hash in self.hash_table:
                     del self.hash_table[saved_hash]
                 self.pool.return_block(block.block_id)
@@ -791,7 +791,7 @@ def _is_quantized_kv(kv) -> bool:
 
 def _dequantize_kv(kv_tuple, group_size: int, bits: int) -> mx.array:
     """Dequantize a (data, scales, biases) tuple back to float array."""
-    return mx.dequantize(*kv_tuple, group_size=group_size, bits=bits)
+    return mx.dequantize(*kv_tuple, group_size=group_size, bits=bits)  # type: ignore[misc]  # nanobind C++ introspection confuses mypy about keyword args
 
 
 def extract_block(

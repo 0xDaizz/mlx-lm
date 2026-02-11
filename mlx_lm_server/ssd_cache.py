@@ -301,7 +301,7 @@ class SSDCache:
                 return None
 
             # mx.load returns a dict-like object; ensure we have standard dict
-            raw = dict(arrays)
+            raw = dict(arrays)  # type: ignore[arg-type]  # mx.load returns SafeTensors (dict-like)
 
             # Detect format: "layer_N_key" keys indicate multi-layer format
             layer_keys = [k for k in raw if k.startswith("layer_")]

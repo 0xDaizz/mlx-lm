@@ -545,7 +545,7 @@ def create_app(
         errors = exc.errors()
         parts = []
         for e in errors:
-            loc = " -> ".join(str(l) for l in e.get("loc", []))
+            loc = " -> ".join(str(part) for part in e.get("loc", []))
             msg = e.get("msg", "validation error")
             parts.append(f"{loc}: {msg}" if loc else msg)
         message = "; ".join(parts) if parts else "Validation error"
@@ -618,7 +618,7 @@ def create_app(
                 wait = min(poll_interval, remaining) if remaining > 0 else poll_interval
                 try:
                     events = await loop.run_in_executor(
-                        _inference_executor, lambda t=wait: sched.get_result(request_id, timeout=t)
+                        _inference_executor, lambda t=wait: sched.get_result(request_id, timeout=t)  # type: ignore[misc]
                     )
                     break  # Got result
                 except TimeoutError:
@@ -691,7 +691,8 @@ def create_app(
         if isinstance(result, list):
             prompt_tokens = result
         elif hasattr(result, 'input_ids'):
-            prompt_tokens = result['input_ids']
+            batch_enc: Any = result  # BatchEncoding is dict-like but typed as str
+            prompt_tokens = batch_enc['input_ids']
             if not isinstance(prompt_tokens, list):
                 prompt_tokens = list(prompt_tokens)
         else:
@@ -1014,8 +1015,8 @@ def _format_chat_messages(
 
     # Fallback: simple formatting
     parts: list[str] = []
-    for m in msg_dicts:
-        parts.append(f"{m['role']}: {m.get('content', '')}")
+    for md in msg_dicts:
+        parts.append(f"{md['role']}: {md.get('content', '')}")
     parts.append("assistant:")
     return "\n".join(parts)
 
@@ -1163,7 +1164,7 @@ def _stream_response(
                 )
                 try:
                     event: TokenEvent | None = await loop.run_in_executor(
-                        executor, lambda t=timeout: token_queue.get(timeout=t)
+                        executor, lambda t=timeout: token_queue.get(timeout=t)  # type: ignore[misc]
                     )
                 except queue.Empty:
                     error_data = {"error": {"message": f"Stream timeout: no tokens received for {timeout} seconds", "type": "server_error"}}
@@ -1229,7 +1230,7 @@ def _stream_response(
 
             # Emit usage chunk before [DONE] if stream_options.include_usage is set
             if include_usage:
-                usage_chunk = {
+                usage_chunk: dict[str, Any] = {
                     "id": request_id,
                     "object": "chat.completion.chunk" if is_chat else "text_completion",
                     "created": int(time.time()),

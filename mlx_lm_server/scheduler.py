@@ -162,8 +162,8 @@ class Scheduler:
         self._active_sequences: dict[str, SequenceState] = {}
         self._active_lock = threading.Lock()
 
-        # Token streams: request_id -> Queue[TokenEvent]
-        self._streams: dict[str, queue.Queue[TokenEvent]] = {}
+        # Token streams: request_id -> Queue[TokenEvent | None]
+        self._streams: dict[str, queue.Queue[TokenEvent | None]] = {}
         self._streams_lock = threading.Lock()
 
         # Results for non-streaming requests: request_id -> list[TokenEvent]
@@ -295,7 +295,7 @@ class Scheduler:
 
         stop_tokens = set()
         if self.tokenizer is not None:
-            eos_ids = getattr(self.tokenizer, "eos_token_ids", set())
+            eos_ids: Any = getattr(self.tokenizer, "eos_token_ids", set())
             if isinstance(eos_ids, (set, frozenset)):
                 stop_tokens = set(eos_ids)
             elif isinstance(eos_ids, int):
@@ -378,14 +378,14 @@ class Scheduler:
 
         logger.debug("Submitted request %s", request.request_id)
 
-    def register_stream(self, request_id: str) -> queue.Queue[TokenEvent]:
+    def register_stream(self, request_id: str) -> queue.Queue[TokenEvent | None]:
         """Register a streaming token queue for a request.
 
         Returns a Queue that will receive TokenEvent objects as tokens
         are generated. A TokenEvent with finish_reason != None signals
         the end of generation.
         """
-        q: queue.Queue[TokenEvent] = queue.Queue(maxsize=256)
+        q: queue.Queue[TokenEvent | None] = queue.Queue(maxsize=256)
         with self._streams_lock:
             self._streams[request_id] = q
         return q
@@ -681,7 +681,7 @@ class Scheduler:
         if self._control_bus is None:
             return True
 
-        from mlx_lm_server.distributed_bus import ControlEvent
+        from mlx_lm_server.distributed_bus import ControlEvent  # noqa: F401
 
         try:
             raw_event = self._control_bus.recv()
@@ -1672,7 +1672,7 @@ class Scheduler:
 
         # EOS token detection
         if self.tokenizer is not None:
-            eos_ids = getattr(self.tokenizer, "eos_token_ids", set())
+            eos_ids: Any = getattr(self.tokenizer, "eos_token_ids", set())
             if seq.output_tokens and seq.output_tokens[-1] in eos_ids:
                 return "stop"
 

@@ -115,12 +115,10 @@ class SequenceCacheStore:
         with self._lock:
             node = self._root
             best_node: _TrieNode | None = None
-            best_depth = 0
 
             # Check root node (empty token key)
             if node.cache_value is not None:
                 best_node = node
-                best_depth = 0
 
             # Walk the trie
             for i, token in enumerate(tokens):
@@ -130,7 +128,7 @@ class SequenceCacheStore:
                 node = child
                 if node.cache_value is not None:
                     best_node = node
-                    best_depth = i + 1
+                    _ = i + 1  # depth tracked implicitly via best_node.token_key
 
             if best_node is None:
                 return None, list(tokens)
@@ -142,6 +140,7 @@ class SequenceCacheStore:
             best_key_len = len(best_node.token_key)
 
         # Phase 2: outside lock — clone cache (fast path for plain KVCache)
+        assert cache_ref is not None  # guaranteed: best_node.cache_value was not None
         cache_copy = _clone_cache_list(cache_ref)
 
         if best_key_len > len(tokens):
