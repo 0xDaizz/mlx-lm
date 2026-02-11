@@ -1,12 +1,12 @@
 """Tests for speculative decoding cache utilities.
 
-Tests batch_variable_trim, uniform_trim, and get_cache_offsets.
-Includes the CRITICAL GATE TEST that determines whether per-sequence
-offset manipulation is safe for the speculative decoding architecture.
+Tests batch_variable_trim, uniform_trim, get_cache_offsets, and
+can_per_seq_trim. Includes the GATE TEST that validates per-sequence
+trim_per_sequence() produces argmax-safe outputs.
 
 GATE Result:
-    A (offset safe)  — per-sequence trim works, optimal performance
-    B (offset unsafe) — must use uniform trim + re-forward, conservative
+    A (argmax-safe per-sequence trim) — trim_per_sequence() available,
+        per-sequence variable trim works correctly
 """
 
 import os
@@ -17,6 +17,7 @@ import pytest
 
 from mlx_lm_server.spec_decode.cache_utils import (
     batch_variable_trim,
+    can_per_seq_trim,
     get_cache_offsets,
     uniform_trim,
 )
@@ -62,6 +63,12 @@ class MockBatchKVCache:
         self.keys[..., prev : self._idx, :] = keys
         self.values[..., prev : self._idx, :] = values
         return self.keys[..., : self._idx, :], self.values[..., : self._idx, :]
+
+    def trim_per_sequence(self, n):
+        """Per-sequence trim matching BatchKVCache.trim_per_sequence()."""
+        n = mx.minimum(n, self.left_padding + self.offset)
+        self.offset = self.offset - n
+        self._idx = int(mx.max(self.left_padding + self.offset).item())
 
     def is_trimmable(self):
         return True
@@ -122,12 +129,13 @@ class TestVariableTrim:
 
         batch_variable_trim(layers, trim_amounts)
 
-        # After variable trim:
-        # max_trim = 5, so _idx = 10 - 5 = 5
-        # deficit = [5-3, 5-1, 5-5] = [2, 4, 0]
-        # offset = (10 - 5) + [2, 4, 0] = [7, 9, 5]
+        # After per-sequence trim via trim_per_sequence:
+        # initial offset=[10,10,10], left_padding=[0,0,0]
+        # n = min([3,1,5], [0+10, 0+10, 0+10]) = [3,1,5]
+        # offset = [10-3, 10-1, 10-5] = [7, 9, 5]
+        # _idx = max(0+7, 0+9, 0+5) = 9
         for layer in layers:
-            assert layer._idx == 5
+            assert layer._idx == 9
             expected_offset = mx.array([7, 9, 5])
             assert mx.array_equal(layer.offset, expected_offset), (
                 f"Expected {expected_offset.tolist()}, got {layer.offset.tolist()}"
@@ -140,11 +148,12 @@ class TestVariableTrim:
 
         batch_variable_trim(layers, trim_amounts)
 
-        # max_trim = 3, so _idx = 10 - 3 = 7
-        # deficit = [3-0, 3-3, 3-0] = [3, 0, 3]
-        # offset = (10 - 3) + [3, 0, 3] = [10, 7, 10]
+        # After per-sequence trim via trim_per_sequence:
+        # n = min([0,3,0], [0+10, 0+10, 0+10]) = [0,3,0]
+        # offset = [10-0, 10-3, 10-0] = [10, 7, 10]
+        # _idx = max(0+10, 0+7, 0+10) = 10
         for layer in layers:
-            assert layer._idx == 7
+            assert layer._idx == 10
             expected_offset = mx.array([10, 7, 10])
             assert mx.array_equal(layer.offset, expected_offset), (
                 f"Expected {expected_offset.tolist()}, got {layer.offset.tolist()}"
@@ -218,11 +227,12 @@ class TestVariableTrim:
 
         batch_variable_trim(layers, trim_amounts)
 
-        # max_trim = 3, _idx = 10 - 3 = 7
-        # deficit = [3-3, 3-1] = [0, 2]
-        # offset = ([8, 10] - 3) + [0, 2] = [5, 9]
+        # After per-sequence trim via trim_per_sequence:
+        # n = min([3,1], [2+8, 0+10]) = min([3,1], [10,10]) = [3,1]
+        # offset = [8-3, 10-1] = [5, 9]
+        # _idx = max(2+5, 0+9) = max(7, 9) = 9
         for layer in layers:
-            assert layer._idx == 7
+            assert layer._idx == 9
             expected_offset = mx.array([5, 9])
             assert mx.array_equal(layer.offset, expected_offset), (
                 f"Expected {expected_offset.tolist()}, got {layer.offset.tolist()}"
@@ -246,7 +256,7 @@ class TestGetCacheOffsets:
         layers = _make_mock_layers(2, batch_size=3, initial_offset=10)
         batch_variable_trim(layers, mx.array([2, 0, 4]))
         offsets = get_cache_offsets(layers)
-        # max_trim=4, _idx=6, deficit=[2,4,0], offset=(10-4)+[2,4,0]=[8,10,6]
+        # Per-sequence trim: offset=[10-2, 10-0, 10-4]=[8, 10, 6]
         assert mx.array_equal(offsets, mx.array([8, 10, 6]))
 
 
@@ -411,11 +421,11 @@ class TestGateDecision:
         trim_amounts = mx.array([3, 1])
         batch_variable_trim(spec_cache, trim_amounts)
 
-        # After variable trim:
-        # _idx = (idx_after_decode1 + k) - max(3,1) = idx_after_decode1 + k - 3
-        # offset[0] = old_offset[0] - 3 (trimmed exactly 3, deficit=0)
-        # offset[1] = old_offset[1] - 3 + 2 = old_offset[1] - 1 (trimmed 1, deficit=2)
-        assert spec_cache[0]._idx == idx_after_decode1 + k - 3
+        # After per-sequence trim via trim_per_sequence:
+        # offset[0] -= 3, offset[1] -= 1
+        # _idx = max(left_padding[0] + offset[0], left_padding[1] + offset[1])
+        # For the less-trimmed sequence (seq 1, trim=1), _idx is higher than
+        # the old uniform-trim approach would give.
 
         # Now decode one more token after variable trim
         # For the next token, we need to feed the last accepted token
@@ -529,27 +539,22 @@ class TestGateDecision:
         # We use argmax match as the primary criterion since floating point
         # differences are expected between batched and individual processing.
         #
-        # GATE RESULT (2026-02-11): **B (offset unsafe)**
-        #   Seq 0 (trim=3, deficit=0): argmax match, logit diff 0.27
-        #   Seq 1 (trim=1, deficit=2): argmax MISMATCH (271 vs 205), logit diff 9.0
+        # GATE RESULT (2026-02-12): **A (argmax-safe per-sequence trim)**
+        #   trim_per_sequence() correctly adjusts offset and _idx atomically.
+        #   Per-sequence variable trim now produces argmax-matching outputs
+        #   vs reference single-sequence processing.
         #
-        # Root cause: BatchKVCache.make_mask() uses _idx (scalar) not
-        # per-sequence offset. update_and_fetch() returns keys[..., :_idx, :]
-        # which excludes positions that were "logically restored" by offset
-        # re-advance. The stale data is invisible to attention.
-        #
-        # Architecture decision: Must use uniform_trim(max_rejected) for all
-        # sequences, then re-forward under-trimmed sequences to rebuild their
-        # cache entries.
+        # Previous Result B (2026-02-11) was due to the old approach of
+        # uniform trim + offset re-advance, which failed because _idx is
+        # scalar and make_mask()/update_and_fetch() use _idx.
         gate_passed = (spec_argmax_0 == ref_argmax_0 and spec_argmax_1 == ref_argmax_1)
 
-        if not gate_passed:
-            pytest.xfail(
-                "GATE RESULT B confirmed: per-sequence offset manipulation is unsafe. "
-                f"Seq 0: spec={spec_argmax_0} ref={ref_argmax_0} (diff={diff_0:.4f}). "
-                f"Seq 1: spec={spec_argmax_1} ref={ref_argmax_1} (diff={diff_1:.4f}). "
-                "Must use uniform trim + re-forward approach."
-            )
+        assert gate_passed, (
+            "GATE RESULT A expected but failed: per-sequence trim_per_sequence "
+            "should produce argmax-safe outputs. "
+            f"Seq 0: spec={spec_argmax_0} ref={ref_argmax_0} (diff={diff_0:.4f}). "
+            f"Seq 1: spec={spec_argmax_1} ref={ref_argmax_1} (diff={diff_1:.4f})."
+        )
 
     def test_uniform_trim_reference(self, model_and_tokenizer):
         """Verify that uniform trim (same amount for all) produces
@@ -652,3 +657,97 @@ class TestGateDecision:
         # Note: batched and individual may differ due to padding effects
         # This is expected behavior. We just verify both produce valid outputs.
         assert batch_logits.shape[-1] > 0, "Batch logits should have vocab dim"
+
+
+# ===========================================================================
+# Tests for can_per_seq_trim capability detection
+# ===========================================================================
+
+
+class TestCanPerSeqTrim:
+    def test_can_per_seq_trim_true(self):
+        """MockBatchKVCache has trim_per_sequence -> True."""
+        layers = _make_mock_layers(3, batch_size=2, initial_offset=10)
+        assert can_per_seq_trim(layers) is True
+
+    def test_can_per_seq_trim_false(self):
+        """Mock without trim_per_sequence -> False."""
+
+        class NoPSTCache:
+            pass
+
+        layers = [NoPSTCache(), NoPSTCache()]
+        assert can_per_seq_trim(layers) is False
+
+    def test_can_per_seq_trim_cache_list(self):
+        """Mock CacheList with all children supporting -> True."""
+
+        class MockCacheList:
+            def __init__(self):
+                self.caches = [
+                    MockBatchKVCache(2, 10),
+                    MockBatchKVCache(2, 10),
+                ]
+
+        # Simulate CacheList by registering it where the check looks
+        layers = [MockCacheList()]
+        # The check uses hasattr fallback (getattr 'caches') since
+        # MockCacheList is not from mlx_lm.models.cache
+        # All children have trim_per_sequence, but the parent MockCacheList
+        # itself also needs it (or be recognized as CacheList).
+        # Since it has 'caches' attribute, the ImportError path kicks in
+        # and checks all children recursively.
+        #
+        # Actually: the try block imports CacheList. If isinstance fails
+        # (MockCacheList != CacheList), falls through to hasattr check.
+        # MockCacheList doesn't have trim_per_sequence, so returns False.
+        # BUT the except ImportError path is only reached if import fails.
+        # Since mlx_lm IS available, isinstance(MockCacheList, CacheList) is False,
+        # so it falls through to `return hasattr(layer, 'trim_per_sequence')`.
+        #
+        # To test the CacheList path properly, we need to use the real CacheList
+        # or mock the import. Let's just test with the real CacheList if available.
+        try:
+            from mlx_lm.models.cache import CacheList
+            cache_list = CacheList.__new__(CacheList)
+            cache_list.caches = [
+                MockBatchKVCache(2, 10),
+                MockBatchKVCache(2, 10),
+            ]
+            assert can_per_seq_trim([cache_list]) is True
+        except ImportError:
+            pytest.skip("mlx_lm.models.cache.CacheList not available")
+
+    def test_can_per_seq_trim_mixed_cache_list(self):
+        """CacheList with one unsupported child -> False."""
+
+        class NoTrimCache:
+            """Cache without trim_per_sequence."""
+            pass
+
+        try:
+            from mlx_lm.models.cache import CacheList
+            cache_list = CacheList.__new__(CacheList)
+            cache_list.caches = [
+                MockBatchKVCache(2, 10),
+                NoTrimCache(),
+            ]
+            assert can_per_seq_trim([cache_list]) is False
+        except ImportError:
+            pytest.skip("mlx_lm.models.cache.CacheList not available")
+
+    def test_can_per_seq_trim_empty(self):
+        """Empty list -> False."""
+        assert can_per_seq_trim([]) is False
+
+    def test_result_b_fallback_path(self):
+        """Verify uniform_trim still works correctly as a fallback."""
+        layers = _make_mock_layers(2, batch_size=3, initial_offset=10)
+
+        # Uniform trim of 4
+        uniform_trim(layers, 4)
+
+        for layer in layers:
+            assert layer._idx == 6
+            expected_offset = mx.array([6, 6, 6])
+            assert mx.array_equal(layer.offset, expected_offset)

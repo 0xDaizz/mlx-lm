@@ -53,15 +53,24 @@ class MockSampler:
 @dataclass
 class MockCacheLayer:
     _offset: int = 10
+    _batch_size: int = 1
     trim_calls: list[int] = field(default_factory=list)
+    trim_per_seq_calls: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.left_padding = mx.zeros((self._batch_size,), dtype=mx.int32)
+        self.offset = mx.array([self._offset] * self._batch_size, dtype=mx.int32)
 
     def trim(self, n: int) -> None:
         self._offset -= n
+        self.offset = self.offset - n
         self.trim_calls.append(n)
 
-    @property
-    def offset(self):
-        return mx.array([self._offset])
+    def trim_per_sequence(self, n) -> None:
+        n = mx.minimum(n, self.left_padding + self.offset)
+        self.offset = self.offset - n
+        self._offset = int(mx.max(self.left_padding + self.offset).item())
+        self.trim_per_seq_calls.append(n)
 
 
 @dataclass
@@ -845,9 +854,10 @@ class TestEngineAdversarial:
         seqs = [MockSequenceState("r0")]
         responses = engine.speculative_step(seqs)
 
-        # All rejected: num_accepted=0, min_accepted=0
-        # keep = 0 + 1 = 1, trim = 4 - 1 = 3
-        assert cache_layers[0].trim_calls == [3]
+        # All rejected: num_accepted=0
+        # Result A: per-sequence trim, keep=1, trim=4-1=3
+        assert len(cache_layers[0].trim_per_seq_calls) == 1
+        assert int(cache_layers[0].trim_per_seq_calls[0][0]) == 3
         assert responses[0].num_accepted == 0
         # Should still get 1 correction token
         assert len(responses[0].tokens) == 1
@@ -1015,10 +1025,10 @@ class TestCacheUtilsAdversarial:
 
     def test_batch_variable_trim_all_zero(self):
         """batch_variable_trim with all zeros -- no-op."""
-        layer = MockCacheLayer(_offset=10)
+        layer = MockCacheLayer(_offset=10, _batch_size=3)
         trim_amounts = mx.array([0, 0, 0], dtype=mx.int32)
         batch_variable_trim([layer], trim_amounts)
-        assert layer.trim_calls == []
+        assert layer.trim_per_seq_calls == []  # early return, no call
 
 
 # ===========================================================================
@@ -1212,3 +1222,349 @@ class TestVerifierProposerCombined:
 
         assert int(num_acc[0]) == 5
         assert int(accepted[0, 5]) == 600  # bonus token
+
+
+# ===========================================================================
+# 10. Per-Sequence Trim Adversarial Tests (Result A)
+# ===========================================================================
+
+class TestPerSequenceTrimAdversarial:
+    """Adversarial tests for Result A per-sequence trim behavior."""
+
+    def test_trim_exceeds_available_offset(self):
+        """trim_amounts > offset should be clamped by trim_per_sequence."""
+        layer = MockCacheLayer(_offset=5, _batch_size=2)
+        # Try to trim 10, but offset is only 5
+        trim_amounts = mx.array([10, 3], dtype=mx.int32)
+        batch_variable_trim([layer], trim_amounts)
+        # Should clamp: min(10, 0+5)=5, min(3, 0+5)=3
+        # offset = [5-5, 5-3] = [0, 2]
+        assert int(layer.offset[0]) == 0
+        assert int(layer.offset[1]) == 2
+
+    def test_single_sequence_trim_no_regression(self):
+        """Single sequence with per-seq trim should behave like uniform trim."""
+        layer_a = MockCacheLayer(_offset=10, _batch_size=1)
+        layer_b = MockCacheLayer(_offset=10, _batch_size=1)
+
+        # Per-sequence trim
+        batch_variable_trim([layer_a], mx.array([3], dtype=mx.int32))
+        # Uniform trim
+        uniform_trim([layer_b], 3)
+
+        assert int(layer_a.offset[0]) == int(layer_b.offset[0])
+
+    def test_all_sequences_same_trim_equals_uniform(self):
+        """When all sequences trim the same amount, result matches uniform trim."""
+        layer_a = MockCacheLayer(_offset=10, _batch_size=3)
+        layer_b = MockCacheLayer(_offset=10, _batch_size=3)
+
+        batch_variable_trim([layer_a], mx.array([4, 4, 4], dtype=mx.int32))
+        uniform_trim([layer_b], 4)
+
+        for i in range(3):
+            assert int(layer_a.offset[i]) == int(layer_b.offset[i])
+
+    def test_mixed_zero_and_nonzero_trims(self):
+        """Some sequences trim 0, some trim more."""
+        layer = MockCacheLayer(_offset=10, _batch_size=4)
+        trim_amounts = mx.array([0, 5, 0, 10], dtype=mx.int32)
+        batch_variable_trim([layer], trim_amounts)
+        # offset = [10-0, 10-5, 10-0, 10-10] = [10, 5, 10, 0]
+        expected = [10, 5, 10, 0]
+        for i, exp in enumerate(expected):
+            assert int(layer.offset[i]) == exp
+
+    def test_large_batch_variable_trim(self):
+        """Variable trim with 32 sequences -- no crash, correct offsets."""
+        batch_size = 32
+        layer = MockCacheLayer(_offset=50, _batch_size=batch_size)
+        trims = [i % 10 for i in range(batch_size)]
+        batch_variable_trim([layer], mx.array(trims, dtype=mx.int32))
+
+        for i in range(batch_size):
+            expected = 50 - trims[i]
+            assert int(layer.offset[i]) == expected
+
+    def test_trim_to_zero_all_sequences(self):
+        """Trim all sequences to offset=0."""
+        layer = MockCacheLayer(_offset=7, _batch_size=3)
+        batch_variable_trim([layer], mx.array([7, 7, 7], dtype=mx.int32))
+        for i in range(3):
+            assert int(layer.offset[i]) == 0
+
+    def test_result_a_b_identical_when_uniform_acceptance(self):
+        """When all sequences accept the same number of tokens,
+        Result A and Result B should produce identical outputs."""
+        vocab_size = 200
+        k = 3
+
+        # Both sequences accept all 3 drafts
+        draft_tokens = mx.array([[10, 11, 12], [20, 21, 22]], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3, 3], dtype=mx.int32),
+        )
+        logits = _make_det_logits(2, 4, vocab_size, [
+            [10, 11, 12, 99],
+            [20, 21, 22, 88],
+        ])
+
+        # Run with Result A
+        cache_a = [MockCacheLayer(_offset=20, _batch_size=2)]
+        batch_a = MockBatch(
+            uids=[0, 1],
+            y=mx.array([5, 6]),
+            tokens=[mx.array([1, 2, 3]), mx.array([4, 5, 6])],
+            num_tokens=[3, 3],
+            max_tokens=[100, 100],
+            cache=cache_a,
+            samplers=[MockSampler(0.0), MockSampler(0.0)],
+        )
+        engine_a, _ = _make_engine(batch=batch_a, model_logits=logits, proposal=proposal)
+        engine_a._per_seq_trim = True
+        seqs_a = [MockSequenceState("r0"), MockSequenceState("r1")]
+        resp_a = engine_a.speculative_step(seqs_a)
+
+        # Run with Result B
+        cache_b = [MockCacheLayer(_offset=20, _batch_size=2)]
+        proposal_b = ProposalResult(
+            draft_tokens=mx.array([[10, 11, 12], [20, 21, 22]], dtype=mx.int32),
+            draft_probs=None,
+            proposal_lens=mx.array([3, 3], dtype=mx.int32),
+        )
+        batch_b = MockBatch(
+            uids=[0, 1],
+            y=mx.array([5, 6]),
+            tokens=[mx.array([1, 2, 3]), mx.array([4, 5, 6])],
+            num_tokens=[3, 3],
+            max_tokens=[100, 100],
+            cache=cache_b,
+            samplers=[MockSampler(0.0), MockSampler(0.0)],
+        )
+        engine_b, _ = _make_engine(batch=batch_b, model_logits=logits, proposal=proposal_b)
+        engine_b._per_seq_trim = False
+        seqs_b = [MockSequenceState("r0"), MockSequenceState("r1")]
+        resp_b = engine_b.speculative_step(seqs_b)
+
+        # When acceptance is uniform, both should produce same tokens
+        for i in range(2):
+            assert resp_a[i].tokens == resp_b[i].tokens
+            assert resp_a[i].num_accepted == resp_b[i].num_accepted
+
+    def test_max_divergent_acceptance(self):
+        """One seq accepts all k, another accepts 0.
+        Result A: seq0 gets k+1 tokens, seq1 gets 1."""
+        vocab_size = 200
+        k = 3
+
+        draft_tokens = mx.array([
+            [10, 11, 12],
+            [90, 91, 92],
+        ], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3, 3], dtype=mx.int32),
+        )
+        # Seq 0: all match, Seq 1: none match
+        logits = _make_det_logits(2, 4, vocab_size, [
+            [10, 11, 12, 99],
+            [60, 61, 62, 63],
+        ])
+
+        cache_layers = [MockCacheLayer(_offset=20, _batch_size=2)]
+        batch = MockBatch(
+            uids=[0, 1],
+            y=mx.array([5, 6]),
+            tokens=[mx.array([1, 2, 3]), mx.array([4, 5, 6])],
+            num_tokens=[3, 3],
+            max_tokens=[100, 100],
+            cache=cache_layers,
+            samplers=[MockSampler(0.0), MockSampler(0.0)],
+        )
+
+        engine, _ = _make_engine(batch=batch, model_logits=logits, proposal=proposal)
+        engine._per_seq_trim = True
+        seqs = [MockSequenceState("r0"), MockSequenceState("r1")]
+        responses = engine.speculative_step(seqs)
+
+        # Result A: seq 0 keeps all 4 (3 accepted + bonus)
+        assert responses[0].tokens == [10, 11, 12, 99]
+        assert responses[0].num_accepted == 3
+        # Seq 1 gets 1 correction token
+        assert responses[1].tokens == [60]
+        assert responses[1].num_accepted == 0
+
+    def test_single_sequence_result_a_matches_b(self):
+        """With batch_size=1, Result A and B produce identical output."""
+        vocab_size = 200
+        k = 3
+
+        draft_tokens = mx.array([[10, 77, 78]], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3], dtype=mx.int32),
+        )
+        logits = _make_det_logits(1, 4, vocab_size, [[10, 11, 12, 99]])
+
+        # Result A
+        cache_a = [MockCacheLayer(_offset=20)]
+        batch_a = MockBatch(
+            uids=[0], y=mx.array([5]),
+            tokens=[mx.array([1, 2, 3])], num_tokens=[3],
+            max_tokens=[100], cache=cache_a, samplers=[MockSampler(0.0)],
+        )
+        engine_a, _ = _make_engine(batch=batch_a, model_logits=logits, proposal=proposal)
+        engine_a._per_seq_trim = True
+        resp_a = engine_a.speculative_step([MockSequenceState("r0")])
+
+        # Result B
+        proposal_b = ProposalResult(
+            draft_tokens=mx.array([[10, 77, 78]], dtype=mx.int32),
+            draft_probs=None,
+            proposal_lens=mx.array([3], dtype=mx.int32),
+        )
+        cache_b = [MockCacheLayer(_offset=20)]
+        batch_b = MockBatch(
+            uids=[0], y=mx.array([5]),
+            tokens=[mx.array([1, 2, 3])], num_tokens=[3],
+            max_tokens=[100], cache=cache_b, samplers=[MockSampler(0.0)],
+        )
+        engine_b, _ = _make_engine(batch=batch_b, model_logits=logits, proposal=proposal_b)
+        engine_b._per_seq_trim = False
+        resp_b = engine_b.speculative_step([MockSequenceState("r0")])
+
+        # Single sequence: Result A and B identical
+        assert resp_a[0].tokens == resp_b[0].tokens
+        assert resp_a[0].num_accepted == resp_b[0].num_accepted
+
+    def test_zero_acceptance_all_sequences(self):
+        """All sequences accept 0 tokens — each gets 1 correction token."""
+        vocab_size = 200
+        k = 3
+
+        # All draft tokens mismatch
+        draft_tokens = mx.array([
+            [90, 91, 92],
+            [93, 94, 95],
+            [96, 97, 98],
+        ], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3, 3, 3], dtype=mx.int32),
+        )
+        logits = _make_det_logits(3, 4, vocab_size, [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+            [30, 31, 32, 33],
+        ])
+
+        cache = [MockCacheLayer(_offset=20, _batch_size=3)]
+        batch = MockBatch(
+            uids=[0, 1, 2],
+            y=mx.array([5, 6, 7]),
+            tokens=[mx.array([1]), mx.array([2]), mx.array([3])],
+            num_tokens=[1, 1, 1],
+            max_tokens=[100, 100, 100],
+            cache=cache,
+            samplers=[MockSampler(0.0), MockSampler(0.0), MockSampler(0.0)],
+        )
+
+        engine, _ = _make_engine(batch=batch, model_logits=logits, proposal=proposal)
+        engine._per_seq_trim = True
+        seqs = [MockSequenceState("r0"), MockSequenceState("r1"), MockSequenceState("r2")]
+        responses = engine.speculative_step(seqs)
+
+        # All get exactly 1 correction token
+        for i, expected_tok in enumerate([10, 20, 30]):
+            assert len(responses[i].tokens) == 1
+            assert responses[i].tokens[0] == expected_tok
+            assert responses[i].num_accepted == 0
+
+    def test_all_k_accepted(self):
+        """All sequences accept all k tokens — no trim needed."""
+        vocab_size = 200
+        k = 3
+
+        draft_tokens = mx.array([
+            [10, 11, 12],
+            [20, 21, 22],
+        ], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3, 3], dtype=mx.int32),
+        )
+        logits = _make_det_logits(2, 4, vocab_size, [
+            [10, 11, 12, 99],
+            [20, 21, 22, 88],
+        ])
+
+        cache = [MockCacheLayer(_offset=20, _batch_size=2)]
+        batch = MockBatch(
+            uids=[0, 1],
+            y=mx.array([5, 6]),
+            tokens=[mx.array([1, 2, 3]), mx.array([4, 5, 6])],
+            num_tokens=[3, 3],
+            max_tokens=[100, 100],
+            cache=cache,
+            samplers=[MockSampler(0.0), MockSampler(0.0)],
+        )
+
+        engine, _ = _make_engine(batch=batch, model_logits=logits, proposal=proposal)
+        engine._per_seq_trim = True
+        seqs = [MockSequenceState("r0"), MockSequenceState("r1")]
+        responses = engine.speculative_step(seqs)
+
+        # All accepted + bonus: 4 tokens each
+        assert responses[0].tokens == [10, 11, 12, 99]
+        assert responses[1].tokens == [20, 21, 22, 88]
+        # No trim needed: keep=4, trim=0
+        assert cache[0].trim_per_seq_calls == []
+
+    def test_proposal_lens_zero_with_result_a(self):
+        """Sequence with proposal_lens=0 still gets 1 token via fallback."""
+        vocab_size = 200
+        k = 3
+
+        # Seq 0 has proposals, Seq 1 has none
+        draft_tokens = mx.array([
+            [10, 11, 12],
+            [0, 0, 0],
+        ], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3, 0], dtype=mx.int32),
+        )
+        logits = _make_det_logits(2, 4, vocab_size, [
+            [10, 11, 12, 99],
+            [50, 51, 52, 53],
+        ])
+
+        cache = [MockCacheLayer(_offset=20, _batch_size=2)]
+        batch = MockBatch(
+            uids=[0, 1],
+            y=mx.array([5, 6]),
+            tokens=[mx.array([1, 2, 3]), mx.array([4, 5, 6])],
+            num_tokens=[3, 3],
+            max_tokens=[100, 100],
+            cache=cache,
+            samplers=[MockSampler(0.0), MockSampler(0.0)],
+        )
+
+        engine, _ = _make_engine(batch=batch, model_logits=logits, proposal=proposal)
+        engine._per_seq_trim = True
+        seqs = [MockSequenceState("r0"), MockSequenceState("r1")]
+        responses = engine.speculative_step(seqs)
+
+        # Seq 0: all 3 accepted + bonus = 4 tokens
+        assert responses[0].tokens == [10, 11, 12, 99]
+        assert responses[0].num_accepted == 3
+        # Seq 1: proposal_lens=0, gets 1 token (correction from target)
+        assert len(responses[1].tokens) == 1
+        assert responses[1].num_accepted == 0

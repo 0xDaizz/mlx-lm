@@ -1,67 +1,42 @@
 """Cache utilities for speculative decoding.
 
-Provides batched cache operations that the standard BatchKVCache
-does not support, specifically per-sequence variable trimming.
+Provides batched cache operations for per-sequence variable trimming
+and capability detection.
 
-GATE RESULT (2026-02-11): **B — offset manipulation is UNSAFE**
+GATE RESULT (2026-02-12): **A — argmax-safe per-sequence trim**
 
-    Investigation findings:
-    - BatchKVCache._idx is a scalar (global write cursor shared by all seqs)
-    - BatchKVCache.offset is a per-sequence mx.array (logical position)
-    - make_mask() uses _idx (scalar), NOT per-sequence offset
-    - update_and_fetch() returns keys[..., :_idx, :] — sliced at _idx
+    BatchKVCache now supports trim_per_sequence(n) which correctly
+    handles per-sequence variable trimming by adjusting both offset
+    and _idx atomically. This is available on the upstream
+    batchkvcache-per-seq-trim branch.
 
-    The batch_variable_trim approach (uniform trim + offset re-advance)
-    is INVALID because:
-    1. After trim(_idx -= max_trim), data beyond _idx is not returned
-    2. Re-advancing offset for under-trimmed sequences doesn't restore
-       the data — _idx still excludes those positions
-    3. The attention mask (based on _idx) doesn't see the "restored" data
-    4. Confirmed empirically: seq with deficit>0 gets max logit diff of 9.0
-       and different argmax output vs reference
+    The old approach (uniform trim + offset re-advance) was UNSAFE
+    (Result B) because _idx is scalar and make_mask()/update_and_fetch()
+    use _idx, not per-sequence offset.
 
-    Architecture decision: Must use uniform_trim(max_rejected) for all
-    sequences. For sequences that accepted more tokens than the batch
-    minimum, re-forward the delta tokens to rebuild cache entries.
-
-    This function is kept for reference but should NOT be used in the
-    speculative decoding engine. Use uniform_trim() instead.
+    With trim_per_sequence(), each sequence's offset is decremented
+    individually, and _idx is set to max(left_padding + offset),
+    ensuring correct attention masking and KV data visibility.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, List
 
 import mlx.core as mx
+
+logger = logging.getLogger(__name__)
 
 
 def batch_variable_trim(
     cache_layers: List[Any],
     trim_amounts: mx.array,
 ) -> None:
-    """Trim different amounts from each sequence's cache.
+    """Per-sequence variable trim using trim_per_sequence().
 
-    WARNING: GATE test confirmed this approach is UNSAFE (Result B).
-    Do NOT use in production. Use uniform_trim() instead, followed by
-    re-forwarding tokens for under-trimmed sequences.
-
-    Kept for testing and reference purposes only.
-
-    BatchKVCache.trim(n) trims ALL sequences by the same amount n.
-    This function attempts to apply different trim amounts per sequence
-    by directly manipulating the per-sequence offset array.
-
-    How it works:
-    1. Trim ALL sequences by max(trim_amounts) using the standard trim()
-    2. For sequences that needed less trimming, re-advance their offset
-       to compensate
-
-    Why it fails:
-    - _idx (scalar) is decremented by max_trim for ALL sequences
-    - update_and_fetch() returns keys[..., :_idx, :] — stale data beyond
-      _idx is excluded regardless of per-sequence offset values
-    - make_mask() uses _idx as the global offset, not per-sequence offset
-    - Result: under-trimmed sequences see incorrect KV data
+    Caller MUST verify trim_per_sequence is available before calling.
+    Use can_per_seq_trim() to check at init time.
 
     Args:
         cache_layers: List of BatchKVCache instances (one per layer).
@@ -69,19 +44,37 @@ def batch_variable_trim(
             trim_amounts[i] = 0 means no trimming for sequence i.
     """
     if int(trim_amounts.max()) == 0:
-        return  # Nothing to trim
-
-    max_trim = int(trim_amounts.max())
+        return
 
     for cache_layer in cache_layers:
-        # Approach 1: Uniform trim + selective re-advance
-        # Trim all by max amount
-        cache_layer.trim(max_trim)
+        cache_layer.trim_per_sequence(trim_amounts)
 
-        # Re-advance offsets for sequences that needed less trimming
-        # deficit[i] = max_trim - trim_amounts[i]
-        deficit = max_trim - trim_amounts
-        cache_layer.offset = cache_layer.offset + deficit
+
+def can_per_seq_trim(cache_layers: List[Any]) -> bool:
+    """Check if cache supports per-sequence trim (Result A).
+
+    Checks EVERY layer and recursively every CacheList child.
+    Returns False if ANY leaf cache lacks trim_per_sequence.
+    """
+    if not cache_layers:
+        return False
+    for layer in cache_layers:
+        if not _layer_supports_per_seq_trim(layer):
+            return False
+    return True
+
+
+def _layer_supports_per_seq_trim(layer: Any) -> bool:
+    """Check a single cache layer (recurse into CacheList)."""
+    try:
+        from mlx_lm.models.cache import CacheList
+        if isinstance(layer, CacheList):
+            return all(_layer_supports_per_seq_trim(c) for c in layer.caches)
+    except ImportError:
+        caches = getattr(layer, 'caches', None)
+        if isinstance(caches, (tuple, list)):
+            return all(_layer_supports_per_seq_trim(c) for c in caches)
+    return hasattr(layer, 'trim_per_sequence')
 
 
 def uniform_trim(

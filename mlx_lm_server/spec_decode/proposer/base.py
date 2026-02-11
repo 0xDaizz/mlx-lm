@@ -118,12 +118,15 @@ class BaseProposer(ABC):
 def create_proposer(
     config: SpecDecodeConfig,
     target_model: object = None,
+    target_tokenizer: object = None,
 ) -> Optional[BaseProposer]:
     """Factory function to create a proposer based on config.
 
     Args:
         config: SpecDecodeConfig with mode and proposer-specific settings.
         target_model: The target model (reserved for future use).
+        target_tokenizer: The target tokenizer (used for draft model
+            vocab compatibility validation).
 
     Returns:
         A BaseProposer instance, or None if mode is "none".
@@ -144,7 +147,7 @@ def create_proposer(
         from mlx_lm_server.spec_decode.proposer.draft_model import DraftModelProposer
         return DraftModelProposer(
             model_path=config.draft_model_path,
-            quantize=config.draft_model_quantize,
+            context_len=config.draft_context_len,
         )
     else:
         raise ValueError(f"Unknown spec decode mode: {config.mode}")

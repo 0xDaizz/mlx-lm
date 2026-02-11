@@ -81,6 +81,7 @@ class ServerConfig:
     spec_decode_ngram_prompt_lookup: bool = True
     spec_decode_draft_model: str | None = None
     spec_decode_draft_quantize: str | None = None
+    spec_decode_draft_context_len: int = 128    # Draft prefill context (max 512)
     spec_decode_dynamic: bool = True
     spec_decode_acceptance_threshold: float = 0.3
     spec_decode_adaptive_k: bool = True

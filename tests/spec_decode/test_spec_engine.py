@@ -37,19 +37,29 @@ class MockSampler:
 
 
 class MockCacheLayer:
-    """Minimal cache layer mock that tracks trim calls."""
+    """Minimal cache layer mock that tracks trim calls.
 
-    def __init__(self, offset: int = 10):
+    Supports both uniform trim() and per-sequence trim_per_sequence().
+    """
+
+    def __init__(self, offset: int = 10, batch_size: int = 1):
         self._offset = offset
+        self._batch_size = batch_size
+        self.left_padding = mx.zeros((batch_size,), dtype=mx.int32)
+        self.offset = mx.array([offset] * batch_size, dtype=mx.int32)
         self.trim_calls: list[int] = []
+        self.trim_per_seq_calls: list = []
 
     def trim(self, n: int) -> None:
         self._offset -= n
+        self.offset = self.offset - n
         self.trim_calls.append(n)
 
-    @property
-    def offset(self):
-        return mx.array([self._offset])
+    def trim_per_sequence(self, n) -> None:
+        n = mx.minimum(n, self.left_padding + self.offset)
+        self.offset = self.offset - n
+        self._offset = int(mx.max(self.left_padding + self.offset).item())
+        self.trim_per_seq_calls.append(n)
 
 
 @dataclass
@@ -403,8 +413,50 @@ class TestUpdateBatchState:
         # 8 + 3 = 11 >= 10 → "length"
         assert responses[0].finish_reason == "length"
 
+    def test_batch_per_sequence_output(self):
+        """Result A: each sequence keeps its own accepted tokens."""
+        batch = MockBatch(
+            uids=[0, 1],
+            y=mx.array([5, 6]),
+            tokens=[mx.array([1, 2, 3]), mx.array([4, 5, 6])],
+            num_tokens=[3, 3],
+            max_tokens=[100, 100],
+            cache=[MockCacheLayer(offset=20, batch_size=2)],
+            samplers=[MockSampler(), MockSampler()],
+        )
+        engine, bg = make_engine(batch=batch)
+        # Force Result A detection
+        engine._per_seq_trim = True
+
+        # Seq 0: 3 accepted (full), Seq 1: 1 accepted
+        accepted = mx.array([
+            [10, 11, 12, 13],
+            [20, 99, PLACEHOLDER_TOKEN_ID, PLACEHOLDER_TOKEN_ID],
+        ], dtype=mx.int32)
+        num_accepted = mx.array([3, 1], dtype=mx.int32)
+        proposal_lens = mx.array([3, 3], dtype=mx.int32)
+        target_probs = mx.softmax(
+            make_deterministic_logits(2, 4, 100, [
+                [10, 11, 12, 13],
+                [20, 99, 0, 0],
+            ]),
+            axis=-1,
+        )
+
+        seqs = [MockSequenceState(request_id="r0"), MockSequenceState(request_id="r1")]
+        responses = engine._update_batch_state(
+            batch, seqs, accepted, num_accepted, proposal_lens, target_probs
+        )
+
+        # Result A: seq 0 keeps all 4 tokens (3 accepted + bonus)
+        assert responses[0].tokens == [10, 11, 12, 13]
+        assert responses[0].num_accepted == 3
+        # Seq 1 gets 2 tokens (1 accepted + correction)
+        assert responses[1].tokens == [20, 99]
+        assert responses[1].num_accepted == 1
+
     def test_batch_result_b_clamping(self):
-        """Result B: tokens clamped to min_accepted + 1 across batch."""
+        """Result B fallback: tokens clamped to min_accepted + 1 across batch."""
         batch = MockBatch(
             uids=[0, 1],
             y=mx.array([5, 6]),
@@ -415,6 +467,8 @@ class TestUpdateBatchState:
             samplers=[MockSampler(), MockSampler()],
         )
         engine, bg = make_engine(batch=batch)
+        # Force Result B
+        engine._per_seq_trim = False
 
         # Seq 0: 3 accepted (full), Seq 1: 1 accepted
         # min_accepted = 1, max_valid = 2
@@ -446,10 +500,11 @@ class TestUpdateBatchState:
 
 
 class TestRollbackCache:
-    """Test _rollback_cache uses uniform_trim (Result B)."""
+    """Test _rollback_cache for Result A (variable trim) and Result B (uniform trim)."""
 
-    def test_uniform_trim_called(self):
-        cache_layers = [MockCacheLayer(offset=20), MockCacheLayer(offset=20)]
+    def test_variable_trim_called(self):
+        """Result A: per-sequence trim via trim_per_sequence."""
+        cache_layers = [MockCacheLayer(offset=20, batch_size=2)]
         batch = MockBatch(
             uids=[0, 1],
             y=mx.array([1, 2]),
@@ -460,6 +515,33 @@ class TestRollbackCache:
             samplers=[MockSampler(), MockSampler()],
         )
         engine, _ = make_engine(batch=batch)
+        engine._per_seq_trim = True
+
+        # Seq 0: 3 accepted, Seq 1: 1 accepted
+        # keep = [4, 2], trim = [4-4, 4-2] = [0, 2]
+        num_accepted = mx.array([3, 1], dtype=mx.int32)
+        engine._rollback_cache(batch, num_accepted, max_input_len=4)
+
+        for layer in cache_layers:
+            assert len(layer.trim_per_seq_calls) == 1
+            trim_arr = layer.trim_per_seq_calls[0]
+            assert int(trim_arr[0]) == 0  # seq 0: no trim needed
+            assert int(trim_arr[1]) == 2  # seq 1: trim 2
+
+    def test_uniform_trim_called_result_b(self):
+        """Result B fallback: uniform trim to min_accepted."""
+        cache_layers = [MockCacheLayer(offset=20, batch_size=2)]
+        batch = MockBatch(
+            uids=[0, 1],
+            y=mx.array([1, 2]),
+            tokens=[mx.array([1]), mx.array([2])],
+            num_tokens=[1, 1],
+            max_tokens=[100, 100],
+            cache=cache_layers,
+            samplers=[MockSampler(), MockSampler()],
+        )
+        engine, _ = make_engine(batch=batch)
+        engine._per_seq_trim = False
 
         # Seq 0: 3 accepted, Seq 1: 1 accepted
         # min_accepted = 1, keep = 2, max_input_len = 4, trim = 2
@@ -481,13 +563,14 @@ class TestRollbackCache:
             samplers=[MockSampler()],
         )
         engine, _ = make_engine(batch=batch)
+        engine._per_seq_trim = True
 
         # 3 accepted, max_input_len = 4 (3 drafts + 1 last_token)
         # keep = 3 + 1 = 4, trim = 4 - 4 = 0
         num_accepted = mx.array([3], dtype=mx.int32)
         engine._rollback_cache(batch, num_accepted, max_input_len=4)
 
-        assert cache_layers[0].trim_calls == []  # no trim needed
+        assert cache_layers[0].trim_per_seq_calls == []  # max trim is 0
 
     def test_trim_amount_calculation(self):
         cache_layers = [MockCacheLayer(offset=20)]
@@ -501,13 +584,15 @@ class TestRollbackCache:
             samplers=[MockSampler()],
         )
         engine, _ = make_engine(batch=batch)
+        engine._per_seq_trim = True
 
         # 0 accepted from k=5, max_input_len=6
         # keep = 0 + 1 = 1, trim = 6 - 1 = 5
         num_accepted = mx.array([0], dtype=mx.int32)
         engine._rollback_cache(batch, num_accepted, max_input_len=6)
 
-        assert cache_layers[0].trim_calls == [5]
+        assert len(cache_layers[0].trim_per_seq_calls) == 1
+        assert int(cache_layers[0].trim_per_seq_calls[0][0]) == 5
 
 
 class TestShouldSpeculate:
@@ -765,8 +850,9 @@ class TestSpeculativeStep:
         assert resp.tokens == [10, 11]
         assert resp.num_accepted == 1
 
-        # Cache trim: max_input_len=4, min_accepted=1, keep=2, trim=2
-        assert cache_layers[0].trim_calls == [2]
+        # Cache trim: Result A, per-sequence: keep=2, trim=4-2=2
+        assert len(cache_layers[0].trim_per_seq_calls) == 1
+        assert int(cache_layers[0].trim_per_seq_calls[0][0]) == 2
 
     def test_controller_updated_after_step(self):
         """Controller stats are updated after a successful spec step."""
@@ -800,7 +886,10 @@ class TestSpeculativeStep:
         assert stats.total_bonus_tokens == 1  # all accepted = bonus
 
     def test_batch_two_sequences_different_acceptance(self):
-        """Batch of 2: seq0 accepts all 3, seq1 accepts 0."""
+        """Batch of 2: seq0 accepts all 3, seq1 accepts 0.
+
+        Result A: each sequence keeps its own accepted tokens.
+        """
         vocab_size = 200
         k = 3
 
@@ -822,7 +911,7 @@ class TestSpeculativeStep:
             [60, 61, 62, 63],
         ])
 
-        cache_layers = [MockCacheLayer(offset=20)]
+        cache_layers = [MockCacheLayer(offset=20, batch_size=2)]
         batch = MockBatch(
             uids=[0, 1],
             y=mx.array([5, 6]),
@@ -839,15 +928,19 @@ class TestSpeculativeStep:
 
         assert len(responses) == 2
 
-        # Result B: min_accepted = 0, max_valid = 1
-        # Both sequences clamped to 1 token
-        assert responses[0].tokens == [10]
-        assert responses[0].num_accepted == 0
-        assert responses[1].tokens == [60]  # correction token
+        # Result A: seq 0 keeps all 4 tokens (3 accepted + bonus)
+        assert responses[0].tokens == [10, 11, 12, 99]
+        assert responses[0].num_accepted == 3
+        # Seq 1 gets 1 correction token
+        assert responses[1].tokens == [60]
         assert responses[1].num_accepted == 0
 
-        # Cache trim: max_input_len=4, min_accepted=0, keep=1, trim=3
-        assert cache_layers[0].trim_calls == [3]
+        # Cache trim: Result A, per-sequence trim
+        # seq 0: keep=4, trim=0; seq 1: keep=1, trim=3
+        assert len(cache_layers[0].trim_per_seq_calls) == 1
+        trim_arr = cache_layers[0].trim_per_seq_calls[0]
+        assert int(trim_arr[0]) == 0  # seq 0
+        assert int(trim_arr[1]) == 3  # seq 1
 
 
 class TestResponseFields:
@@ -909,3 +1002,88 @@ class TestResponseFields:
         )
 
         assert responses[0].uid == 42
+
+
+class TestLazyDetection:
+    """Test that _per_seq_trim is detected lazily and only once."""
+
+    def test_lazy_detection_triggers_once(self):
+        """Engine detects per_seq_trim on first speculative_step, not before."""
+        vocab_size = 200
+        draft_tokens = mx.array([[10, 11, 12]], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3], dtype=mx.int32),
+        )
+        logits = make_deterministic_logits(1, 4, vocab_size, [[10, 11, 12, 99]])
+
+        cache_layers = [MockCacheLayer(offset=20)]
+        batch = MockBatch(
+            uids=[0],
+            y=mx.array([5]),
+            tokens=[mx.array([1, 2, 3, 4, 5])],
+            num_tokens=[5],
+            max_tokens=[100],
+            cache=cache_layers,
+            samplers=[MockSampler(0.0)],
+        )
+
+        engine, bg = make_engine(batch=batch, model_logits=logits, proposal=proposal)
+
+        # Before first step, detection has not occurred
+        assert engine._per_seq_trim is None
+
+        seqs = [MockSequenceState("r0", token_ids=[1, 2, 3, 4, 5])]
+        engine.speculative_step(seqs)
+
+        # After first step, detection has occurred (MockCacheLayer has trim_per_sequence)
+        assert engine._per_seq_trim is True
+
+        # Second call doesn't re-detect (stays True)
+        # Reset proposal for second step
+        engine.proposer._proposal = ProposalResult(
+            draft_tokens=mx.array([[10, 11, 12]], dtype=mx.int32),
+            draft_probs=None,
+            proposal_lens=mx.array([3], dtype=mx.int32),
+        )
+        engine.speculative_step(seqs)
+        assert engine._per_seq_trim is True
+
+    def test_detection_false_without_trim_per_sequence(self):
+        """Engine detects Result B when cache lacks trim_per_sequence."""
+
+        class BasicCacheLayer:
+            """Cache without trim_per_sequence."""
+            def __init__(self):
+                self._offset = 20
+                self.offset = mx.array([20], dtype=mx.int32)
+            def trim(self, n):
+                self._offset -= n
+                self.offset = self.offset - n
+
+        vocab_size = 200
+        draft_tokens = mx.array([[10, 11, 12]], dtype=mx.int32)
+        proposal = ProposalResult(
+            draft_tokens=draft_tokens,
+            draft_probs=None,
+            proposal_lens=mx.array([3], dtype=mx.int32),
+        )
+        logits = make_deterministic_logits(1, 4, vocab_size, [[10, 11, 12, 99]])
+
+        cache_layers = [BasicCacheLayer()]
+        batch = MockBatch(
+            uids=[0],
+            y=mx.array([5]),
+            tokens=[mx.array([1, 2, 3, 4, 5])],
+            num_tokens=[5],
+            max_tokens=[100],
+            cache=cache_layers,
+            samplers=[MockSampler(0.0)],
+        )
+
+        engine, bg = make_engine(batch=batch, model_logits=logits, proposal=proposal)
+        seqs = [MockSequenceState("r0", token_ids=[1, 2, 3, 4, 5])]
+        engine.speculative_step(seqs)
+
+        assert engine._per_seq_trim is False

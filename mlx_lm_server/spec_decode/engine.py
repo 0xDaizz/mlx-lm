@@ -8,23 +8,29 @@ Works alongside BatchGenerator:
 The engine does NOT own the model or cache — it borrows them
 from BatchGenerator.active_batch for each step.
 
-GATE Result B: per-sequence offset manipulation is UNSAFE.
-This engine uses uniform_trim() for cache rollback. When sequences
-accept different numbers of tokens, the cache is trimmed to the
-minimum accepted count. Sequences that accepted more tokens lose
-some cache entries (conservative approach acceptable for Phase 1
-n-gram where k is small).
+Result A (argmax-safe per-sequence trim): when the underlying
+BatchKVCache supports trim_per_sequence(), each sequence keeps
+its own accepted tokens and the cache is trimmed per-sequence.
+Falls back to Result B (uniform trim to batch minimum) when
+trim_per_sequence is not available.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, List
 
 import mlx.core as mx
 
-from mlx_lm_server.spec_decode.cache_utils import uniform_trim
+from mlx_lm_server.spec_decode.cache_utils import (
+    batch_variable_trim,
+    can_per_seq_trim,
+    uniform_trim,
+)
 from mlx_lm_server.spec_decode.proposer.base import SpecResponse
 from mlx_lm_server.spec_decode.verifier import PLACEHOLDER_TOKEN_ID
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from mlx_lm_server.spec_decode.config import SpecDecodeConfig
@@ -60,6 +66,8 @@ class SpecDecodeEngine:
         self.verifier = verifier
         self.config = config
         self.controller = controller
+        self._per_seq_trim: bool | None = None  # None = not yet detected
+        self._warned_fallback = False
 
     def should_speculate(self, batch_size: int) -> bool:
         """Check if spec decode should be used for this step.
@@ -97,6 +105,15 @@ class SpecDecodeEngine:
         if batch is None:
             return []
 
+        if self._per_seq_trim is None:
+            self._per_seq_trim = can_per_seq_trim(batch.cache)
+            if not self._per_seq_trim and not self._warned_fallback:
+                logger.warning(
+                    "Cache lacks trim_per_sequence — using Result B (uniform trim). "
+                    "Per-sequence acceptance clamped to batch minimum."
+                )
+                self._warned_fallback = True
+
         k = self.controller.get_k(len(sequences))
         if k == 0:
             return self._fallback_normal_decode()
@@ -125,7 +142,7 @@ class SpecDecodeEngine:
             modes=per_seq_modes,
         )
 
-        # --- Step 5: CACHE ROLLBACK (Result B: uniform_trim) ---
+        # --- Step 5: CACHE ROLLBACK (Result A or B) ---
         max_input_len = verify_input.shape[1]
         self._rollback_cache(batch, num_accepted, max_input_len)
 
@@ -227,17 +244,27 @@ class SpecDecodeEngine:
     ) -> None:
         """Roll back KV cache to account for rejected tokens.
 
-        GATE Result B: uses uniform_trim to the minimum accepted count.
-        All sequences are trimmed to the same level. Sequences that
-        accepted more than the minimum lose some valid cache entries,
-        which will be recomputed on the next forward pass.
-        """
-        min_accepted = int(num_accepted.min())
-        keep = min_accepted + 1  # accepted drafts + correction/bonus token
-        trim_amount = max_input_len - keep
+        Result A: per-sequence trim via batch_variable_trim when the cache
+        supports trim_per_sequence(). Each sequence keeps its own accepted
+        tokens.
 
-        if trim_amount > 0:
-            uniform_trim(batch.cache, trim_amount)
+        Result B: uniform_trim to the minimum accepted count. Sequences
+        that accepted more than the minimum lose some valid cache entries.
+        """
+        if self._per_seq_trim:
+            # Result A: per-sequence trim
+            batch_size = num_accepted.shape[0]
+            keep = num_accepted + 1
+            trim_amounts = mx.array([max_input_len] * batch_size, dtype=mx.int32) - keep
+            trim_amounts = mx.maximum(trim_amounts, 0)
+            if int(trim_amounts.max()) > 0:
+                batch_variable_trim(batch.cache, trim_amounts)
+        else:
+            # Result B: uniform trim to min_accepted
+            min_accepted = int(num_accepted.min())
+            trim_amount = max_input_len - (min_accepted + 1)
+            if trim_amount > 0:
+                uniform_trim(batch.cache, trim_amount)
 
     def _update_batch_state(
         self,
@@ -258,9 +285,6 @@ class SpecDecodeEngine:
         """
         responses = []
         min_accepted = int(num_accepted.min())
-        # Result B: clamp emitted tokens to min_accepted + 1 since
-        # cache was uniformly trimmed to that level.
-        max_valid = min_accepted + 1
 
         for i, seq in enumerate(sequences):
             uid = batch.uids[i]
@@ -279,8 +303,14 @@ class SpecDecodeEngine:
             if not valid_tokens:
                 valid_tokens = [int(mx.argmax(target_probs[i, 0, :]))]
 
-            # Clamp to what the cache supports after uniform trim
-            valid_tokens = valid_tokens[:max_valid]
+            # Clamp to what the cache supports after trim
+            if self._per_seq_trim:
+                # Result A: each seq emits n_accepted + 1 tokens
+                valid_count = n_accepted + 1
+            else:
+                # Result B: clamp to batch-wide min_accepted + 1
+                valid_count = min(n_accepted + 1, min_accepted + 1)
+            valid_tokens = valid_tokens[:valid_count]
 
             # Update batch state — single bulk concatenation per sequence
             valid_arr = mx.array(valid_tokens)
@@ -310,7 +340,7 @@ class SpecDecodeEngine:
                 finish_reason=finish_reason,
                 prompt_cache=None,
                 num_drafted=plen,
-                num_accepted=min(n_accepted, min_accepted),
+                num_accepted=n_accepted if self._per_seq_trim else min(n_accepted, min_accepted),
             ))
 
         # Update batch.y as mx.array

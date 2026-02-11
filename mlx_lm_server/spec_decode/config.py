@@ -54,6 +54,7 @@ class SpecDecodeConfig:
     # Draft model settings (Phase 2)
     draft_model_path: Optional[str] = None
     draft_model_quantize: Optional[str] = None
+    draft_context_len: int = 128
 
     # Dynamic control
     dynamic_enabled: bool = True
@@ -99,4 +100,8 @@ class SpecDecodeConfig:
         if self.disable_by_batch_size < 0:
             raise ValueError(
                 f"disable_by_batch_size must be >= 0, got {self.disable_by_batch_size}"
+            )
+        if self.draft_context_len < 1 or self.draft_context_len > 512:
+            raise ValueError(
+                f"draft_context_len must be in [1, 512], got {self.draft_context_len}"
             )

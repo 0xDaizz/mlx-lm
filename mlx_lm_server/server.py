@@ -1410,6 +1410,12 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     spec_group.add_argument("--draft-model-path", type=str, default=None)
     spec_group.add_argument("--draft-model-quantize", type=str, default=None)
     spec_group.add_argument(
+        "--draft-context-len",
+        type=int,
+        default=defaults.spec_decode_draft_context_len,
+        help="Draft model prefill context length, max 512 (default: 128)",
+    )
+    spec_group.add_argument(
         "--no-spec-decode-dynamic",
         dest="spec_decode_dynamic",
         action="store_false",
