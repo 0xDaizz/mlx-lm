@@ -949,6 +949,19 @@ def create_app(
         ]
         return PlainTextResponse("\n".join(lines) + "\n", media_type="text/plain; version=0.0.4; charset=utf-8")
 
+    # ------------------------------------------------------------------
+    # GET /v1/spec_decode/metrics
+    # ------------------------------------------------------------------
+
+    @app.get("/v1/spec_decode/metrics")
+    async def spec_decode_metrics():
+        """Return speculative decoding metrics."""
+        sched = app.state.scheduler
+        if hasattr(sched, '_spec_engine') and sched._spec_engine is not None:
+            metrics = sched._spec_engine.controller.get_metrics()
+            return JSONResponse(content=metrics)
+        return JSONResponse(content={"spec_decode_enabled": False})
+
     return app
 
 
@@ -1366,6 +1379,54 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     parser.add_argument("--num-local-ranks", type=int, default=None,
                         help="Number of local ranks for single-machine TP (used by auto-relaunch)")
 
+    # Speculative Decoding
+    spec_group = parser.add_argument_group("Speculative Decoding")
+    spec_group.add_argument(
+        "--spec-decode",
+        choices=["none", "ngram", "draft"],
+        default="none",
+        help="Speculative decoding mode (default: none)",
+    )
+    spec_group.add_argument(
+        "--num-speculative-tokens",
+        type=int,
+        default=5,
+        help="Number of draft tokens per speculation step (default: 5)",
+    )
+    spec_group.add_argument(
+        "--spec-decode-disable-batch-size",
+        type=int,
+        default=8,
+        help="Auto-disable spec decode when batch size >= this (default: 8)",
+    )
+    spec_group.add_argument("--ngram-max", type=int, default=4)
+    spec_group.add_argument("--ngram-min", type=int, default=1)
+    spec_group.add_argument(
+        "--no-ngram-prompt-lookup",
+        dest="ngram_prompt_lookup",
+        action="store_false",
+        default=True,
+    )
+    spec_group.add_argument("--draft-model-path", type=str, default=None)
+    spec_group.add_argument("--draft-model-quantize", type=str, default=None)
+    spec_group.add_argument(
+        "--no-spec-decode-dynamic",
+        dest="spec_decode_dynamic",
+        action="store_false",
+        default=True,
+    )
+    spec_group.add_argument(
+        "--spec-decode-acceptance-threshold",
+        type=float,
+        default=0.3,
+    )
+    spec_group.add_argument(
+        "--no-adaptive-k",
+        dest="adaptive_k",
+        action="store_false",
+        default=True,
+    )
+
     parsed = parser.parse_args(args)
 
     if parsed.ssd_writer_queue_size < 1:
@@ -1517,6 +1578,17 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
         "distributed_mode": parsed.distributed_mode,
         "distributed_sharding": parsed.distributed_sharding,
         "distributed_strict": parsed.distributed_strict,
+        "spec_decode_mode": parsed.spec_decode,
+        "spec_decode_num_tokens": parsed.num_speculative_tokens,
+        "spec_decode_disable_batch_size": parsed.spec_decode_disable_batch_size,
+        "spec_decode_ngram_max": parsed.ngram_max,
+        "spec_decode_ngram_min": parsed.ngram_min,
+        "spec_decode_ngram_prompt_lookup": parsed.ngram_prompt_lookup,
+        "spec_decode_draft_model": parsed.draft_model_path,
+        "spec_decode_draft_quantize": parsed.draft_model_quantize,
+        "spec_decode_dynamic": parsed.spec_decode_dynamic,
+        "spec_decode_acceptance_threshold": parsed.spec_decode_acceptance_threshold,
+        "spec_decode_adaptive_k": parsed.adaptive_k,
     }
 
     if api_key is not None:

@@ -24,7 +24,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Optional
 from mlx_lm_server.config import ServerConfig
 from mlx_lm_server.types import (
     InferenceRequest,
@@ -244,6 +244,8 @@ class Scheduler:
             "total_requests": 0,
             "submitted_requests": 0,
             "accepted_requests": 0,
+            "spec_tokens_drafted": 0,
+            "spec_tokens_accepted": 0,
         }
         self._stats_lock = threading.Lock()
 
@@ -270,6 +272,9 @@ class Scheduler:
             except Exception as e:
                 logger.warning("SSD cache validation failed on startup: %s", e)
 
+        # Speculative decode engine (optional)
+        self._spec_engine: Optional[Any] = None
+
         # Initialize BatchGenerator if model is available
         if self.model is not None and BatchGenerator is not None:
             self._create_batch_generator()
@@ -282,6 +287,51 @@ class Scheduler:
                 "model was provided but BatchGenerator failed to import. "
                 "Check mlx_lm installation."
             )
+
+        # Initialize SpecDecodeEngine after BatchGenerator is created
+        if config.spec_decode_mode != "none" and self._batch_generator is not None:
+            try:
+                from mlx_lm_server.spec_decode.config import SpecDecodeConfig
+                from mlx_lm_server.spec_decode.engine import SpecDecodeEngine
+                from mlx_lm_server.spec_decode.proposer.base import create_proposer
+                from mlx_lm_server.spec_decode.verifier import NGramVerifier
+                from mlx_lm_server.spec_decode.controller import DynamicSpecController
+
+                spec_config = SpecDecodeConfig(
+                    mode=config.spec_decode_mode,
+                    num_speculative_tokens=config.spec_decode_num_tokens,
+                    disable_by_batch_size=config.spec_decode_disable_batch_size,
+                    ngram_max=config.spec_decode_ngram_max,
+                    ngram_min=config.spec_decode_ngram_min,
+                    ngram_prompt_lookup=config.spec_decode_ngram_prompt_lookup,
+                    draft_model_path=config.spec_decode_draft_model,
+                    draft_model_quantize=config.spec_decode_draft_quantize,
+                    dynamic_enabled=config.spec_decode_dynamic,
+                    acceptance_rate_threshold=config.spec_decode_acceptance_threshold,
+                    adaptive_k=config.spec_decode_adaptive_k,
+                )
+                spec_config.validate()
+
+                proposer = create_proposer(spec_config, target_model=self.model)
+                verifier = NGramVerifier(mode="greedy")  # Phase 1: greedy only
+                controller = DynamicSpecController(spec_config)
+
+                if proposer is not None:
+                    self._spec_engine = SpecDecodeEngine(
+                        model=self.model,
+                        batch_generator=self._batch_generator,
+                        proposer=proposer,
+                        verifier=verifier,
+                        config=spec_config,
+                        controller=controller,
+                    )
+                    logger.info(
+                        "SpecDecodeEngine initialized: mode=%s, k=%d",
+                        config.spec_decode_mode,
+                        config.spec_decode_num_tokens,
+                    )
+            except Exception as e:
+                logger.warning("Failed to initialize SpecDecodeEngine: %s", e, exc_info=True)
 
     def _inc_stat(self, key: str, value: int = 1) -> None:
         """Thread-safe increment of a stats counter."""
@@ -911,18 +961,53 @@ class Scheduler:
         # 3. Run one batch step if there are active sequences
         with self._active_lock:
             has_active = bool(self._uid_to_request_id)
+            active_count = len(self._uid_to_request_id)
         if not has_active:
             return
 
-        # Call next() to get responses for all active sequences
-        try:
-            responses = self._batch_generator.next()
-        except Exception as e:
-            logger.error("BatchGenerator.next() failed: %s", e, exc_info=True)
-            raise
+        # 4. Choose decode strategy: speculative or normal
+        use_spec = (
+            self._spec_engine is not None
+            and self._spec_engine.should_speculate(active_count)
+        )
 
-        # 4. Process responses
-        events, uids_to_remove, finished_caches = self._process_batch_responses(responses)
+        if use_spec:
+            # Speculative decode path
+            with self._active_lock:
+                sequences = [
+                    self._active_sequences[rid]
+                    for rid in self._uid_to_request_id.values()
+                    if rid in self._active_sequences
+                ]
+            try:
+                responses = self._spec_engine.speculative_step(sequences)
+            except Exception as e:
+                logger.error("SpecDecodeEngine failed: %s", e, exc_info=True)
+                # Fall back to normal decode
+                responses = self._batch_generator.next()
+                use_spec = False
+
+            if use_spec:
+                # Process spec responses (multi-token)
+                events, uids_to_remove, finished_caches = (
+                    self._process_spec_responses(responses)
+                )
+            else:
+                # Fell back to normal
+                events, uids_to_remove, finished_caches = (
+                    self._process_batch_responses(responses)
+                )
+        else:
+            # Normal decode path (unchanged)
+            try:
+                responses = self._batch_generator.next()
+            except Exception as e:
+                logger.error("BatchGenerator.next() failed: %s", e, exc_info=True)
+                raise
+
+            events, uids_to_remove, finished_caches = (
+                self._process_batch_responses(responses)
+            )
 
         # 5. Emit token events
         self._emit_tokens(events)
@@ -1013,6 +1098,92 @@ class Scheduler:
                 finish_reason=finish_reason,
             )
             events.append(event)
+
+        return events, uids_to_remove, finished_caches
+
+    def _process_spec_responses(
+        self, responses
+    ) -> tuple[list[TokenEvent], list[int], dict[int, list]]:
+        """Process speculative decode responses with multiple tokens per sequence.
+
+        Similar to _process_batch_responses but handles SpecResponse objects
+        which contain a list of tokens instead of a single token.
+
+        Args:
+            responses: List of SpecResponse from SpecDecodeEngine.
+
+        Returns:
+            Tuple of (events, uids_to_remove, finished_caches).
+        """
+        uids_to_remove: list[int] = []
+        events: list[TokenEvent] = []
+        finished_caches: dict[int, list] = {}
+
+        for r in responses:
+            # Handle both SpecResponse (has .tokens list) and
+            # BatchGenerator.Response (has .token single) for fallback path
+            if hasattr(r, 'tokens'):
+                tokens = r.tokens
+            else:
+                tokens = [r.token]
+
+            request_id = self._uid_to_request_id.get(r.uid)
+            if request_id is None:
+                continue
+
+            with self._active_lock:
+                seq = self._active_sequences.get(request_id)
+            if seq is None:
+                continue
+
+            finish_reason = None
+
+            for token in tokens:
+                # Detokenize
+                detokenizer = getattr(seq, "_detokenizer", None)
+                if detokenizer is not None:
+                    detokenizer.add_token(token)
+                    token_text = detokenizer.last_segment
+                else:
+                    token_text = str(token)
+
+                seq.output_tokens.append(token)
+                seq.token_ids.append(token)
+                seq.output_text += token_text
+
+                # Check stop conditions
+                if finish_reason is None:
+                    request = getattr(seq, "_request", None)
+                    if request is not None:
+                        finish_reason = self._check_stop_conditions(seq, request)
+
+                events.append(TokenEvent(
+                    request_id=request_id,
+                    token_id=token,
+                    token_text=token_text,
+                    finish_reason=finish_reason if finish_reason else None,
+                ))
+
+                if finish_reason is not None:
+                    break
+
+            # Handle finish
+            if finish_reason is not None:
+                seq.is_finished = True
+                seq.finish_reason = finish_reason
+                self._inc_stat("requests_completed")
+                uids_to_remove.append(r.uid)
+
+                if hasattr(r, 'prompt_cache') and r.prompt_cache is not None:
+                    try:
+                        finished_caches[r.uid] = r.prompt_cache
+                    except Exception:
+                        pass
+
+            # Update spec decode stats
+            if hasattr(r, 'num_drafted'):
+                self._inc_stat("spec_tokens_drafted", r.num_drafted)
+                self._inc_stat("spec_tokens_accepted", r.num_accepted)
 
         return events, uids_to_remove, finished_caches
 

@@ -71,3 +71,16 @@ class ServerConfig:
     distributed_hostfile: str | None = None
     distributed_ibv_devices: str | None = None
     distributed_jaccl_coordinator: str | None = None
+
+    # Speculative Decoding
+    spec_decode_mode: str = "none"                 # none | ngram | draft
+    spec_decode_num_tokens: int = 5                # k
+    spec_decode_disable_batch_size: int = 8        # auto-OFF threshold
+    spec_decode_ngram_max: int = 4
+    spec_decode_ngram_min: int = 1
+    spec_decode_ngram_prompt_lookup: bool = True
+    spec_decode_draft_model: str | None = None
+    spec_decode_draft_quantize: str | None = None
+    spec_decode_dynamic: bool = True
+    spec_decode_acceptance_threshold: float = 0.3
+    spec_decode_adaptive_k: bool = True
