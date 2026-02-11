@@ -2756,3 +2756,101 @@ class TestStreamOptionsIncludeUsage:
             assert chunk["choices"] != [], (
                 "With include_usage=false, no usage chunk should be emitted"
             )
+
+
+# ===========================================================================
+# TestNParameter — reject n > 1
+# ===========================================================================
+
+
+class TestNParameter:
+    """Verify that n > 1 is rejected and n=1 is accepted."""
+
+    @pytest.mark.anyio
+    async def test_n_greater_than_1_rejected(self, client):
+        """n=2 must be rejected with a validation error."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": 2,
+            },
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "n > 1 is not supported" in body["error"]["message"]
+
+    @pytest.mark.anyio
+    async def test_n_equals_1_accepted(self, client):
+        """n=1 should be accepted normally (200)."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": 1,
+            },
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_completion_n_greater_than_1_rejected(self, client):
+        """n=2 on /v1/completions must also be rejected."""
+        resp = await client.post(
+            "/v1/completions",
+            json={
+                "prompt": "Hello",
+                "n": 3,
+            },
+        )
+        assert resp.status_code == 422
+        body = resp.json()
+        assert "n > 1 is not supported" in body["error"]["message"]
+
+    @pytest.mark.anyio
+    async def test_completion_n_equals_1_accepted(self, client):
+        """n=1 on /v1/completions should work normally."""
+        resp = await client.post(
+            "/v1/completions",
+            json={
+                "prompt": "Hello",
+                "n": 1,
+            },
+        )
+        assert resp.status_code == 200
+
+
+# ===========================================================================
+# TestExtraFieldsIgnored — unknown fields silently dropped
+# ===========================================================================
+
+
+class TestExtraFieldsIgnored:
+    """Verify that unknown request fields are silently ignored (OpenAI compat)."""
+
+    @pytest.mark.anyio
+    async def test_chat_completion_extra_fields_ignored(self, client):
+        """Extra fields on /v1/chat/completions should not cause 422."""
+        resp = await client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "hi"}],
+                "unknown_field": "should_be_ignored",
+                "logprobs": True,
+                "best_of": 5,
+            },
+        )
+        assert resp.status_code == 200
+
+    @pytest.mark.anyio
+    async def test_extra_fields_ignored(self, client):
+        """Extra fields on /v1/completions should not cause 422."""
+        resp = await client.post(
+            "/v1/completions",
+            json={
+                "prompt": "Hello",
+                "unknown_field": "should_be_ignored",
+                "logprobs": 5,
+                "suffix": "world",
+            },
+        )
+        assert resp.status_code == 200

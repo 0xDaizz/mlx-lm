@@ -89,6 +89,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     model: str = ""
     messages: list[ChatMessage]
     max_tokens: int = 512
@@ -97,6 +99,7 @@ class ChatCompletionRequest(BaseModel):
     stream: bool = False
     stop: list[str] | str | None = None
     stream_options: dict | None = None
+    n: int = 1
 
     @field_validator('messages')
     @classmethod
@@ -105,8 +108,17 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError('messages must not be empty')
         return v
 
+    @field_validator('n')
+    @classmethod
+    def n_must_be_one(cls, v):
+        if v != 1:
+            raise ValueError('n > 1 is not supported; only n=1 is allowed')
+        return v
+
 
 class CompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
     model: str = ""
     prompt: str
     max_tokens: int = 512
@@ -115,6 +127,14 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     stop: list[str] | str | None = None
     stream_options: dict | None = None
+    n: int = 1
+
+    @field_validator('n')
+    @classmethod
+    def n_must_be_one(cls, v):
+        if v != 1:
+            raise ValueError('n > 1 is not supported; only n=1 is allowed')
+        return v
 
 
 class UsageInfo(BaseModel):

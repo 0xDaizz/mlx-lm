@@ -60,6 +60,11 @@ BUS_OUTBOX_MAXSIZE = 1024
 BUS_OUTBOX_CONTROL_RESERVE = 64
 BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S = 2.0
 
+_PENDING_CACHE_SAVES_MAX = 10000
+_PENDING_CACHE_SAVES_CLEANUP_INTERVAL_S = 60.0
+
+_BUS_RETRY_EVENTS_MAX = 100
+
 
 class RequestQueue:
     """Thread-safe FIFO queue for incoming inference requests.
@@ -224,6 +229,7 @@ class Scheduler:
         # and saved to sequence cache + block-level cache, so the prefill
         # computation is not wasted and can be reused by future requests.
         self._pending_cache_saves: set[int] = set()
+        self._pending_cache_saves_last_cleanup: float = time.monotonic()
 
         # Cache effectiveness counters
         self._stats: dict[str, int] = {
@@ -814,6 +820,13 @@ class Scheduler:
                 # Preserve events for retry (skip noops)
                 real_events = [ev for ev in events if ev.typ != "noop"]
                 if real_events:
+                    if len(real_events) > _BUS_RETRY_EVENTS_MAX:
+                        num_discarded = len(real_events) - _BUS_RETRY_EVENTS_MAX
+                        logger.warning(
+                            "Bus retry events exceed max (%d), discarding %d oldest events",
+                            _BUS_RETRY_EVENTS_MAX, num_discarded,
+                        )
+                        real_events = real_events[num_discarded:]
                     self._bus_retry_events = real_events
                     # Signal quick retry
                     self._new_request_event.set()
@@ -930,6 +943,9 @@ class Scheduler:
 
         # 8. Periodic SSD pruning
         self._prune_ssd_if_needed()
+
+        # 8b. Periodic stale cleanup for _pending_cache_saves
+        self._cleanup_stale_pending_cache_saves()
 
         # 9. Clean up finished sequences
         self._cleanup_finished_batch()
@@ -1074,6 +1090,32 @@ class Scheduler:
                         logger.info("Pruned %d expired SSD blocks", pruned)
                 except Exception as e:
                     logger.warning("SSD pruning failed: %s", e)
+
+    def _cleanup_stale_pending_cache_saves(self) -> None:
+        """Periodically remove stale UIDs from _pending_cache_saves.
+
+        A UID is stale if it is no longer present in _uid_to_request_id,
+        meaning the request has already been cleaned up through another path
+        without going through the normal discard in _cleanup_finished_batch
+        or _process_cancellations_batch.
+
+        Runs at most once every _PENDING_CACHE_SAVES_CLEANUP_INTERVAL_S seconds.
+        """
+        now = time.monotonic()
+        if now - self._pending_cache_saves_last_cleanup < _PENDING_CACHE_SAVES_CLEANUP_INTERVAL_S:
+            return
+        self._pending_cache_saves_last_cleanup = now
+
+        if not self._pending_cache_saves:
+            return
+
+        stale = self._pending_cache_saves - set(self._uid_to_request_id.keys())
+        if stale:
+            self._pending_cache_saves -= stale
+            logger.info(
+                "Cleaned up %d stale UIDs from _pending_cache_saves (remaining: %d)",
+                len(stale), len(self._pending_cache_saves),
+            )
 
     def _process_cancellations_batch(self) -> None:
         """Remove cancelled requests from BatchGenerator.
@@ -1329,7 +1371,13 @@ class Scheduler:
                     seq._batch_uid = uid
                     # G2: Track cache-miss inserts for early prefill save
                     if cache is None:
-                        self._pending_cache_saves.add(uid)
+                        if len(self._pending_cache_saves) < _PENDING_CACHE_SAVES_MAX:
+                            self._pending_cache_saves.add(uid)
+                        else:
+                            logger.warning(
+                                "Pending cache saves set at capacity (%d), skipping UID %d",
+                                _PENDING_CACHE_SAVES_MAX, uid,
+                            )
                     # Register in _active_sequences AFTER insert() succeeds
                     # and UID is assigned (Bug 3 / Issue 4 fix).
                     with self._active_lock:

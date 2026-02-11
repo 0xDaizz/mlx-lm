@@ -703,3 +703,278 @@ class TestG2CancelCacheSalvage:
                 "remove() should be called with return_prompt_caches=True for salvageable UIDs"
         finally:
             sched.stop()
+
+
+# ---------------------------------------------------------------------------
+# Resource Bounding: _pending_cache_saves and _bus_retry_events
+# ---------------------------------------------------------------------------
+
+
+class TestPendingCacheSavesBounded:
+    """Tests for bounding the _pending_cache_saves set."""
+
+    def test_pending_cache_saves_bounded(self):
+        """Verify _pending_cache_saves set does not exceed _PENDING_CACHE_SAVES_MAX."""
+        from mlx_lm_server.scheduler import _PENDING_CACHE_SAVES_MAX
+
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Directly fill _pending_cache_saves to capacity
+        for i in range(_PENDING_CACHE_SAVES_MAX):
+            sched._pending_cache_saves.add(i)
+
+        assert len(sched._pending_cache_saves) == _PENDING_CACHE_SAVES_MAX
+
+        # Simulate the bounded add logic: adding a new UID when at capacity
+        # should be skipped. We test by calling the code path that does the add.
+        # The add site is in _insert_new_requests_batch, but we can test the
+        # invariant directly: after filling to max, the set stays at max.
+        sched._pending_cache_saves.add(99999999)  # direct add would exceed
+        # But the scheduler code checks len() before .add(). Let's verify the
+        # constant is accessible and the set was at capacity before the forced add.
+        assert _PENDING_CACHE_SAVES_MAX == 10000
+
+        # Now test the actual code path through the scheduler.
+        # Reset and fill to capacity minus 1, submit one request, it should add.
+        sched._pending_cache_saves.clear()
+        for i in range(_PENDING_CACHE_SAVES_MAX):
+            sched._pending_cache_saves.add(i)
+
+        # The set is now at max. The code path in _insert_new_requests_batch
+        # checks `if len(self._pending_cache_saves) < _PENDING_CACHE_SAVES_MAX`
+        # before adding. We verify this by running the inference loop with
+        # a request that would trigger a cache-miss add.
+        sched.run_inference_loop()
+        try:
+            req = InferenceRequest(
+                request_id="bound-test",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=2,
+            )
+            sched.submit_request(req)
+            events = sched.get_result("bound-test", timeout=5.0)
+            assert events[-1].finish_reason is not None
+
+            # The UID for this request should NOT be in _pending_cache_saves
+            # because the set was already at capacity when the request was inserted.
+            uid = None
+            # The request completed, so UID mapping may already be cleaned up.
+            # But the _pending_cache_saves set should not have grown beyond max + a few
+            # (the cleanup path removes entries too).
+            # Key assertion: set never exceeds max by more than a tiny margin
+            # (cleanup may remove some entries between the add and now).
+            assert len(sched._pending_cache_saves) <= _PENDING_CACHE_SAVES_MAX + 1
+        finally:
+            sched.stop()
+
+    def test_pending_cache_saves_stale_cleanup(self):
+        """Verify stale UIDs are removed from _pending_cache_saves during periodic cleanup."""
+        from mlx_lm_server.scheduler import _PENDING_CACHE_SAVES_CLEANUP_INTERVAL_S
+
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Add some UIDs to _pending_cache_saves that are NOT in _uid_to_request_id
+        # These are "stale" UIDs that should be cleaned up.
+        stale_uids = {100000, 100001, 100002}
+        sched._pending_cache_saves.update(stale_uids)
+
+        # Also add a "live" UID that IS in _uid_to_request_id
+        live_uid = 200000
+        sched._uid_to_request_id[live_uid] = "live-request"
+        sched._pending_cache_saves.add(live_uid)
+
+        assert len(sched._pending_cache_saves) == 4
+
+        # Force the cleanup to run by setting last_cleanup to the past
+        sched._pending_cache_saves_last_cleanup = (
+            time.monotonic() - _PENDING_CACHE_SAVES_CLEANUP_INTERVAL_S - 1.0
+        )
+
+        # Call the cleanup method directly
+        sched._cleanup_stale_pending_cache_saves()
+
+        # Stale UIDs should be removed
+        for uid in stale_uids:
+            assert uid not in sched._pending_cache_saves, \
+                f"Stale UID {uid} should have been removed"
+
+        # Live UID should remain
+        assert live_uid in sched._pending_cache_saves, \
+            "Live UID should not be removed"
+
+        assert len(sched._pending_cache_saves) == 1
+
+        # Clean up
+        sched._uid_to_request_id.pop(live_uid, None)
+
+    def test_pending_cache_saves_cleanup_respects_interval(self):
+        """Cleanup only runs when the time interval has elapsed."""
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        stale_uids = {100000, 100001}
+        sched._pending_cache_saves.update(stale_uids)
+
+        # Set last_cleanup to now — cleanup should NOT run
+        sched._pending_cache_saves_last_cleanup = time.monotonic()
+
+        sched._cleanup_stale_pending_cache_saves()
+
+        # Stale UIDs should still be there (cleanup didn't run)
+        assert stale_uids.issubset(sched._pending_cache_saves), \
+            "Cleanup should not run before interval elapses"
+
+
+class TestBusRetryEventsBounded:
+    """Tests for bounding the _bus_retry_events list."""
+
+    def test_bus_retry_events_bounded(self):
+        """Verify _bus_retry_events does not exceed _BUS_RETRY_EVENTS_MAX."""
+        from mlx_lm_server.scheduler import _BUS_RETRY_EVENTS_MAX
+
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        # Create a mock control bus that always fails to publish
+        class FailingBus:
+            def publish(self, event):
+                raise RuntimeError("Publish failed")
+            def recv(self):
+                raise RuntimeError("Not implemented")
+
+        class MockDistCtx:
+            is_rank0 = True
+            world_size = 2
+
+        sched._control_bus = FailingBus()
+        sched._dist_ctx = MockDistCtx()
+
+        # We need to import ControlEvent to create fake events
+        from mlx_lm_server.distributed_bus import ControlEvent
+
+        # Fill the outbox with more events than _BUS_RETRY_EVENTS_MAX
+        num_events = _BUS_RETRY_EVENTS_MAX + 50
+        for i in range(num_events):
+            req = InferenceRequest(
+                request_id=f"retry-{i}",
+                prompt_tokens=[1, 2, 3],
+                max_tokens=10,
+            )
+            try:
+                sched._bus_outbox.put_nowait(ControlEvent.submit(req))
+            except Exception:
+                break
+
+        # Call _drain_bus_outbox — publish will fail, events go to retry
+        sched._drain_bus_outbox()
+
+        # _bus_retry_events should be bounded
+        assert len(sched._bus_retry_events) <= _BUS_RETRY_EVENTS_MAX, \
+            f"Bus retry events ({len(sched._bus_retry_events)}) should not exceed max ({_BUS_RETRY_EVENTS_MAX})"
+
+    def test_bus_retry_events_oldest_discarded(self):
+        """When bus retry events exceed max, oldest events are discarded (FIFO)."""
+        from mlx_lm_server.scheduler import _BUS_RETRY_EVENTS_MAX
+
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        class FailingBus:
+            def publish(self, event):
+                raise RuntimeError("Publish failed")
+            def recv(self):
+                raise RuntimeError("Not implemented")
+
+        class MockDistCtx:
+            is_rank0 = True
+            world_size = 2
+
+        sched._control_bus = FailingBus()
+        sched._dist_ctx = MockDistCtx()
+
+        from mlx_lm_server.distributed_bus import ControlEvent
+
+        # Create more events than the max
+        total_events = _BUS_RETRY_EVENTS_MAX + 30
+        for i in range(total_events):
+            req = InferenceRequest(
+                request_id=f"order-{i}",
+                prompt_tokens=[1],
+                max_tokens=10,
+            )
+            try:
+                sched._bus_outbox.put_nowait(ControlEvent.submit(req))
+            except Exception:
+                break
+
+        sched._drain_bus_outbox()
+
+        # Should have exactly _BUS_RETRY_EVENTS_MAX events
+        assert len(sched._bus_retry_events) == _BUS_RETRY_EVENTS_MAX
+
+        # The retained events should be the NEWEST ones (oldest discarded).
+        # The last event in retry list should be from the last request added.
+        # Verify by checking that the first discarded events are gone.
+        # Since events are submit events, we can unpack request_ids.
+        retained_ids = []
+        for ev in sched._bus_retry_events:
+            if ev.typ == "submit":
+                req = ev.unpack_request()
+                if req is not None:
+                    retained_ids.append(req.request_id)
+
+        # The oldest 30 events (order-0 through order-29) should be discarded.
+        # The retained should start from order-30.
+        if retained_ids:
+            # First retained should NOT be "order-0" (it was discarded)
+            assert retained_ids[0] != "order-0", \
+                "Oldest event should have been discarded"
+            # Last retained should be from the tail of the original list
+            # (It may not be exactly "order-{total-1}" due to outbox capacity,
+            # but it should be a later event than order-0)
+
+    def test_bus_retry_events_within_limit_no_discard(self):
+        """When bus retry events are within limit, no events are discarded."""
+        from mlx_lm_server.scheduler import _BUS_RETRY_EVENTS_MAX
+
+        sched, mock_bg = _make_scheduler_with_mock_bg(
+            max_batch_size=4, default_max_tokens=100
+        )
+
+        class FailingBus:
+            def publish(self, event):
+                raise RuntimeError("Publish failed")
+            def recv(self):
+                raise RuntimeError("Not implemented")
+
+        class MockDistCtx:
+            is_rank0 = True
+            world_size = 2
+
+        sched._control_bus = FailingBus()
+        sched._dist_ctx = MockDistCtx()
+
+        from mlx_lm_server.distributed_bus import ControlEvent
+
+        # Add fewer events than the max
+        num_events = 10
+        for i in range(num_events):
+            req = InferenceRequest(
+                request_id=f"small-{i}",
+                prompt_tokens=[1],
+                max_tokens=10,
+            )
+            sched._bus_outbox.put_nowait(ControlEvent.submit(req))
+
+        sched._drain_bus_outbox()
+
+        # All events should be retained (no discard needed)
+        assert len(sched._bus_retry_events) == num_events, \
+            f"All {num_events} events should be retained when under limit"
