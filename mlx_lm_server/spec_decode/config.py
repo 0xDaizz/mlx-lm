@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Literal, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,7 +45,7 @@ class SpecDecodeConfig:
             High acceptance -> increase k, low acceptance -> decrease k.
     """
 
-    mode: Literal["none", "ngram", "draft"] = "none"
+    mode: Literal["none", "ngram", "draft", "mtp"] = "none"
     num_speculative_tokens: int = 5
     disable_by_batch_size: int = 8
 
@@ -105,3 +108,17 @@ class SpecDecodeConfig:
             raise ValueError(
                 f"draft_context_len must be in [1, 512], got {self.draft_context_len}"
             )
+
+        # MTP-specific warnings
+        if self.mode == "mtp":
+            if self.draft_model_path:
+                logger.warning(
+                    "draft_model_path is ignored in MTP mode (MTP uses "
+                    "model-internal layers, not an external draft model)."
+                )
+            if self.num_speculative_tokens > 4:
+                logger.warning(
+                    "num_speculative_tokens=%d is high for MTP mode. "
+                    "Most models have 1-2 MTP layers.",
+                    self.num_speculative_tokens,
+                )

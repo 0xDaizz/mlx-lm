@@ -18,7 +18,7 @@ trim_per_sequence is not available.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, List
+from typing import TYPE_CHECKING, List, Optional
 
 import mlx.core as mx
 
@@ -27,7 +27,7 @@ from mlx_lm_server.spec_decode.cache_utils import (
     can_per_seq_trim,
     uniform_trim,
 )
-from mlx_lm_server.spec_decode.proposer.base import SpecResponse
+from mlx_lm_server.spec_decode.proposer.base import ProposalResult, SpecResponse
 from mlx_lm_server.spec_decode.verifier import PLACEHOLDER_TOKEN_ID
 
 logger = logging.getLogger(__name__)
@@ -68,6 +68,9 @@ class SpecDecodeEngine:
         self.controller = controller
         self._per_seq_trim: bool | None = None  # None = not yet detected
         self._warned_fallback = False
+        # MTP mode: capture hidden states from target forward
+        self._mtp_mode: bool = hasattr(proposer, 'set_hidden_states')
+        self._last_hidden: Optional[mx.array] = None
 
     def should_speculate(self, batch_size: int) -> bool:
         """Check if spec decode should be used for this step.
@@ -121,7 +124,17 @@ class SpecDecodeEngine:
         # --- Step 1: PROPOSE ---
         proposal = self.proposer.propose(sequences, k)
         if proposal is None:
-            return self._fallback_normal_decode()
+            if self._mtp_mode:
+                # Null proposal: triggers target_forward to capture hidden
+                # for the next MTP propose step (bootstrap)
+                batch_size = len(sequences)
+                proposal = ProposalResult(
+                    draft_tokens=mx.zeros((batch_size, 1), dtype=mx.int32),
+                    draft_probs=None,
+                    proposal_lens=mx.zeros((batch_size,), dtype=mx.int32),
+                )
+            else:
+                return self._fallback_normal_decode()
 
         # --- Step 2: BUILD VERIFICATION INPUT ---
         verify_input, verify_lens = self._build_verify_input(
@@ -145,6 +158,16 @@ class SpecDecodeEngine:
         # --- Step 5: CACHE ROLLBACK (Result A or B) ---
         max_input_len = verify_input.shape[1]
         self._rollback_cache(batch, num_accepted, max_input_len)
+
+        # --- Step 5.5: MTP HIDDEN STATE UPDATE ---
+        if self._mtp_mode and self._last_hidden is not None:
+            per_seq_h = []
+            for i in range(len(sequences)):
+                n = int(num_accepted[i])
+                # Take the hidden state at the accepted position
+                per_seq_h.append(self._last_hidden[i:i+1, n:n+1, :])
+            self.proposer.set_hidden_states(mx.concatenate(per_seq_h, axis=0))
+            self._last_hidden = None  # Clear to avoid stale reference
 
         # --- Step 6: UPDATE BATCH STATE ---
         responses = self._update_batch_state(
@@ -222,14 +245,22 @@ class SpecDecodeEngine:
         Returns:
             target_probs: [B, max_input_len, vocab_size] softmax probs.
         """
-        logits = self.model(verify_input, cache=batch.cache)
+        if self._mtp_mode:
+            from mlx_lm_server.spec_decode.mtp_utils import forward_with_hidden
+            logits, self._last_hidden = forward_with_hidden(
+                self.model, verify_input, cache=batch.cache
+            )
+        else:
+            logits = self.model(verify_input, cache=batch.cache)
 
-        # Per-sequence temperature scaling
+        # Per-sequence temperature scaling (functional, no in-place mutation)
         batch_size = logits.shape[0]
+        temps = []
         for i in range(batch_size):
-            temp = getattr(batch.samplers[i], 'temperature', 0.0)
-            if temp > 0:
-                logits[i] = logits[i] / temp
+            t = getattr(batch.samplers[i], 'temperature', 0.0)
+            temps.append(t if t > 0 else 1.0)  # 1.0 = no-op for zero temp
+        temp_arr = mx.array(temps).reshape(-1, 1, 1)  # [B, 1, 1]
+        logits = logits / temp_arr  # broadcast, no mutation
 
         target_probs = mx.softmax(logits, axis=-1)
         mx.eval(target_probs)

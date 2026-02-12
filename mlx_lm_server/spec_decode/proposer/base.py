@@ -150,5 +150,12 @@ def create_proposer(
             model_path=config.draft_model_path,
             context_len=config.draft_context_len,
         )
+    elif config.mode == "mtp":
+        # MTP proposer is created directly in scheduler.py
+        # because it needs the MTPModule from build_mtp_module()
+        raise ValueError(
+            "MTP proposer should be created via build_mtp_module() in scheduler, "
+            "not through create_proposer()"
+        )
     else:
         raise ValueError(f"Unknown spec decode mode: {config.mode}")
