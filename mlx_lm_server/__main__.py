@@ -11,7 +11,11 @@ import threading
 
 import uvicorn
 
-from mlx_lm_server.distributed import DistributedContext, finalize_distributed, init_distributed
+from mlx_lm_server.distributed import (
+    DistributedContext,
+    finalize_distributed,
+    init_distributed,
+)
 from mlx_lm_server.server import create_app, parse_args
 
 logger = logging.getLogger(__name__)
@@ -32,8 +36,13 @@ def _maybe_relaunch_under_mlx_launch() -> None:
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--distributed-mode", default="off")
     pre.add_argument("--distributed-hostfile", default=os.environ.get("MLX_HOSTFILE"))
-    pre.add_argument("--distributed-ibv-devices", default=os.environ.get("MLX_IBV_DEVICES"))
-    pre.add_argument("--distributed-jaccl-coordinator", default=os.environ.get("MLX_JACCL_COORDINATOR"))
+    pre.add_argument(
+        "--distributed-ibv-devices", default=os.environ.get("MLX_IBV_DEVICES")
+    )
+    pre.add_argument(
+        "--distributed-jaccl-coordinator",
+        default=os.environ.get("MLX_JACCL_COORDINATOR"),
+    )
     pre.add_argument("--num-local-ranks", type=int, default=None)
     args, _ = pre.parse_known_args()
 
@@ -41,14 +50,21 @@ def _maybe_relaunch_under_mlx_launch() -> None:
     if mode == "off":
         return
 
-    if mode == "ring" and args.distributed_hostfile is None and args.num_local_ranks is None:
+    if (
+        mode == "ring"
+        and args.distributed_hostfile is None
+        and args.num_local_ranks is None
+    ):
         print(
             "ERROR: --distributed-mode=ring requires --distributed-hostfile or --num-local-ranks.",
             file=sys.stderr,
         )
         sys.exit(2)
     if mode == "jaccl":
-        if args.distributed_ibv_devices is None or args.distributed_jaccl_coordinator is None:
+        if (
+            args.distributed_ibv_devices is None
+            or args.distributed_jaccl_coordinator is None
+        ):
             print(
                 "ERROR: --distributed-mode=jaccl requires both "
                 "--distributed-ibv-devices and --distributed-jaccl-coordinator.",
@@ -108,9 +124,7 @@ def main() -> None:
             import mlx.core as mx
             from mlx_lm.utils import sharded_load
 
-            logger.info(
-                "Rank %d: loading model with sharded_load (TP)", dist_ctx.rank
-            )
+            logger.info("Rank %d: loading model with sharded_load (TP)", dist_ctx.rank)
             try:
                 mx.metal.reset_peak_memory()
                 pre_mem = mx.metal.get_active_memory()
@@ -142,9 +156,7 @@ def main() -> None:
         else:
             from mlx_lm import load
 
-            model, tokenizer = load(
-                config.model, adapter_path=config.adapter_path
-            )
+            model, tokenizer = load(config.model, adapter_path=config.adapter_path)
 
         # --- SSD cache dir (rank namespace for TP) ---
         ssd_cache_dir = config.ssd_cache_dir
@@ -175,7 +187,11 @@ def main() -> None:
                     adapter_path=config.adapter_path,
                 )
                 ssd_dir = ssd_cache_dir / fingerprint
-                max_size_bytes = int(config.ssd_max_size_gb * (1024 ** 3)) if config.ssd_max_size_gb > 0 else 0
+                max_size_bytes = (
+                    int(config.ssd_max_size_gb * (1024**3))
+                    if config.ssd_max_size_gb > 0
+                    else 0
+                )
                 ssd_cache = SSDCache(
                     ssd_dir,
                     config.ssd_ttl_days,
@@ -189,7 +205,9 @@ def main() -> None:
                 if config.ssd_policy == "write_through" and config.ssd_async_writes:
                     from mlx_lm_server.ssd_writer import SSDWriterThread
 
-                    assert ssd_cache is not None  # guaranteed by ssd_enabled check above
+                    assert (
+                        ssd_cache is not None
+                    )  # guaranteed by ssd_enabled check above
                     ssd_writer = SSDWriterThread(
                         ssd=ssd_cache,
                         queue_size=config.ssd_writer_queue_size,
@@ -237,7 +255,9 @@ def main() -> None:
         if not dist_ctx.enabled or dist_ctx.is_rank0:
             # Rank 0 (or single-machine): run HTTP server
             app = create_app(
-                config=config, scheduler=scheduler, tokenizer=tokenizer,
+                config=config,
+                scheduler=scheduler,
+                tokenizer=tokenizer,
                 dist_ctx=dist_ctx,
             )
             uvicorn.run(
@@ -253,9 +273,7 @@ def main() -> None:
             )
             scheduler.join_worker_loop(timeout=300.0)
             if scheduler.worker_timed_out:
-                raise RuntimeError(
-                    f"Rank {dist_ctx.rank}: worker loop timed out"
-                )
+                raise RuntimeError(f"Rank {dist_ctx.rank}: worker loop timed out")
 
     except RuntimeError as e:
         logger.critical("Fatal error: %s", e)
