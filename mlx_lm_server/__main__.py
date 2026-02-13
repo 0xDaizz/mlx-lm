@@ -173,14 +173,22 @@ def main() -> None:
 
     _setup_metal_memory()
     atexit.register(_cleanup_metal)
-    signal.signal(signal.SIGTERM, lambda s, f: (_cleanup_metal(), sys.exit(0)))
-    signal.signal(signal.SIGINT, lambda s, f: (_cleanup_metal(), sys.exit(0)))
+    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
 
     config = parse_args()
 
     # --- Distributed initialization ---
     dist_ctx = DistributedContext()  # default disabled
     scheduler = None
+    model = None
+    tokenizer = None
+    app = None
+    kv_cache_manager = None
+    ssd_cache = None
+    tiered_cache = None
+    ssd_writer = None
+    control_bus = None
 
     try:
         dist_ctx = init_distributed(config)
@@ -357,8 +365,17 @@ def main() -> None:
                     scheduler.stop()
                 except Exception:
                     logger.warning("Error during scheduler shutdown", exc_info=True)
-                # Release scheduler reference to allow model GC
-                scheduler = None
+            # Release all heavy references to allow GC to free Metal memory.
+            # These locals hold mx.array objects (model weights, KV caches, etc.)
+            scheduler = None
+            model = None
+            tokenizer = None
+            app = None
+            kv_cache_manager = None
+            tiered_cache = None
+            ssd_cache = None
+            ssd_writer = None
+            control_bus = None
             gc.collect()  # Collect model arrays before clearing Metal cache
             _cleanup_metal()
             if dist_ctx is not None:

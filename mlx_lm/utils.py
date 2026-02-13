@@ -57,6 +57,14 @@ def eval_with_timeout(params, timeout_seconds=300.0, on_timeout=None):
             )
             if on_timeout is not None:
                 on_timeout()
+            # Best-effort Metal cleanup before hard exit.
+            # os._exit() skips atexit/finally, so we must clean up here.
+            try:
+                mx.set_wired_limit(0)
+                mx.set_cache_limit(0)
+                mx.clear_cache()
+            except Exception:
+                pass
             os._exit(1)
 
     t = threading.Thread(target=watchdog, daemon=True)
