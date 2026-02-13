@@ -99,6 +99,20 @@ def init_distributed(config) -> DistributedContext:
 
 
 def finalize_distributed(ctx: DistributedContext) -> None:
-    """Clean up distributed context. Currently a no-op (MLX handles cleanup)."""
-    if ctx.enabled:
+    """Clean up distributed context and release Metal memory."""
+    if not ctx.enabled:
+        return
+    try:
+        import gc
+
+        import mlx.core as mx
+
+        gc.collect()
+        mx.clear_cache()
+        logger.info(
+            "Distributed context finalized (rank=%d, active_mem=%.1f GB)",
+            ctx.rank,
+            mx.get_active_memory() / (1024**3),
+        )
+    except Exception:
         logger.info("Distributed context finalized (rank=%d)", ctx.rank)

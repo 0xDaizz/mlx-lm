@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import gc
 import logging
 import os
 import shutil
+import signal
 import sys
 import threading
 
@@ -107,8 +110,55 @@ def _maybe_relaunch_under_mlx_launch() -> None:
     os.execvp(cmd[0], cmd)
 
 
+def _setup_metal_memory() -> None:
+    """Configure Metal memory limits (exo-style)."""
+    try:
+        import mlx.core as mx
+    except ImportError:
+        return
+
+    try:
+        if not mx.metal.is_available():
+            return
+        device_info = mx.device_info()
+        max_rec_size = int(device_info.get("max_recommended_working_set_size", 0))
+        mem_size = int(device_info.get("memory_size", 0))
+        if max_rec_size > 0:
+            mx.set_wired_limit(max_rec_size)
+            logger.info(
+                "Metal wired limit set to %d MB (total: %d MB)",
+                max_rec_size // (1024 * 1024),
+                mem_size // (1024 * 1024),
+            )
+        else:
+            logger.info("max_recommended_working_set_size not available, skipping wired limit")
+    except (AttributeError, Exception) as e:
+        logger.debug(f"Could not configure Metal memory: {e}")
+
+
+def _cleanup_metal() -> None:
+    """Clean up Metal GPU resources (exo-style)."""
+    try:
+        import mlx.core as mx
+
+        mx.clear_cache()
+    except (AttributeError, Exception):
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+    gc.collect()
+    logger.info("Metal cleanup completed")
+
+
 def main() -> None:
     _maybe_relaunch_under_mlx_launch()
+
+    _setup_metal_memory()
+    atexit.register(_cleanup_metal)
+    signal.signal(signal.SIGTERM, lambda s, f: (_cleanup_metal(), sys.exit(0)))
 
     config = parse_args()
 
@@ -126,8 +176,8 @@ def main() -> None:
 
             logger.info("Rank %d: loading model with sharded_load (TP)", dist_ctx.rank)
             try:
-                mx.metal.reset_peak_memory()
-                pre_mem = mx.metal.get_active_memory()
+                mx.reset_peak_memory()
+                pre_mem = mx.get_active_memory()
                 logger.info(
                     "Rank %d: pre-load active memory: %.1f GB",
                     dist_ctx.rank,
@@ -143,8 +193,8 @@ def main() -> None:
             )
 
             try:
-                post_mem = mx.metal.get_active_memory()
-                peak_mem = mx.metal.get_peak_memory()
+                post_mem = mx.get_active_memory()
+                peak_mem = mx.get_peak_memory()
                 logger.info(
                     "Rank %d: post-load memory: active=%.1f GB, peak=%.1f GB",
                     dist_ctx.rank,
@@ -291,6 +341,7 @@ def main() -> None:
                     scheduler.stop()
                 except Exception:
                     logger.warning("Error during scheduler shutdown", exc_info=True)
+            _cleanup_metal()
             if dist_ctx is not None:
                 finalize_distributed(dist_ctx)
         finally:

@@ -737,6 +737,9 @@ class Scheduler:
         # Clean up finished sequences
         self._cleanup_finished()
 
+        # Periodic zombie cleanup (safety net for stuck sequences)
+        self._cleanup_zombie_sequences(timeout_s=60.0)
+
     def _apply_bus_events(self) -> bool:
         """Receive and apply control events from the distributed bus.
 
@@ -1050,6 +1053,9 @@ class Scheduler:
 
         # 9. Clean up finished sequences
         self._cleanup_finished_batch()
+
+        # 10. Periodic zombie cleanup (safety net for stuck sequences)
+        self._cleanup_zombie_sequences(timeout_s=60.0)
 
     def _process_batch_responses(self, responses) -> tuple[list[TokenEvent], list[int], dict[int, list]]:
         """Process batch responses: detokenize, check stops, create events.
@@ -1934,9 +1940,16 @@ class Scheduler:
 
     def _emit_tokens(self, events: list[TokenEvent]) -> None:
         """Deliver token events to streams and result buffers."""
+        now = time.time()
         for event in events:
             self._inc_stat("tokens_generated")
             rid = event.request_id
+
+            # Update last_activity_time for zombie detection
+            with self._active_lock:
+                seq = self._active_sequences.get(rid)
+            if seq is not None:
+                seq.last_activity_time = now
 
             # Deliver to stream if registered
             with self._streams_lock:
@@ -2007,6 +2020,23 @@ class Scheduler:
                     rid,
                     seq.finish_reason,
                 )
+
+    def _cleanup_zombie_sequences(self, timeout_s: float = 60.0) -> None:
+        """Remove sequences that haven't had activity recently (safety net).
+
+        This is a defensive measure against sequences that get stuck due to
+        missed cancellations or other edge cases. It does NOT replace proper
+        disconnect detection in the server layer, but acts as a fallback.
+        """
+        now = time.time()
+        with self._active_lock:
+            zombie_ids = [
+                rid for rid, seq in self._active_sequences.items()
+                if not seq.is_finished and (now - seq.last_activity_time) > timeout_s
+            ]
+        for rid in zombie_ids:
+            logger.warning("Cleaning up zombie sequence %s (no activity for %.0fs)", rid, timeout_s)
+            self.cancel_request(rid)
 
     # --- Introspection ---
 

@@ -31,6 +31,11 @@ from mlx_lm_server.types import InferenceRequest, TokenEvent, BusOutboxFullError
 logger = logging.getLogger(__name__)
 
 
+class _ClientDisconnected(Exception):
+    """Raised when streaming client disconnects."""
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Encoding helpers
 # ---------------------------------------------------------------------------
@@ -680,7 +685,7 @@ def create_app(
     # ------------------------------------------------------------------
 
     @app.post("/v1/chat/completions")
-    async def chat_completions(body: ChatCompletionRequest):
+    async def chat_completions(body: ChatCompletionRequest, request: Request):
         tok = app.state.tokenizer
         if tok is None:
             raise HTTPException(status_code=500, detail="Tokenizer not loaded")
@@ -732,6 +737,7 @@ def create_app(
                 and body.stream_options.get("include_usage")
             )
             return _stream_response(
+                request,
                 app.state.scheduler, inf_req, app.state.model_name,
                 request_id, len(prompt_tokens), tok,
                 format_chunk=_format_chat_chunk,
@@ -749,7 +755,7 @@ def create_app(
     # ------------------------------------------------------------------
 
     @app.post("/v1/completions")
-    async def completions(body: CompletionRequest):
+    async def completions(body: CompletionRequest, request: Request):
         tok = app.state.tokenizer
         if tok is None:
             raise HTTPException(status_code=500, detail="Tokenizer not loaded")
@@ -790,6 +796,7 @@ def create_app(
                 and body.stream_options.get("include_usage")
             )
             return _stream_response(
+                request,
                 app.state.scheduler, inf_req, app.state.model_name,
                 request_id, len(prompt_tokens), tok,
                 format_chunk=_format_completion_chunk,
@@ -1105,6 +1112,7 @@ def _format_completion_response(request_id, model_name, text, finish_reason, pro
 
 
 def _stream_response(
+    request: Request,
     scheduler: SchedulerProtocol,
     inf_req: InferenceRequest,
     model_name: str,
@@ -1175,11 +1183,26 @@ def _stream_response(
                     first_token_timeout_s if first_token and first_token_timeout_s is not None
                     else request_timeout_s
                 )
-                try:
-                    event: TokenEvent | None = await loop.run_in_executor(
-                        executor, lambda t=timeout: token_queue.get(timeout=t)  # type: ignore[misc]
-                    )
-                except queue.Empty:
+                # Poll with short intervals to detect client disconnect
+                poll_start = time.time()
+                event: TokenEvent | None = None
+                got_event = False
+                while True:
+                    if await request.is_disconnected():
+                        logger.debug("Client disconnected for request %s", request_id)
+                        raise _ClientDisconnected()
+                    try:
+                        event = await loop.run_in_executor(
+                            executor, lambda: token_queue.get(timeout=1.0)  # type: ignore[misc]
+                        )
+                        got_event = True
+                        break
+                    except queue.Empty:
+                        elapsed = time.time() - poll_start
+                        if elapsed >= timeout:
+                            break  # Overall timeout exceeded
+                        continue
+                if not got_event:
                     error_data = {"error": {"message": f"Stream timeout: no tokens received for {timeout} seconds", "type": "server_error"}}
                     yield f"data: {json.dumps(error_data)}\n\n"
                     break
@@ -1258,6 +1281,8 @@ def _stream_response(
                 yield f"data: {json.dumps(usage_chunk)}\n\n"
 
             yield "data: [DONE]\n\n"
+        except _ClientDisconnected:
+            logger.info("Streaming cancelled: client disconnected for %s", request_id)
         finally:
             # Always cancel to clean up scheduler resources (stream queue, etc.)
             # Safe to call even if request already finished — cancel is idempotent.

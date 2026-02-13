@@ -11,6 +11,7 @@ import os
 import resource
 import sys
 import shutil
+import threading
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -41,6 +42,59 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 
 logger = logging.getLogger(__name__)
+
+
+def eval_with_timeout(params, timeout_seconds=300.0, on_timeout=None):
+    """Evaluate params with a timeout watchdog (exo-style)."""
+    completed = threading.Event()
+
+    def watchdog():
+        if not completed.wait(timeout=timeout_seconds):
+            logger.error(
+                f"mx.eval timed out after {timeout_seconds:.0f}s. "
+                "This may indicate a FAST_SYNCH or tensor parallel issue. "
+                "Terminating process."
+            )
+            if on_timeout is not None:
+                on_timeout()
+            os._exit(1)
+
+    t = threading.Thread(target=watchdog, daemon=True)
+    t.start()
+    try:
+        mx.eval(params)
+    finally:
+        completed.set()
+
+
+def set_wired_limit_for_model(model):
+    """Set MLX wired limit based on model size (exo-style). macOS 15+ only."""
+    try:
+        if not mx.metal.is_available():
+            return
+        device_info = mx.device_info()
+        max_rec_size = int(device_info.get("max_recommended_working_set_size", 0))
+        if max_rec_size <= 0:
+            return
+
+        # Calculate model size
+        model_bytes = sum(
+            p.nbytes for p in tree_flatten(model.parameters())[0]
+        )
+        model_mb = model_bytes // (1024 * 1024)
+        max_rec_mb = max_rec_size // (1024 * 1024)
+
+        if model_bytes > 0.9 * max_rec_size:
+            logger.warning(
+                f"Model requires {model_mb} MB which is close to the "
+                f"maximum recommended size of {max_rec_mb} MB. This can be slow."
+            )
+
+        mx.set_wired_limit(max_rec_size)
+        logger.info(f"Wired limit set to {max_rec_mb} MB.")
+    except (AttributeError, Exception) as e:
+        logger.debug(f"Could not set wired limit: {e}")
+
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper
@@ -516,8 +570,8 @@ def _check_memory_guard(
     own cleanup path in ``__main__.py``.
     """
     try:
-        active = mx.metal.get_active_memory()
-        peak = mx.metal.get_peak_memory()
+        active = mx.get_active_memory()
+        peak = mx.get_peak_memory()
     except AttributeError:
         return  # older MLX without metal memory API
 
@@ -718,14 +772,14 @@ class _EvalShardEvalIter:
             # Flush the *previous* layer's sharded result so its original
             # (pre-shard) concrete weights become unreachable.
             if self._prev_layer is not None:
-                mx.eval(self._prev_layer.parameters())
+                eval_with_timeout(self._prev_layer.parameters(), timeout_seconds=300.0)
                 gc.collect()
                 mx.clear_cache()
                 if self._guard_bytes > 0:
                     _check_memory_guard(self._guard_bytes, self._prev_idx, num)
 
             # Materialise this layer's original (lazy-mmap) weights.
-            mx.eval(layer.parameters())
+            eval_with_timeout(layer.parameters(), timeout_seconds=300.0)
             gc.collect()
             mx.clear_cache()
 
@@ -735,7 +789,7 @@ class _EvalShardEvalIter:
 
         # Flush the last layer after the shard loop finishes.
         if self._prev_layer is not None:
-            mx.eval(self._prev_layer.parameters())
+            eval_with_timeout(self._prev_layer.parameters(), timeout_seconds=300.0)
             gc.collect()
             mx.clear_cache()
             if self._guard_bytes > 0:
@@ -822,6 +876,31 @@ def sharded_load(
     tensor_group: Optional[mx.distributed.Group] = None,
     return_config: bool = False,
 ):
+    # --- Pre-load system memory check ---
+    # Warn if wired memory is too high (leftover from previous sessions)
+    try:
+        import subprocess as _sp
+
+        _vmstat = _sp.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+        if _vmstat.returncode == 0:
+            _page_size = 16384  # macOS ARM64 page size
+            for _line in _vmstat.stdout.splitlines():
+                if "Pages free" in _line:
+                    _free_pages = int(_line.split(":")[1].strip().rstrip("."))
+                    _free_gb = (_free_pages * _page_size) / (1024**3)
+                    if _free_gb < 50:
+                        logger.warning(
+                            "Low free memory: %.1f GB. If loading fails with exit 255, "
+                            "reboot to reclaim wired Metal memory.",
+                            _free_gb,
+                        )
+                    else:
+                        logger.info("Free memory: %.1f GB", _free_gb)
+                    break
+            del _vmstat
+    except Exception:
+        pass
+
     # Get model path with everything but weight safetensors
     model_path = _download(
         repo,
@@ -908,6 +987,8 @@ def sharded_load(
         _chunked_eval_params(model)
     else:
         _chunked_eval_params(model)
+
+    set_wired_limit_for_model(model)
 
     # Synchronize processes to avoid timeout
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))

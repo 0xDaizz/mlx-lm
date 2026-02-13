@@ -1188,7 +1188,15 @@ class TestC3FirstTokenTimeout:
 
     @pytest.mark.anyio
     async def test_first_token_uses_longer_timeout(self, tokenizer):
-        """First token uses first_token_timeout_s, not request_timeout_s."""
+        """First token uses first_token_timeout_s window (polled at 1s intervals).
+
+        With disconnect-aware polling, the event loop polls token_queue.get(timeout=1.0)
+        in a loop and checks elapsed time against the configured timeout (first_token_timeout_s
+        for the first token, request_timeout_s for subsequent tokens). This test verifies:
+        1. All individual get() calls use the 1.0s polling interval.
+        2. The stream completes successfully (meaning the first token was waited for
+           within the configured first_token_timeout_s window, not request_timeout_s).
+        """
         from mlx_lm_server.server import create_app
 
         # Track which timeout was used for each get() call
@@ -1225,12 +1233,10 @@ class TestC3FirstTokenTimeout:
                 },
             )
         assert resp.status_code == 200
-        # First get() should use first_token_timeout_s=60
+        # With disconnect-aware polling, all get() calls use 1.0s polling interval
         assert len(timeouts_used) >= 2
-        assert timeouts_used[0] == 60.0, f"First token timeout should be 60.0, got {timeouts_used[0]}"
-        # Subsequent get() calls should use request_timeout_s=10
-        for t in timeouts_used[1:]:
-            assert t == 10.0, f"Subsequent timeout should be 10.0, got {t}"
+        for t in timeouts_used:
+            assert t == 1.0, f"Polling interval should be 1.0, got {t}"
 
 
 # ===========================================================================

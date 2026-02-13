@@ -78,6 +78,24 @@ class NaiveStreamingDetokenizer(StreamingDetokenizer):
         self._current_tokens = []
         self._current_text = ""
 
+    def __copy__(self):
+        """Support copy.copy() despite the read-only text property.
+
+        The base class declares ``text`` in ``__slots__``, but this subclass
+        overrides it with a computed ``@property``.  The default shallow-copy
+        machinery tries to *set* every slot on the new instance, which fails
+        because the property has no setter.  We work around this by manually
+        constructing the copy and transferring the internal state.
+        """
+        new = object.__new__(type(self))
+        new._tokenizer = self._tokenizer
+        new._text = self._text
+        new._current_tokens = self._current_tokens[:]
+        new._current_text = self._current_text
+        new.offset = self.offset
+        new.tokens = self.tokens[:]
+        return new
+
     def add_token(self, token):
         self._current_tokens.append(token)
         self.tokens.append(token)
@@ -315,7 +333,10 @@ class TokenizerWrapper:
         if self._chat_template is not None:
             out = self._chat_template(*args, **kwargs)
             if tokenize:
-                out = self._tokenizer.encode(out, add_special_tokens=False)
+                try:
+                    out = self._tokenizer.encode(out, add_special_tokens=False)
+                except (TypeError, ValueError):
+                    out = self._tokenizer.encode(out)
             return out
 
         kwargs["return_dict"] = False

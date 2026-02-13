@@ -680,7 +680,10 @@ def stream_generate(
             add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
                 tokenizer.bos_token
             )
-            prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            try:
+                prompt = tokenizer.encode(prompt, add_special_tokens=add_special_tokens)
+            except (TypeError, ValueError):
+                prompt = tokenizer.encode(prompt)
         prompt = mx.array(prompt)
 
     detokenizer = tokenizer.detokenizer
@@ -1431,7 +1434,10 @@ def main():
                 add_generation_prompt=not has_prefill,
             )
             prompt = prompt[test_prompt.index("<query>") :]
-        prompt = tokenizer.encode(prompt, add_special_tokens=False)
+        try:
+            prompt = tokenizer.encode(prompt, add_special_tokens=False)
+        except (TypeError, ValueError):
+            prompt = tokenizer.encode(prompt)
     else:
         prompt = tokenizer.encode(prompt)
 

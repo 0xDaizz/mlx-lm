@@ -60,6 +60,8 @@ class SequenceState:
     _detokenizer: Any = None
     # Batch UID assigned by BatchGenerator.insert()
     _batch_uid: int | None = None
+    # Timestamp of last token activity (for zombie detection)
+    last_activity_time: float = field(default_factory=time.time)
 
 
 @dataclass
