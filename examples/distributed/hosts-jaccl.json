@@ -1,16 +1,16 @@
 {
+    "backend": "jaccl",
+    "envs": [],
     "hosts": [
         {
-            "hostname": "mac-studio-1.local",
-            "num_ranks": 1
+            "ssh": "node1.local",
+            "ips": ["192.168.10.1"],
+            "rdma": [null, ["rdma_en3", "rdma_en5"]]
         },
         {
-            "hostname": "mac-studio-2.local",
-            "num_ranks": 1
+            "ssh": "node2.local",
+            "ips": ["192.168.10.2"],
+            "rdma": [["rdma_en3", "rdma_en5"], null]
         }
-    ],
-    "jaccl": {
-        "ibv_devices": "/dev/infiniband/uverbs0",
-        "coordinator": "mac-studio-1.local:9000"
-    }
+    ]
 }
