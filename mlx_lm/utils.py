@@ -1,10 +1,12 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import copy
+import gc
 import glob
 import importlib
 import inspect
 import json
+import logging
 import os
 import resource
 import shutil
@@ -36,6 +38,8 @@ else:
 resource.setrlimit(resource.RLIMIT_NOFILE, (2048, 4096))
 
 from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
+
+logger = logging.getLogger(__name__)
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper
@@ -489,6 +493,78 @@ def load(
         return model, tokenizer
 
 
+def _extract_layer_index(param_name: str) -> int | None:
+    """Extract transformer layer index from a flattened parameter name.
+
+    Handles patterns like:
+      - "model.layers.42.self_attn.q_proj.weight"
+      - "layers.0.mlp.gate_proj.weight"
+      - "transformer.h.10.attn.weight"
+      - "blocks.5.norm.weight"
+    """
+    parts = param_name.split(".")
+    for i, part in enumerate(parts):
+        if part in ("layers", "h", "blocks") and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                continue
+    return None
+
+
+def _chunked_eval_params(model) -> None:
+    """Evaluate model parameters layer-by-layer to limit peak memory.
+
+    Instead of ``mx.eval(model.parameters())`` which materializes all lazy
+    weight tensors simultaneously (problematic for 600GB+ models in distributed
+    tensor-parallel setups), this evaluates parameters in chunks: non-layer
+    params first, then one transformer layer at a time.
+
+    After each layer is materialized the lazy computation graph for the
+    preceding full (pre-shard) tensors becomes unreachable and the MLX
+    allocator can reclaim that memory before the next layer is loaded.
+    """
+    all_params = dict(tree_flatten(model.parameters()))
+
+    layer_params: dict[int, list] = {}
+    non_layer_params: list = []
+
+    for name, param in all_params.items():
+        layer_idx = _extract_layer_index(name)
+        if layer_idx is not None:
+            layer_params.setdefault(layer_idx, []).append(param)
+        else:
+            non_layer_params.append(param)
+
+    num_layers = len(layer_params)
+
+    # Fall back to bulk eval if the model has no recognisable layer structure.
+    if num_layers == 0:
+        logger.warning(
+            "_chunked_eval_params: no layer structure detected, "
+            "falling back to mx.eval(model.parameters())"
+        )
+        mx.eval(model.parameters())
+        return
+
+    logger.info(
+        "Chunked eval: %d layers, %d non-layer param groups",
+        num_layers,
+        len(non_layer_params),
+    )
+
+    # 1. Materialise non-layer params (embeddings, final norm, lm_head …)
+    if non_layer_params:
+        mx.eval(*non_layer_params)
+
+    # 2. Materialise one layer at a time.
+    for idx in sorted(layer_params.keys()):
+        mx.eval(*layer_params[idx])
+        gc.collect()
+
+    logger.info("Chunked eval complete: %d layers materialised", num_layers)
+
+
 def sharded_load(
     repo,
     pipeline_group: Optional[mx.distributed.Group] = None,
@@ -566,7 +642,7 @@ def sharded_load(
         model.shard(tensor_group)
     if pipeline_group is not None:
         model.model.pipeline(pipeline_group)
-    mx.eval(model.parameters())
+    _chunked_eval_params(model)
 
     # Synchronize processes to avoid timeout
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))

@@ -105,16 +105,40 @@ def main() -> None:
 
         # --- Load model and tokenizer ---
         if dist_ctx.enabled and dist_ctx.world_size > 1:
+            import mlx.core as mx
             from mlx_lm.utils import sharded_load
 
             logger.info(
                 "Rank %d: loading model with sharded_load (TP)", dist_ctx.rank
             )
+            try:
+                mx.metal.reset_peak_memory()
+                pre_mem = mx.metal.get_active_memory()
+                logger.info(
+                    "Rank %d: pre-load active memory: %.1f GB",
+                    dist_ctx.rank,
+                    pre_mem / (1024**3),
+                )
+            except AttributeError:
+                pass
+
             model, tokenizer = sharded_load(
                 config.model,
                 pipeline_group=dist_ctx.pipeline_group,
                 tensor_group=dist_ctx.tensor_group,
             )
+
+            try:
+                post_mem = mx.metal.get_active_memory()
+                peak_mem = mx.metal.get_peak_memory()
+                logger.info(
+                    "Rank %d: post-load memory: active=%.1f GB, peak=%.1f GB",
+                    dist_ctx.rank,
+                    post_mem / (1024**3),
+                    peak_mem / (1024**3),
+                )
+            except AttributeError:
+                pass
         else:
             from mlx_lm import load
 
