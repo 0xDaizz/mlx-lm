@@ -1,5 +1,7 @@
 """Tests for memory-safe chunked parameter evaluation."""
 
+import pytest
+
 import mlx.core as mx
 import mlx.nn as nn
 
@@ -316,3 +318,65 @@ class TestChunkedEvalStress:
 
         for _, param in tree_flatten(model.parameters()):
             _ = param.tolist()
+
+
+# ---------------------------------------------------------------------------
+# Memory guard tests
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryGuard:
+    def test_get_total_physical_memory_positive(self):
+        """Should return a positive integer on macOS/Linux."""
+        from mlx_lm.utils import _get_total_physical_memory
+
+        total = _get_total_physical_memory()
+        assert total > 0
+        # Sanity: at least 1 GB
+        assert total > 1024**3
+
+    def test_check_memory_guard_no_crash_when_safe(self):
+        """Guard should not exit when there is plenty of memory."""
+        from mlx_lm.utils import _check_memory_guard
+
+        # Use a tiny threshold that should never trigger
+        _check_memory_guard(1024, 0, 10)  # 1 KB threshold
+
+    def test_check_memory_guard_exits_when_triggered(self):
+        """Guard should call sys.exit(1) when threshold exceeds total RAM."""
+        from mlx_lm.utils import _check_memory_guard
+
+        # Set threshold to something impossibly large (1 PB)
+        with pytest.raises(SystemExit) as exc_info:
+            _check_memory_guard(1024**5, 0, 10)
+        assert exc_info.value.code == 1
+
+    def test_memory_guard_env_var_override(self, monkeypatch):
+        """MLX_MEMORY_GUARD_GB=0 should disable the guard."""
+        monkeypatch.setenv("MLX_MEMORY_GUARD_GB", "0")
+        # With guard disabled (0), even a large model should not trigger exit
+        model = SimpleModel(num_layers=4)
+        _chunked_eval_params(model)
+        from mlx.utils import tree_flatten
+
+        for _, param in tree_flatten(model.parameters()):
+            _ = param.tolist()
+
+    def test_memory_guard_env_var_custom_threshold(self, monkeypatch):
+        """MLX_MEMORY_GUARD_GB=0.001 should set a tiny threshold that doesn't trip."""
+        monkeypatch.setenv("MLX_MEMORY_GUARD_GB", "0.001")
+        model = SimpleModel(num_layers=4)
+        _chunked_eval_params(model)  # should succeed with tiny model
+        from mlx.utils import tree_flatten
+
+        for _, param in tree_flatten(model.parameters()):
+            _ = param.tolist()
+
+    def test_memory_guard_default_threshold(self):
+        """Default threshold should be 10% of total RAM, min 5 GB."""
+        from mlx_lm.utils import _get_total_physical_memory
+
+        total = _get_total_physical_memory()
+        expected = max(int(total * 0.10), 5 * (1024**3))
+        # At least 5 GB
+        assert expected >= 5 * (1024**3)

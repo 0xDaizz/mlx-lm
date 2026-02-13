@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import resource
+import sys
 import shutil
 from pathlib import Path
 from textwrap import dedent
@@ -493,6 +494,56 @@ def load(
         return model, tokenizer
 
 
+def _get_total_physical_memory() -> int:
+    """Return total physical memory in bytes (macOS / Linux)."""
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (AttributeError, ValueError):
+        return 0
+
+
+def _check_memory_guard(
+    threshold_bytes: int,
+    layer_idx: int,
+    num_layers: int,
+) -> None:
+    """Abort loading if remaining memory drops below threshold.
+
+    This prevents macOS kernel panics (watchdog timeout) caused by memory
+    compressor saturation when loading 600GB+ models in distributed TP.
+    Both nodes will shut down: the exiting node calls ``sys.exit``, and the
+    peer's ``mx.distributed.all_sum`` barrier will timeout, triggering its
+    own cleanup path in ``__main__.py``.
+    """
+    try:
+        active = mx.metal.get_active_memory()
+        peak = mx.metal.get_peak_memory()
+    except AttributeError:
+        return  # older MLX without metal memory API
+
+    total_ram = _get_total_physical_memory()
+    if total_ram == 0:
+        return  # cannot determine system memory
+
+    remaining = total_ram - active
+
+    if remaining < threshold_bytes:
+        logger.critical(
+            "MEMORY GUARD: aborting model load — remaining memory %.1f GB "
+            "is below safety threshold %.1f GB "
+            "(layer %d/%d, active=%.1f GB, peak=%.1f GB, total_ram=%.1f GB). "
+            "Exiting to prevent kernel panic.",
+            remaining / (1024**3),
+            threshold_bytes / (1024**3),
+            layer_idx + 1,
+            num_layers,
+            active / (1024**3),
+            peak / (1024**3),
+            total_ram / (1024**3),
+        )
+        sys.exit(1)
+
+
 def _extract_layer_index(param_name: str) -> int | None:
     """Extract transformer layer index from a flattened parameter name.
 
@@ -523,6 +574,11 @@ def _chunked_eval_params(model) -> None:
     After each layer is materialized the lazy computation graph for the
     preceding full (pre-shard) tensors becomes unreachable and the MLX
     allocator can reclaim that memory before the next layer is loaded.
+
+    A memory guard (configurable via ``MLX_MEMORY_GUARD_GB``) monitors
+    remaining system memory after each layer and aborts with ``sys.exit(1)``
+    if it drops below the safety threshold, preventing macOS kernel panics.
+    Set to ``0`` to disable.  Default: 10% of physical RAM (min 5 GB).
     """
     all_params = dict(tree_flatten(model.parameters()))
 
@@ -547,6 +603,17 @@ def _chunked_eval_params(model) -> None:
         mx.eval(model.parameters())
         return
 
+    # --- memory guard threshold ---
+    env_guard = os.environ.get("MLX_MEMORY_GUARD_GB")
+    if env_guard is not None:
+        guard_bytes = int(float(env_guard) * (1024**3))
+    else:
+        total_ram = _get_total_physical_memory()
+        guard_bytes = max(int(total_ram * 0.10), 5 * (1024**3)) if total_ram > 0 else 0
+
+    if guard_bytes > 0:
+        logger.info("Memory guard active: threshold=%.1f GB", guard_bytes / (1024**3))
+
     logger.info(
         "Chunked eval: %d layers, %d non-layer param groups",
         num_layers,
@@ -557,9 +624,14 @@ def _chunked_eval_params(model) -> None:
     if non_layer_params:
         mx.eval(*non_layer_params)
 
+    if guard_bytes > 0:
+        _check_memory_guard(guard_bytes, -1, num_layers)
+
     # 2. Materialise one layer at a time.
     for idx in sorted(layer_params.keys()):
         mx.eval(*layer_params[idx])
+        if guard_bytes > 0:
+            _check_memory_guard(guard_bytes, idx, num_layers)
         gc.collect()
 
     logger.info("Chunked eval complete: %d layers materialised", num_layers)
