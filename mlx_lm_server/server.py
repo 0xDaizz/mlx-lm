@@ -26,6 +26,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from mlx_lm_server.config import ServerConfig
+from mlx_lm_server.dashboard_api import router as dashboard_router
 from mlx_lm_server.types import InferenceRequest, TokenEvent, BusOutboxFullError
 
 logger = logging.getLogger(__name__)
@@ -343,6 +344,13 @@ def create_app(
     app.state.started_at = time.monotonic()
 
     # ------------------------------------------------------------------
+    # Dashboard API router
+    # ------------------------------------------------------------------
+    # Must be included BEFORE the static files mount so that
+    # /dashboard/api/* routes take priority over the catch-all.
+    app.include_router(dashboard_router)
+
+    # ------------------------------------------------------------------
     # Admission / security middleware
     # ------------------------------------------------------------------
     # FastAPI middleware is LIFO: last registered runs first (outermost).
@@ -381,8 +389,10 @@ def create_app(
     async def concurrency_limiter(request: Request, call_next):
         if _concurrency_sem is None:
             return await call_next(request)
-        # Bypass for health and non-inference endpoints
+        # Bypass for health, non-inference, and dashboard endpoints
         if request.url.path in concurrency_bypass_paths:
+            return await call_next(request)
+        if request.url.path.startswith("/dashboard"):
             return await call_next(request)
         # Atomic non-blocking acquire: no TOCTOU gap between check and acquire
         if not _try_acquire_semaphore(_concurrency_sem):
@@ -407,6 +417,9 @@ def create_app(
         if not api_key:
             return await call_next(request)
         if request.url.path in health_bypass_paths:
+            return await call_next(request)
+        # Dashboard endpoints are public (no API key required)
+        if request.url.path.startswith("/dashboard"):
             return await call_next(request)
         if not request.url.path.startswith("/v1/"):
             return await call_next(request)
@@ -962,6 +975,30 @@ def create_app(
             return JSONResponse(content=metrics)
         return JSONResponse(content={"spec_decode_enabled": False})
 
+    # ------------------------------------------------------------------
+    # Dashboard static files
+    # ------------------------------------------------------------------
+    # Mount the Next.js static export if the build output exists.
+    # This MUST come after app.include_router(dashboard_router) so that
+    # the /dashboard/api/* routes take priority over the static file
+    # catch-all.  html=True enables /dashboard -> /dashboard/index.html
+    # and allows sub-paths to resolve correctly.
+    from fastapi.staticfiles import StaticFiles
+
+    dashboard_dir = Path(__file__).parent.parent / "dashboard" / "out"
+    if dashboard_dir.exists():
+        app.mount(
+            "/dashboard",
+            StaticFiles(directory=str(dashboard_dir), html=True),
+            name="dashboard",
+        )
+        logger.info("Dashboard UI mounted at /dashboard from %s", dashboard_dir)
+    else:
+        logger.debug(
+            "Dashboard UI not mounted (build output not found at %s)",
+            dashboard_dir,
+        )
+
     return app
 
 
@@ -1383,7 +1420,7 @@ def parse_args(args: list[str] | None = None) -> ServerConfig:
     spec_group = parser.add_argument_group("Speculative Decoding")
     spec_group.add_argument(
         "--spec-decode",
-        choices=["none", "ngram", "draft"],
+        choices=["none", "ngram", "draft", "mtp"],
         default="none",
         help="Speculative decoding mode (default: none)",
     )
