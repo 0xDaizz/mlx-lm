@@ -168,6 +168,22 @@ def _cleanup_metal() -> None:
     logger.info("Metal cleanup completed")
 
 
+def _emergency_exit() -> None:
+    """Best-effort Metal unwire before forced exit.
+
+    Called by cleanup_timer when scheduler.stop() hangs.
+    Similar to eval_with_timeout() in mlx_lm/utils.py.
+    """
+    try:
+        import mlx.core as mx
+        mx.set_wired_limit(0)
+        mx.set_cache_limit(0)
+        mx.clear_cache()
+    except Exception:
+        pass
+    os._exit(1)
+
+
 def main() -> None:
     _maybe_relaunch_under_mlx_launch()
 
@@ -356,7 +372,7 @@ def main() -> None:
         # Guard cleanup with a 30-second timeout. If scheduler.stop() or
         # finalize_distributed() hangs (stuck collective, stuck thread join),
         # the daemon timer forces process exit.
-        cleanup_timer = threading.Timer(30.0, lambda: os._exit(1))
+        cleanup_timer = threading.Timer(30.0, _emergency_exit)
         cleanup_timer.daemon = True
         cleanup_timer.start()
         try:
