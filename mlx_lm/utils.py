@@ -623,6 +623,8 @@ def _chunked_eval_params(model) -> None:
     # 1. Materialise non-layer params (embeddings, final norm, lm_head …)
     if non_layer_params:
         mx.eval(*non_layer_params)
+        gc.collect()
+        mx.clear_cache()
 
     if guard_bytes > 0:
         _check_memory_guard(guard_bytes, -1, num_layers)
@@ -630,11 +632,188 @@ def _chunked_eval_params(model) -> None:
     # 2. Materialise one layer at a time.
     for idx in sorted(layer_params.keys()):
         mx.eval(*layer_params[idx])
+        gc.collect()
+        mx.clear_cache()
         if guard_bytes > 0:
             _check_memory_guard(guard_bytes, idx, num_layers)
-        gc.collect()
 
     logger.info("Chunked eval complete: %d layers materialised", num_layers)
+
+
+def _find_layers_container(model) -> tuple:
+    """Locate the (parent_module, attr_name) holding the transformer layers list.
+
+    All model ``shard()`` methods iterate ``self.model.layers``.  This helper
+    walks the module tree to find the ``layers`` attribute used during sharding
+    so that ``_eval_shard_eval`` can intercept iteration.
+
+    Returns:
+        ``(parent, "layers")`` if found, otherwise ``(None, None)``.
+    """
+    # Common patterns (ordered by specificity):
+    #   kimi_k25:     model.language_model.model.layers
+    #   deepseek_v3:  model.model.layers
+    #   llama:        model.model.layers
+    candidates = []
+
+    def _walk(obj, depth=0):
+        if depth > 4:
+            return
+        layers = getattr(obj, "layers", None)
+        if isinstance(layers, list) and len(layers) > 0 and isinstance(layers[0], nn.Module):
+            candidates.append((obj, "layers", depth))
+        for attr_name in ("model", "language_model", "transformer"):
+            child = getattr(obj, attr_name, None)
+            if child is not None and isinstance(child, nn.Module):
+                _walk(child, depth + 1)
+
+    _walk(model)
+    if not candidates:
+        return None, None
+    # Pick the deepest match — that is the one the shard() loop references
+    candidates.sort(key=lambda c: c[2], reverse=True)
+    return candidates[0][0], candidates[0][1]
+
+
+class _EvalShardEvalIter:
+    """A list-like wrapper that interposes mx.eval / gc between shard iterations.
+
+    When ``model.shard(group)`` iterates ``self.model.layers``, each element
+    goes through the following sequence:
+
+    1. **Before yield** — ``mx.eval(layer.parameters())`` materialises the
+       *original* (full, pre-shard) lazy-mmap weights for this layer.
+    2. **Yield** — the shard method applies ``shard_linear`` / ``shard_inplace``
+       to the layer, creating new lazy tensors that reference the now-concrete
+       original weights.
+    3. **On the next iteration** (or after the loop ends) — the *previous*
+       layer's sharded parameters are materialised with ``mx.eval``, after
+       which its original weights become unreachable and can be freed.
+
+    This keeps peak Metal memory to roughly *one full layer + one sharded
+    layer* at a time, instead of holding all layers' lazy shard graphs
+    simultaneously.
+
+    The wrapper also delegates ``len()`` and index access so that shard methods
+    using ``enumerate(self.model.layers)`` or ``len(self.model.layers)`` keep
+    working.
+    """
+
+    def __init__(self, layers: list, guard_bytes: int = 0):
+        self._layers = layers
+        self._guard_bytes = guard_bytes
+        self._prev_layer = None
+        self._prev_idx = -1
+
+    # --- list protocol (read-only) so shard methods can len() / index ---
+    def __len__(self):
+        return len(self._layers)
+
+    def __getitem__(self, idx):
+        return self._layers[idx]
+
+    def __iter__(self):
+        num = len(self._layers)
+        for i, layer in enumerate(self._layers):
+            # Flush the *previous* layer's sharded result so its original
+            # (pre-shard) concrete weights become unreachable.
+            if self._prev_layer is not None:
+                mx.eval(self._prev_layer.parameters())
+                gc.collect()
+                mx.clear_cache()
+                if self._guard_bytes > 0:
+                    _check_memory_guard(self._guard_bytes, self._prev_idx, num)
+
+            # Materialise this layer's original (lazy-mmap) weights.
+            mx.eval(layer.parameters())
+            gc.collect()
+            mx.clear_cache()
+
+            self._prev_layer = layer
+            self._prev_idx = i
+            yield layer
+
+        # Flush the last layer after the shard loop finishes.
+        if self._prev_layer is not None:
+            mx.eval(self._prev_layer.parameters())
+            gc.collect()
+            mx.clear_cache()
+            if self._guard_bytes > 0:
+                _check_memory_guard(self._guard_bytes, self._prev_idx, num)
+
+
+def _eval_shard_eval(model, group) -> None:
+    """Materialise and shard model weights layer-by-layer (exo-style).
+
+    The naive approach — ``model.shard(group); mx.eval(model.parameters())``
+    — creates a single giant lazy computation graph spanning *all* layers.
+    MLX cannot free intermediate buffers because every layer's shard ops
+    reference the original lazy-mmap arrays simultaneously.
+
+    This function instead interposes ``mx.eval`` calls *inside* the shard
+    loop so that only one layer's full-size tensors are live at a time:
+
+    For each transformer layer:
+      1. ``mx.eval(layer.parameters())`` — materialise full (pre-shard) weights
+      2. ``shard_linear`` / ``shard_inplace`` — create lazy shard ops on the
+         now-concrete data (short graph, not referencing mmap)
+      3. ``mx.eval(layer.parameters())`` — materialise the sharded result
+      4. ``gc.collect()`` + ``mx.clear_cache()`` — free pre-shard tensors
+
+    Peak memory: ~1 full layer + 1 sharded layer at a time.
+    """
+    container, attr = _find_layers_container(model)
+    if container is None:
+        logger.warning(
+            "_eval_shard_eval: could not locate layers container; "
+            "falling back to shard + chunked eval"
+        )
+        model.shard(group)
+        _chunked_eval_params(model)
+        return
+
+    original_layers = getattr(container, attr)
+    num_layers = len(original_layers)
+    logger.info("eval-shard-eval: %d transformer layers", num_layers)
+
+    # --- memory guard threshold ---
+    env_guard = os.environ.get("MLX_MEMORY_GUARD_GB")
+    if env_guard is not None:
+        guard_bytes = int(float(env_guard) * (1024**3))
+    else:
+        total_ram = _get_total_physical_memory()
+        guard_bytes = max(int(total_ram * 0.10), 5 * (1024**3)) if total_ram > 0 else 0
+
+    if guard_bytes > 0:
+        logger.info("Memory guard active: threshold=%.1f GB", guard_bytes / (1024**3))
+
+    # 1. Materialise non-layer params (embeddings, final norm, lm_head, …)
+    all_params = dict(tree_flatten(model.parameters()))
+    non_layer = [p for name, p in all_params.items()
+                 if _extract_layer_index(name) is None]
+    if non_layer:
+        logger.info("Materialising %d non-layer param groups", len(non_layer))
+        mx.eval(*non_layer)
+        gc.collect()
+        mx.clear_cache()
+    del all_params, non_layer
+
+    if guard_bytes > 0:
+        _check_memory_guard(guard_bytes, -1, num_layers)
+
+    # 2. Replace the layers list with our eval-interposing wrapper, then
+    #    call model.shard().  The wrapper's __iter__ will eval each layer's
+    #    original weights before yield and the previous layer's sharded
+    #    weights at the start of the next iteration.
+    wrapper = _EvalShardEvalIter(original_layers, guard_bytes=guard_bytes)
+    setattr(container, attr, wrapper)
+    try:
+        model.shard(group)
+    finally:
+        # Restore the original list (which has been mutated in-place by shard)
+        setattr(container, attr, original_layers)
+
+    logger.info("eval-shard-eval complete: %d layers materialised", num_layers)
 
 
 def sharded_load(
@@ -658,12 +837,18 @@ def sharded_load(
         ],
     )
 
-    # Lazy load model to figure out what type of sharding we can do and which
-    # weights we need to download.
-    model, config = load_model(model_path, lazy=True, strict=False)
+    # Lightweight config-only probe to determine sharding capabilities
+    # without loading any safetensors (avoids OOM on large models like
+    # Kimi K2.5 with 182 shards / 612 GB).
+    config = load_config(model_path)
+    model_class, model_args_class = _get_classes(config=config)
+    has_tensor_parallel = hasattr(model_class, "shard")
 
-    has_pipelining = hasattr(model.model, "pipeline")
-    has_tensor_parallel = hasattr(model, "shard")
+    # For pipelining we need a model instance to inspect the inner .model
+    # attribute, but we can build the skeleton without touching safetensors.
+    model_args = model_args_class.from_dict(config)
+    _probe = model_class(model_args)
+    has_pipelining = hasattr(getattr(_probe, "model", None), "pipeline")
 
     if pipeline_group is not None and not has_pipelining:
         raise ValueError(
@@ -684,14 +869,14 @@ def sharded_load(
 
     # If pipelining then figure out which files we need for the local shard
     if pipeline_group is not None:
-        model.model.pipeline(pipeline_group)
+        _probe.model.pipeline(pipeline_group)
 
         # Figure out which files we need for the local shard
         with open(model_path / "model.safetensors.index.json", "r") as fid:
             weight_index = json.load(fid)["weight_map"]
 
         local_files = set()
-        for k, _ in tree_flatten(model.parameters()):
+        for k, _ in tree_flatten(_probe.parameters()):
             if file_name := weight_index.get(k, None) is None:
                 raise ValueError(
                     "Pipeline loading is only supported for MLX converted models."
@@ -703,6 +888,11 @@ def sharded_load(
     else:
         _download(repo)
 
+    # Free the lightweight probe model before the real load
+    del _probe
+    gc.collect()
+    mx.clear_cache()
+
     # Load and shard the model, and load the weights
     tokenizer = load_tokenizer(
         model_path,
@@ -710,11 +900,14 @@ def sharded_load(
         eos_token_ids=config.get("eos_token_id", None),
     )
     model, _ = load_model(model_path, lazy=True, strict=False)
+
     if tensor_group is not None:
-        model.shard(tensor_group)
-    if pipeline_group is not None:
+        _eval_shard_eval(model, tensor_group)
+    elif pipeline_group is not None:
         model.model.pipeline(pipeline_group)
-    _chunked_eval_params(model)
+        _chunked_eval_params(model)
+    else:
+        _chunked_eval_params(model)
 
     # Synchronize processes to avoid timeout
     mx.eval(mx.distributed.all_sum(mx.array(1.0), stream=mx.cpu))

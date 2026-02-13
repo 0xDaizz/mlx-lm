@@ -138,8 +138,8 @@ dmypy.json
 # .DS_Store files
 .DS_Store
 
-# Model weights
-models/
+# Model weights (top-level only, not mlx_lm/models/)
+/models/
 
 # Secrets / credentials
 *.pem
