@@ -518,6 +518,12 @@ class Scheduler:
             self._new_request_event.set()
             return True
 
+        # Non-rank0 workers in distributed mode must NOT cancel directly.
+        # They receive cancellations exclusively via bus events from rank0.
+        if self._control_bus is not None and self._dist_ctx is not None and not self._dist_ctx.is_rank0:
+            logger.debug("cancel_request(%s) ignored on non-rank0 — bus-only", request_id)
+            return False
+
         # ===== NON-DISTRIBUTED MODE: immediate cancel =====
         # Try removing from queue first (no lock needed for this)
         if self.request_queue.cancel(request_id):
@@ -627,6 +633,14 @@ class Scheduler:
                 self._batch_generator.close()
             except Exception:
                 pass
+            self._batch_generator = None  # release reference to allow GC
+
+        # Release model reference to allow GC to free Metal memory
+        self.model = None
+
+        # Release spec engine
+        if hasattr(self, '_spec_engine') and self._spec_engine is not None:
+            self._spec_engine = None
 
         # Flush SSD cache index
         if self._tiered_cache and hasattr(self._tiered_cache, 'ssd') and self._tiered_cache.ssd is not None:
@@ -737,8 +751,11 @@ class Scheduler:
         # Clean up finished sequences
         self._cleanup_finished()
 
-        # Periodic zombie cleanup (safety net for stuck sequences)
-        self._cleanup_zombie_sequences(timeout_s=60.0)
+        # Periodic zombie cleanup (safety net for stuck sequences).
+        # Only rank0 runs cleanup in distributed mode — non-rank0 workers
+        # receive cancellations exclusively via the control bus.
+        if self._dist_ctx is None or self._dist_ctx.is_rank0:
+            self._cleanup_zombie_sequences(timeout_s=300.0)
 
     def _apply_bus_events(self) -> bool:
         """Receive and apply control events from the distributed bus.
@@ -1054,8 +1071,11 @@ class Scheduler:
         # 9. Clean up finished sequences
         self._cleanup_finished_batch()
 
-        # 10. Periodic zombie cleanup (safety net for stuck sequences)
-        self._cleanup_zombie_sequences(timeout_s=60.0)
+        # 10. Periodic zombie cleanup (safety net for stuck sequences).
+        # Only rank0 runs cleanup in distributed mode — non-rank0 workers
+        # receive cancellations exclusively via the control bus.
+        if self._dist_ctx is None or self._dist_ctx.is_rank0:
+            self._cleanup_zombie_sequences(timeout_s=300.0)
 
     def _process_batch_responses(self, responses) -> tuple[list[TokenEvent], list[int], dict[int, list]]:
         """Process batch responses: detokenize, check stops, create events.
@@ -2021,12 +2041,18 @@ class Scheduler:
                     seq.finish_reason,
                 )
 
-    def _cleanup_zombie_sequences(self, timeout_s: float = 60.0) -> None:
+    def _cleanup_zombie_sequences(self, timeout_s: float = 300.0) -> None:
         """Remove sequences that haven't had activity recently (safety net).
 
         This is a defensive measure against sequences that get stuck due to
         missed cancellations or other edge cases. It does NOT replace proper
         disconnect detection in the server layer, but acts as a fallback.
+
+        IMPORTANT: In distributed mode, this must only be called by rank0.
+        Non-rank0 workers receive cancellations exclusively via the control bus.
+        Calling cancel_request() directly on non-rank0 causes immediate local
+        cancellation, which diverges from rank0's deferred (outbox) cancellation
+        and leads to BatchGenerator state mismatch → collective op deadlock.
         """
         now = time.time()
         with self._active_lock:

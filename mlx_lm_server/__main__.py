@@ -137,10 +137,25 @@ def _setup_metal_memory() -> None:
 
 
 def _cleanup_metal() -> None:
-    """Clean up Metal GPU resources (exo-style)."""
+    """Clean up Metal GPU resources.
+
+    Critical sequence:
+    1. gc.collect() — drop Python references to mx.array objects
+    2. mx.set_wired_limit(0) — unwire buffers from Metal residency set
+       (without this, OS CANNOT reclaim wired pages even after process exit;
+       see llama.cpp PR #11427 and MLX PR #1510)
+    3. mx.set_cache_limit(0) — prevent re-caching during cleanup
+    4. mx.clear_cache() — release cached Metal buffers
+    5. gc.collect() + mx.clear_cache() — second pass for circular refs
+    """
     try:
         import mlx.core as mx
 
+        gc.collect()
+        mx.set_wired_limit(0)
+        mx.set_cache_limit(0)
+        mx.clear_cache()
+        gc.collect()
         mx.clear_cache()
     except (AttributeError, Exception):
         try:
@@ -159,6 +174,7 @@ def main() -> None:
     _setup_metal_memory()
     atexit.register(_cleanup_metal)
     signal.signal(signal.SIGTERM, lambda s, f: (_cleanup_metal(), sys.exit(0)))
+    signal.signal(signal.SIGINT, lambda s, f: (_cleanup_metal(), sys.exit(0)))
 
     config = parse_args()
 
@@ -329,10 +345,10 @@ def main() -> None:
         logger.critical("Fatal error: %s", e)
         sys.exit(1)
     finally:
-        # Guard cleanup with a 10-second timeout. If scheduler.stop() or
+        # Guard cleanup with a 30-second timeout. If scheduler.stop() or
         # finalize_distributed() hangs (stuck collective, stuck thread join),
         # the daemon timer forces process exit.
-        cleanup_timer = threading.Timer(10.0, lambda: os._exit(1))
+        cleanup_timer = threading.Timer(30.0, lambda: os._exit(1))
         cleanup_timer.daemon = True
         cleanup_timer.start()
         try:
@@ -341,6 +357,9 @@ def main() -> None:
                     scheduler.stop()
                 except Exception:
                     logger.warning("Error during scheduler shutdown", exc_info=True)
+                # Release scheduler reference to allow model GC
+                scheduler = None
+            gc.collect()  # Collect model arrays before clearing Metal cache
             _cleanup_metal()
             if dist_ctx is not None:
                 finalize_distributed(dist_ctx)

@@ -108,6 +108,10 @@ def finalize_distributed(ctx: DistributedContext) -> None:
         import mlx.core as mx
 
         gc.collect()
+        mx.set_wired_limit(0)
+        mx.set_cache_limit(0)
+        mx.clear_cache()
+        gc.collect()
         mx.clear_cache()
         logger.info(
             "Distributed context finalized (rank=%d, active_mem=%.1f GB)",

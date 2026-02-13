@@ -596,7 +596,13 @@ def create_app(
         """
         sched = app.state.scheduler
         tok = app.state.tokenizer
-        timeout = app.state.config.request_timeout_s
+        # For non-streaming, use the maximum of request_timeout_s and
+        # first_token_timeout_s since prefill can take a long time for
+        # large models (e.g. 612GB Kimi K2.5 can exceed 120s prefill).
+        timeout = max(
+            app.state.config.request_timeout_s,
+            app.state.config.first_token_timeout_s,
+        )
 
         try:
             sched.submit_request(inf_req)
