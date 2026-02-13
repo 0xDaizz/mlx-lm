@@ -12,7 +12,7 @@ if [ ! -f "$PIDFILE" ]; then
         echo "[stop] Found processes on port 8080: $PIDS"
         echo "[stop] Sending SIGTERM ..."
         echo "$PIDS" | xargs kill 2>/dev/null || true
-        sleep 3
+        sleep 5
         # Force kill if still alive
         REMAINING=$(lsof -ti :8080 2>/dev/null || true)
         if [ -n "$REMAINING" ]; then
@@ -23,6 +23,13 @@ if [ ! -f "$PIDFILE" ]; then
     else
         echo "[stop] No server processes found on port 8080."
     fi
+
+    # Clean up remote node (hwStudio2) — Rank 1 worker
+    echo "[stop] Cleaning up remote node (hwStudio2) ..."
+    ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no hwStudio2.local \
+        'pgrep -f "mlx_lm_server" | xargs kill 2>/dev/null; sleep 5; pgrep -f "mlx_lm_server" | xargs kill -9 2>/dev/null' \
+        2>/dev/null || echo "[stop] Could not reach hwStudio2 (may be offline)"
+
     exit 0
 fi
 
@@ -34,9 +41,9 @@ if kill -0 "$SERVER_PID" 2>/dev/null; then
     kill "$SERVER_PID"
     echo "[stop] Sent SIGTERM, waiting for shutdown ..."
 
-    # Wait up to 30s for graceful shutdown
+    # Wait up to 45s for graceful shutdown (server's internal cleanup_timer is 30s)
     ELAPSED=0
-    while [ $ELAPSED -lt 30 ]; do
+    while [ $ELAPSED -lt 45 ]; do
         if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "[stop] Server stopped gracefully after ${ELAPSED}s"
             rm -f "$PIDFILE"
@@ -57,11 +64,23 @@ fi
 
 rm -f "$PIDFILE"
 
-# Also clean up any remaining mlx_lm_server on port 8080
+# Clean up remote node (hwStudio2) — Rank 1 worker
+echo "[stop] Cleaning up remote node (hwStudio2) ..."
+ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no hwStudio2.local \
+    'pgrep -f "mlx_lm_server" | xargs kill 2>/dev/null; sleep 5; pgrep -f "mlx_lm_server" | xargs kill -9 2>/dev/null' \
+    2>/dev/null || echo "[stop] Could not reach hwStudio2 (may be offline)"
+
+# Also clean up any remaining mlx_lm_server on port 8080 (SIGTERM first, then SIGKILL)
 REMAINING=$(lsof -ti :8080 2>/dev/null || true)
 if [ -n "$REMAINING" ]; then
     echo "[stop] Cleaning up remaining processes on port 8080: $REMAINING"
-    echo "$REMAINING" | xargs kill -9 2>/dev/null || true
+    echo "$REMAINING" | xargs kill 2>/dev/null || true
+    sleep 5
+    REMAINING=$(lsof -ti :8080 2>/dev/null || true)
+    if [ -n "$REMAINING" ]; then
+        echo "[stop] Force killing remaining: $REMAINING"
+        echo "$REMAINING" | xargs kill -9 2>/dev/null || true
+    fi
 fi
 
 echo "[stop] Done."
