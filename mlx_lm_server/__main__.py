@@ -363,9 +363,7 @@ def main() -> None:
                 "Rank %d: waiting for inference loop (no HTTP server)",
                 dist_ctx.rank,
             )
-            scheduler.join_worker_loop(timeout=300.0)
-            if scheduler.worker_timed_out:
-                raise RuntimeError(f"Rank {dist_ctx.rank}: worker loop timed out")
+            scheduler.join_worker_loop(timeout=None)
 
     except RuntimeError as e:
         logger.critical("Fatal error: %s", e)

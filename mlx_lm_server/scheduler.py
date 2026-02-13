@@ -562,11 +562,12 @@ class Scheduler:
             )
             self._inference_thread.start()
 
-    def join_worker_loop(self, timeout: float = 300.0) -> None:
+    def join_worker_loop(self, timeout: float | None = None) -> None:
         """Block until the inference loop finishes. Used by non-rank0 workers.
 
         Args:
-            timeout: Maximum seconds to wait. If exceeded, sets worker_timed_out=True.
+            timeout: Maximum seconds to wait. None means wait indefinitely.
+                     If exceeded, sets worker_timed_out=True.
         """
         self.worker_timed_out = False
         if self._inference_thread is not None:
