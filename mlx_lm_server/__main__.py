@@ -191,6 +191,8 @@ def main() -> None:
     atexit.register(_cleanup_metal)
     signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
     signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
+    if hasattr(signal, "SIGHUP"):
+        signal.signal(signal.SIGHUP, lambda s, f: sys.exit(0))
 
     config = parse_args()
 

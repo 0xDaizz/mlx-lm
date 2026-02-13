@@ -331,10 +331,11 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
-        # Shutdown: flush and stop
+        # Shutdown: stop scheduler first (unblocks polling threads),
+        # then drain executor so no dangling refs remain.
         app.state.shutting_down = True
-        _inference_executor.shutdown(wait=False)
         scheduler.shutdown()
+        _inference_executor.shutdown(wait=True, cancel_futures=True)
 
     app = FastAPI(title="mlx-lm-server", version="0.1.0", lifespan=lifespan)
 

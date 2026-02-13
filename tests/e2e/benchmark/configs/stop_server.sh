@@ -1,86 +1,112 @@
 #!/usr/bin/env bash
-# stop_server.sh — Gracefully stop the benchmark server
+# stop_server.sh — Gracefully stop the benchmark server (2-node JACCL TP)
+#
+# Process topology:
+#   mlx.launch (PID in pidfile)
+#   ├── python rank 0 (local, port 8080, holds ~310GB wired Metal memory)
+#   └── python rank 1 (hwStudio2 via SSH, holds ~310GB wired Metal memory)
+#
+# mlx.launch has NO SIGTERM handler — it dies instantly without propagating
+# to children. So we must explicitly kill all server processes ourselves.
+#
+# Strategy:
+#   1. Send SIGTERM to all mlx_lm_server processes (local + remote)
+#   2. Wait up to 40s for graceful Metal cleanup (_cleanup_metal takes ~30s max)
+#   3. SIGKILL only as last resort
 set -euo pipefail
 
 PIDFILE="/tmp/kimi-bench-server.pid"
+REMOTE_HOST="hwStudio2.local"
+GRACE_PERIOD=40   # seconds — must exceed server's internal cleanup_timer (30s)
 
-if [ ! -f "$PIDFILE" ]; then
-    echo "[stop] No PID file found at $PIDFILE"
-    # Try to find and kill any mlx_lm_server processes on port 8080
-    PIDS=$(lsof -ti :8080 2>/dev/null || true)
-    if [ -n "$PIDS" ]; then
-        echo "[stop] Found processes on port 8080: $PIDS"
-        echo "[stop] Sending SIGTERM ..."
-        echo "$PIDS" | xargs kill 2>/dev/null || true
-        sleep 5
-        # Force kill if still alive
-        REMAINING=$(lsof -ti :8080 2>/dev/null || true)
-        if [ -n "$REMAINING" ]; then
-            echo "[stop] Force killing remaining processes: $REMAINING"
-            echo "$REMAINING" | xargs kill -9 2>/dev/null || true
-        fi
+# ── Helper: kill local mlx_lm_server processes on port 8080 ──
+kill_local_server() {
+    local sig="${1:-TERM}"
+    local pids
+    pids=$(lsof -ti :8080 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+        echo "[stop] Local port 8080 processes: $pids (SIG$sig)"
+        echo "$pids" | xargs kill -"$sig" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
+
+# ── Helper: kill remote mlx_lm_server processes on hwStudio2 ──
+kill_remote_server() {
+    local sig="${1:-TERM}"
+    echo "[stop] Remote ($REMOTE_HOST): sending SIG$sig to mlx_lm_server processes ..."
+    ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no "$REMOTE_HOST" \
+        "pgrep -f 'mlx_lm_server' | xargs kill -$sig 2>/dev/null" \
+        2>/dev/null || true
+}
+
+# ── 1. Kill mlx.launch parent (if pidfile exists) ──
+if [ -f "$PIDFILE" ]; then
+    SERVER_PID=$(cat "$PIDFILE")
+    echo "[stop] Killing mlx.launch parent PID: $SERVER_PID"
+    kill "$SERVER_PID" 2>/dev/null || true
+    rm -f "$PIDFILE"
+fi
+
+# ── 2. Send SIGTERM to actual server processes (local + remote) ──
+echo "[stop] Sending SIGTERM to all server processes ..."
+kill_local_server "TERM" || true
+kill_remote_server "TERM"
+
+# ── 3. Wait for graceful shutdown (Metal cleanup needs up to 30s) ──
+echo "[stop] Waiting up to ${GRACE_PERIOD}s for graceful Metal cleanup ..."
+ELAPSED=0
+while [ $ELAPSED -lt $GRACE_PERIOD ]; do
+    LOCAL_ALIVE=$(lsof -ti :8080 2>/dev/null || true)
+    REMOTE_ALIVE=""
+    REMOTE_REACHABLE=true
+    REMOTE_ALIVE=$(ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no "$REMOTE_HOST" \
+        "pgrep -f 'mlx_lm_server'" 2>/dev/null) || REMOTE_REACHABLE=false
+
+    if [ -z "$LOCAL_ALIVE" ] && [ "$REMOTE_REACHABLE" = true ] && [ -z "$REMOTE_ALIVE" ]; then
+        echo "[stop] All server processes exited gracefully after ${ELAPSED}s"
         echo "[stop] Done."
-    else
-        echo "[stop] No server processes found on port 8080."
+        exit 0
     fi
 
-    # Clean up remote node (hwStudio2) — Rank 1 worker
-    echo "[stop] Cleaning up remote node (hwStudio2) ..."
-    ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no hwStudio2.local \
-        'pgrep -f "mlx_lm_server" | xargs kill 2>/dev/null; sleep 5; pgrep -f "mlx_lm_server" | xargs kill -9 2>/dev/null' \
-        2>/dev/null || echo "[stop] Could not reach hwStudio2 (may be offline)"
+    if [ "$REMOTE_REACHABLE" = false ] && [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+        echo "[stop] WARNING: Cannot reach $REMOTE_HOST — remote status unknown"
+    fi
 
-    exit 0
-fi
+    # Progress every 10s
+    if [ $((ELAPSED % 10)) -eq 0 ] && [ $ELAPSED -gt 0 ]; then
+        echo "[stop] Still waiting ... (${ELAPSED}s elapsed, local: ${LOCAL_ALIVE:-none}, remote: ${REMOTE_ALIVE:-none})"
+    fi
 
-SERVER_PID=$(cat "$PIDFILE")
-echo "[stop] Stopping server PID: $SERVER_PID"
-
-if kill -0 "$SERVER_PID" 2>/dev/null; then
-    # Send SIGTERM for graceful shutdown
-    kill "$SERVER_PID"
-    echo "[stop] Sent SIGTERM, waiting for shutdown ..."
-
-    # Wait up to 45s for graceful shutdown (server's internal cleanup_timer is 30s)
-    ELAPSED=0
-    while [ $ELAPSED -lt 45 ]; do
-        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-            echo "[stop] Server stopped gracefully after ${ELAPSED}s"
-            rm -f "$PIDFILE"
-            exit 0
-        fi
-        sleep 1
-        ELAPSED=$((ELAPSED + 1))
-    done
-
-    # Force kill if still alive
-    echo "[stop] Server did not stop gracefully, sending SIGKILL ..."
-    kill -9 "$SERVER_PID" 2>/dev/null || true
     sleep 1
-    echo "[stop] Server force-killed."
+    ELAPSED=$((ELAPSED + 1))
+done
+
+# ── 4. SIGKILL as last resort ──
+echo "[stop] Grace period expired. Force-killing remaining processes ..."
+kill_local_server "KILL" || true
+kill_remote_server "KILL"
+sleep 2
+
+# ── 5. Final verification ──
+REMAINING_LOCAL=$(lsof -ti :8080 2>/dev/null || true)
+if [ -n "$REMAINING_LOCAL" ]; then
+    echo "[stop] WARNING: Local processes still alive after SIGKILL: $REMAINING_LOCAL"
 else
-    echo "[stop] Server PID $SERVER_PID is not running."
+    echo "[stop] Local: clean"
 fi
 
-rm -f "$PIDFILE"
-
-# Clean up remote node (hwStudio2) — Rank 1 worker
-echo "[stop] Cleaning up remote node (hwStudio2) ..."
-ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no hwStudio2.local \
-    'pgrep -f "mlx_lm_server" | xargs kill 2>/dev/null; sleep 5; pgrep -f "mlx_lm_server" | xargs kill -9 2>/dev/null' \
-    2>/dev/null || echo "[stop] Could not reach hwStudio2 (may be offline)"
-
-# Also clean up any remaining mlx_lm_server on port 8080 (SIGTERM first, then SIGKILL)
-REMAINING=$(lsof -ti :8080 2>/dev/null || true)
-if [ -n "$REMAINING" ]; then
-    echo "[stop] Cleaning up remaining processes on port 8080: $REMAINING"
-    echo "$REMAINING" | xargs kill 2>/dev/null || true
-    sleep 5
-    REMAINING=$(lsof -ti :8080 2>/dev/null || true)
-    if [ -n "$REMAINING" ]; then
-        echo "[stop] Force killing remaining: $REMAINING"
-        echo "$REMAINING" | xargs kill -9 2>/dev/null || true
-    fi
+REMAINING_REMOTE=""
+VERIFY_REACHABLE=true
+REMAINING_REMOTE=$(ssh -o ConnectTimeout=3 -o StrictHostKeyChecking=no "$REMOTE_HOST" \
+    "pgrep -f 'mlx_lm_server'" 2>/dev/null) || VERIFY_REACHABLE=false
+if [ "$VERIFY_REACHABLE" = false ]; then
+    echo "[stop] WARNING: Cannot reach $REMOTE_HOST — remote status unknown (may need manual check)"
+elif [ -n "$REMAINING_REMOTE" ]; then
+    echo "[stop] WARNING: Remote processes still alive after SIGKILL: $REMAINING_REMOTE"
+else
+    echo "[stop] Remote: clean"
 fi
 
 echo "[stop] Done."
