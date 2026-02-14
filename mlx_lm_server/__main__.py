@@ -336,9 +336,10 @@ def main() -> None:
         # --- Control bus (for future scheduler integration) ---
         control_bus = None
         if dist_ctx.enabled and dist_ctx.world_size > 1:
+            from mlx_lm.generate import generation_stream
             from mlx_lm_server.distributed_bus import DistributedControlBus
 
-            control_bus = DistributedControlBus(dist_ctx)
+            control_bus = DistributedControlBus(dist_ctx, stream=generation_stream)
             logger.info(
                 "Rank %d: control bus created (world_size=%d)",
                 dist_ctx.rank,

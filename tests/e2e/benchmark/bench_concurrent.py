@@ -81,7 +81,7 @@ def single_streaming_request(
     error = None
 
     try:
-        with httpx.Client() as client:
+        with httpx.Client(timeout=httpx.Timeout(600.0)) as client:
             with client.stream(
                 "POST", f"{url}/v1/chat/completions", json=payload, timeout=600.0
             ) as resp:
@@ -142,7 +142,7 @@ def single_streaming_request(
 def get_health(url: str) -> dict | None:
     """Fetch server health stats."""
     try:
-        with httpx.Client() as client:
+        with httpx.Client(timeout=httpx.Timeout(600.0)) as client:
             resp = client.get(f"{url}/health", timeout=10.0)
             if resp.status_code == 200:
                 return resp.json()
@@ -259,14 +259,29 @@ def main():
     print(f"Model: {model_name}")
 
     all_results = []
-    for level in levels:
-        batch_result = run_concurrent_batch(url, level, args.max_tokens, model=model_name)
-        all_results.append(batch_result)
-        # Brief pause between batches
-        time.sleep(2)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+
+    def _save_partial():
+        pf = RESULTS_DIR / f"bench_concurrent_{ts}_partial.json"
+        pf.write_text(json.dumps(
+            {"benchmark": "bench_concurrent", "results": all_results, "partial": True},
+            indent=2, default=str,
+        ))
+
+    try:
+        for level in levels:
+            batch_result = run_concurrent_batch(url, level, args.max_tokens, model=model_name)
+            all_results.append(batch_result)
+            _save_partial()
+            # Brief pause between batches
+            time.sleep(2)
+    except Exception as e:
+        print(f"\nFATAL: {e}", file=sys.stderr)
+        _save_partial()
+        print(f"Partial results ({len(all_results)} levels) saved", file=sys.stderr)
+        raise
 
     # Save results
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     output = {
         "benchmark": "bench_concurrent",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -278,6 +293,10 @@ def main():
     outfile = RESULTS_DIR / f"bench_concurrent_{ts}.json"
     outfile.write_text(json.dumps(output, indent=2, default=str))
     print(f"\nResults saved to {outfile}")
+
+    partial_file = RESULTS_DIR / f"bench_concurrent_{ts}_partial.json"
+    if partial_file.exists():
+        partial_file.unlink()
 
     # Summary table
     print("\n=== Concurrency Summary ===")

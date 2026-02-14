@@ -3,6 +3,17 @@
 > Memory-Safe Distributed Loader를 612GB Kimi K2.5 모델로 검증하기 위한
 > 2-node JACCL Tensor Parallelism 전체 절차 및 참조 문서.
 
+> **⚠️ CRITICAL: 작업 기기 vs 목표 기기 구분**
+>
+> Claude Code는 **HWmacbookpro (MacBook Pro)** 에서 실행된다.
+> hwStudio1/hwStudio2는 **별도의 Mac Studio** 이며, 반드시 SSH로 접근해야 한다.
+> 로컬에서 직접 ifconfig, mlx.launch, vm_stat 등을 실행하면 **잘못된 기기에서 실행**된다.
+>
+> ```
+> ssh hwStudio1.local "명령어"   # rank 0
+> ssh hwStudio2.local "명령어"   # rank 1
+> ```
+
 ---
 
 ## 목차

@@ -19,6 +19,7 @@ Pass model=None and tokenizer=None for mock-based tests.
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -248,6 +249,12 @@ class Scheduler:
             "spec_tokens_accepted": 0,
         }
         self._stats_lock = threading.Lock()
+
+        # Inference loop watchdog: detect hung _batch_generator.next() / eval_impl()
+        self._last_inference_step_ts: float = time.monotonic()
+        self._inference_watchdog_s: float = float(
+            os.environ.get("MLX_INFERENCE_WATCHDOG_S", "300")
+        )
 
         # Shutdown health fields
         self._shutdown_clean: bool = True
@@ -714,6 +721,13 @@ class Scheduler:
 
     def _mock_inference_step(self) -> None:
         """One iteration of the mock inference loop (model=None)."""
+        self._last_inference_step_ts = time.monotonic()
+        # Temporary safety barrier: synchronize generation_stream before bus sync.
+        # See _batch_inference_step for rationale.
+        if self._control_bus is not None:
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+            mx.synchronize(generation_stream)
         # Distributed bus synchronization (TP mode) — same as _batch_inference_step
         if self._control_bus is not None and self._dist_ctx is not None:
             if self._dist_ctx.is_rank0:
@@ -726,6 +740,7 @@ class Scheduler:
         with self._active_lock:
             has_active = len(self._active_sequences) > 0
         if not has_active and self.request_queue.size == 0:
+            self._last_inference_step_ts = time.monotonic()
             self._new_request_event.wait(timeout=0.1)
             self._new_request_event.clear()
             if not self._running:
@@ -969,6 +984,18 @@ class Scheduler:
 
     def _batch_inference_step(self) -> None:
         """One step of the batch inference loop using BatchGenerator."""
+        self._last_inference_step_ts = time.monotonic()
+
+        # Temporary safety barrier: synchronize generation_stream before bus sync.
+        # With bus now on generation_stream (ERR-06 fix), this is mostly redundant
+        # since same-stream ops serialize automatically. Kept during soak period
+        # to catch any remaining ordering issues. Remove after stable validation.
+        # See: MLX-LM PR #741, ERR-06 deadlock investigation.
+        if self._control_bus is not None:
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+            mx.synchronize(generation_stream)
+
         # Distributed bus synchronization (TP mode)
         if self._control_bus is not None and self._dist_ctx is not None:
             if self._dist_ctx.is_rank0:
@@ -983,6 +1010,7 @@ class Scheduler:
         with self._active_lock:
             has_active = bool(self._uid_to_request_id)
         if not has_active and self.request_queue.size == 0:
+            self._last_inference_step_ts = time.monotonic()
             self._new_request_event.wait(timeout=0.1)
             self._new_request_event.clear()
             if not self._running:
@@ -2139,6 +2167,14 @@ class Scheduler:
         stats["dist_bus_error_count"] = self._bus_error_count
         stats["dist_bus_unpack_error_count"] = self._bus_unpack_error_count
         stats["dist_outbox_size"] = self._bus_outbox.qsize()
+        # Inference loop watchdog — only flag stale when there is pending work,
+        # otherwise an idle server with no requests would trigger a false positive.
+        staleness = time.monotonic() - self._last_inference_step_ts
+        stats["inference_loop_stale_s"] = round(staleness, 1)
+        has_work = stats["active_sequences"] > 0 or stats["queued_requests"] > 0
+        stats["inference_loop_alive"] = (
+            not has_work or staleness < self._inference_watchdog_s
+        )
         # Shutdown health fields
         stats["shutdown_clean"] = self._shutdown_clean
         stats["shutdown_partial_flush"] = self._shutdown_partial_flush

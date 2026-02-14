@@ -94,13 +94,16 @@ class DistributedControlBus:
     When rank0 has no events, it sends a noop to prevent collective deadlock.
     """
 
-    def __init__(self, dist_ctx: DistributedContext) -> None:
+    def __init__(self, dist_ctx: DistributedContext, stream=None) -> None:
         import mlx.core as mx
 
         self.group = dist_ctx.group
         self.rank = dist_ctx.rank
         self.world_size = dist_ctx.world_size
-        self._stream = mx.new_stream(mx.default_device())
+        if stream is None:
+            from mlx_lm.generate import generation_stream
+            stream = generation_stream
+        self._stream = stream  # Use generation_stream to serialize with model all_sum
         self._mx = mx
 
     def publish(self, event: ControlEvent) -> None:

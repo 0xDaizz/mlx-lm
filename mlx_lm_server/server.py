@@ -860,6 +860,8 @@ def create_app(
             reasons.append("shutting_down")
         if dist["fatal"]:
             reasons.append(dist["fatal_reason"] or "distributed_fatal")
+        if not cache_stats.get("inference_loop_alive", True):
+            reasons.append("inference_stalled")
         if _check_memory_pressure():
             reasons.append("memory_pressure")
         ready = len(reasons) == 0
@@ -902,6 +904,9 @@ def create_app(
         if dist["fatal"]:
             status = "distributed_fatal"
             status_code = 503
+        elif not cache_stats.get("inference_loop_alive", True):
+            status = "inference_stalled"
+            status_code = 503
         elif utilization >= threshold:
             status = "overloaded"
             status_code = 503
@@ -918,6 +923,7 @@ def create_app(
                 "status": status,
                 "ready": status_code == 200,
                 "utilization": utilization,
+                "inference_loop_stale_s": cache_stats.get("inference_loop_stale_s", 0),
                 "cache_stats": cache_stats,
                 "distributed": dist,
             },

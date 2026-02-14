@@ -299,7 +299,7 @@ def get_model_name(server_url: str) -> str:
 def get_health(url: str) -> dict | None:
     """Fetch server health stats."""
     try:
-        with httpx.Client() as client:
+        with httpx.Client(timeout=httpx.Timeout(600.0)) as client:
             resp = client.get(f"{url}/health", timeout=10.0)
             if resp.status_code == 200:
                 return resp.json()
@@ -346,7 +346,7 @@ def single_streaming_request(
     error = None
 
     try:
-        with httpx.Client() as client:
+        with httpx.Client(timeout=httpx.Timeout(600.0)) as client:
             with client.stream(
                 "POST", f"{url}/v1/chat/completions", json=payload, timeout=600.0
             ) as resp:
@@ -514,70 +514,85 @@ def main():
     # --- Run benchmarks ---
     all_batch_results = []  # one entry per batch_size
     k1_avg_throughput = None
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
-    for k in batch_sizes:
-        print(f"=== Batch size k={k} ===")
-        runs = []
-        for run_idx in range(num_runs):
-            print(f"  Run {run_idx + 1}/{num_runs} ... ", end="", flush=True)
-            run_result = run_batch(url, k, max_tokens, model_name, run_idx)
+    def _save_partial():
+        pf = RESULTS_DIR / f"bench_batch_{ts}_partial.json"
+        pf.write_text(json.dumps(
+            {"benchmark": "bench_batch", "results": all_batch_results, "partial": True},
+            indent=2, default=str,
+        ))
 
-            ok = run_result["successful"]
-            errs = run_result["errors"]
-            print(
-                f"wall={run_result['wall_clock_s']:.2f}s, "
-                f"throughput={run_result['aggregate_throughput_tok_s']:.1f} tok/s, "
-                f"{ok}/{k} ok" + (f", {errs} errors" if errs else "")
-            )
-            runs.append(run_result)
+    try:
+        for k in batch_sizes:
+            print(f"=== Batch size k={k} ===")
+            runs = []
+            for run_idx in range(num_runs):
+                print(f"  Run {run_idx + 1}/{num_runs} ... ", end="", flush=True)
+                run_result = run_batch(url, k, max_tokens, model_name, run_idx)
 
-            # Brief pause between runs to let the server settle
-            if run_idx < num_runs - 1:
-                time.sleep(1)
+                ok = run_result["successful"]
+                errs = run_result["errors"]
+                print(
+                    f"wall={run_result['wall_clock_s']:.2f}s, "
+                    f"throughput={run_result['aggregate_throughput_tok_s']:.1f} tok/s, "
+                    f"{ok}/{k} ok" + (f", {errs} errors" if errs else "")
+                )
+                runs.append(run_result)
 
-        # Aggregate across runs
-        throughputs = [r["aggregate_throughput_tok_s"] for r in runs]
-        avg_throughput = round(statistics.mean(throughputs), 2)
+                # Brief pause between runs to let the server settle
+                if run_idx < num_runs - 1:
+                    time.sleep(1)
 
-        # Per-request latencies across all runs
-        all_latencies = []
-        for r in runs:
-            for req in r["requests"]:
-                if not req.get("error"):
-                    all_latencies.append(req["total_time_s"])
+            # Aggregate across runs
+            throughputs = [r["aggregate_throughput_tok_s"] for r in runs]
+            avg_throughput = round(statistics.mean(throughputs), 2)
 
-        avg_latency = round(statistics.mean(all_latencies), 4) if all_latencies else 0.0
-        sorted_latencies = sorted(all_latencies)
-        p95_idx = max(0, math.ceil(len(sorted_latencies) * 0.95) - 1)
-        p95_latency = round(sorted_latencies[p95_idx], 4) if sorted_latencies else 0.0
+            # Per-request latencies across all runs
+            all_latencies = []
+            for r in runs:
+                for req in r["requests"]:
+                    if not req.get("error"):
+                        all_latencies.append(req["total_time_s"])
 
-        # Prompt tokens average (from actual requests)
-        all_prompt_tokens = []
-        for r in runs:
-            for req in r["requests"]:
-                pt = req.get("prompt_tokens", 0)
-                if pt > 0:
-                    all_prompt_tokens.append(pt)
-        avg_prompt_tokens = round(statistics.mean(all_prompt_tokens)) if all_prompt_tokens else 0
+            avg_latency = round(statistics.mean(all_latencies), 4) if all_latencies else 0.0
+            sorted_latencies = sorted(all_latencies)
+            p95_idx = max(0, math.ceil(len(sorted_latencies) * 0.95) - 1)
+            p95_latency = round(sorted_latencies[p95_idx], 4) if sorted_latencies else 0.0
 
-        if k1_avg_throughput is None:
-            k1_avg_throughput = avg_throughput
-        speedup = round(avg_throughput / k1_avg_throughput, 2) if k1_avg_throughput > 0 else 0.0
+            # Prompt tokens average (from actual requests)
+            all_prompt_tokens = []
+            for r in runs:
+                for req in r["requests"]:
+                    pt = req.get("prompt_tokens", 0)
+                    if pt > 0:
+                        all_prompt_tokens.append(pt)
+            avg_prompt_tokens = round(statistics.mean(all_prompt_tokens)) if all_prompt_tokens else 0
 
-        batch_entry = {
-            "batch_size": k,
-            "runs": runs,
-            "avg_aggregate_throughput_tok_s": avg_throughput,
-            "avg_per_request_latency_s": avg_latency,
-            "p95_per_request_latency_s": p95_latency,
-            "avg_prompt_tokens": avg_prompt_tokens,
-            "speedup_vs_k1": speedup,
-        }
-        all_batch_results.append(batch_entry)
+            if k1_avg_throughput is None:
+                k1_avg_throughput = avg_throughput
+            speedup = round(avg_throughput / k1_avg_throughput, 2) if k1_avg_throughput > 0 else 0.0
 
-        # Pause between batch sizes
-        if k != batch_sizes[-1]:
-            time.sleep(2)
+            batch_entry = {
+                "batch_size": k,
+                "runs": runs,
+                "avg_aggregate_throughput_tok_s": avg_throughput,
+                "avg_per_request_latency_s": avg_latency,
+                "p95_per_request_latency_s": p95_latency,
+                "avg_prompt_tokens": avg_prompt_tokens,
+                "speedup_vs_k1": speedup,
+            }
+            all_batch_results.append(batch_entry)
+            _save_partial()
+
+            # Pause between batch sizes
+            if k != batch_sizes[-1]:
+                time.sleep(2)
+    except Exception as e:
+        print(f"\nFATAL: {e}", file=sys.stderr)
+        _save_partial()
+        print(f"Partial results ({len(all_batch_results)} batches) saved", file=sys.stderr)
+        raise
 
     # --- Save results ---
     health_after = get_health(url)
@@ -589,7 +604,6 @@ def main():
             all_pt.append(br["avg_prompt_tokens"])
     prompt_tokens_avg = round(statistics.mean(all_pt)) if all_pt else 0
 
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     output = {
         "benchmark": "batch_inference",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -605,6 +619,10 @@ def main():
     outfile = RESULTS_DIR / f"bench_batch_{ts}.json"
     outfile.write_text(json.dumps(output, indent=2, default=str))
     print(f"\nResults saved to {outfile}")
+
+    partial_file = RESULTS_DIR / f"bench_batch_{ts}_partial.json"
+    if partial_file.exists():
+        partial_file.unlink()
 
     # --- Console summary table ---
     print()

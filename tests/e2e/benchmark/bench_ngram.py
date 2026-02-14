@@ -238,7 +238,7 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     url = args.server_url.rstrip("/")
-    client = httpx.Client()
+    client = httpx.Client(timeout=httpx.Timeout(600.0))
 
     health = get_health(client, url)
     if health is None:
@@ -263,42 +263,55 @@ def main():
         else PROMPT_CATEGORIES
     )
 
+    label = args.label or "default"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     results = []
-    for cat_name, cat_info in categories.items():
-        prompt = cat_info["prompt"]
-        desc = cat_info["description"]
-        print(f"\n--- {cat_name}: {desc} ---")
 
-        # Get spec metrics before this category
-        spec_before = get_spec_decode_metrics(client, url)
+    def _save_partial():
+        pf = RESULTS_DIR / f"bench_ngram_{label}_{ts}_partial.json"
+        pf.write_text(json.dumps(
+            {"benchmark": "bench_ngram", "results": results, "partial": True},
+            indent=2, default=str,
+        ))
 
-        print(f"  Benchmarking... ", end="", flush=True)
-        r = bench_streaming_chat(client, url, prompt, args.max_tokens, model=model_name)
-        r["category"] = cat_name
-        r["category_description"] = desc
-        r["max_tokens"] = args.max_tokens
+    try:
+        for cat_name, cat_info in categories.items():
+            prompt = cat_info["prompt"]
+            desc = cat_info["description"]
+            print(f"\n--- {cat_name}: {desc} ---")
 
-        # Get spec metrics after to compute delta
-        spec_after = get_spec_decode_metrics(client, url)
-        r["spec_metrics_after"] = spec_after
+            # Get spec metrics before this category
+            spec_before = get_spec_decode_metrics(client, url)
 
-        if r.get("error"):
-            print(f"ERROR: {r['error'][:60]}")
-        else:
-            print(
-                f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, "
-                f"{r['completion_tokens']} tokens, {r['total_time_s']}s"
-            )
+            print(f"  Benchmarking... ", end="", flush=True)
+            r = bench_streaming_chat(client, url, prompt, args.max_tokens, model=model_name)
+            r["category"] = cat_name
+            r["category_description"] = desc
+            r["max_tokens"] = args.max_tokens
 
-        results.append(r)
+            # Get spec metrics after to compute delta
+            spec_after = get_spec_decode_metrics(client, url)
+            r["spec_metrics_after"] = spec_after
+
+            if r.get("error"):
+                print(f"ERROR: {r['error'][:60]}")
+            else:
+                print(
+                    f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, "
+                    f"{r['completion_tokens']} tokens, {r['total_time_s']}s"
+                )
+
+            results.append(r)
+            _save_partial()
+    except Exception as e:
+        print(f"\nFATAL: {e}", file=sys.stderr)
+        _save_partial()
+        print(f"Partial results ({len(results)} tests) saved", file=sys.stderr)
+        raise
 
     # Final spec metrics
     spec_metrics_after = get_spec_decode_metrics(client, url)
     client.close()
-
-    # Save
-    label = args.label or "default"
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     output = {
         "benchmark": "bench_ngram",
         "label": label,

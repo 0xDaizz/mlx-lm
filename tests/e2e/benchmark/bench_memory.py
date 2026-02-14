@@ -176,7 +176,7 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     url = args.server_url.rstrip("/")
-    client = httpx.Client()
+    client = httpx.Client(timeout=httpx.Timeout(600.0))
 
     # Initial health check
     health_initial = get_health(client, url)
@@ -200,38 +200,53 @@ def main():
     print(f"  utilization: {health_initial.get('utilization', 'N/A')}")
 
     results = []
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
-    for test in TEST_PROMPTS:
-        name = test["name"]
-        messages = test["messages"]
-        print(f"\n--- {name} ---")
+    def _save_partial():
+        pf = RESULTS_DIR / f"bench_memory_{args.label}_{ts}_partial.json"
+        pf.write_text(json.dumps(
+            {"benchmark": "bench_memory", "label": args.label, "results": results, "partial": True},
+            indent=2, default=str,
+        ))
 
-        health_before = get_health(client, url)
+    try:
+        for test in TEST_PROMPTS:
+            name = test["name"]
+            messages = test["messages"]
+            print(f"\n--- {name} ---")
 
-        print(f"  Running inference... ", end="", flush=True)
-        r = streaming_chat(client, url, messages, args.max_tokens, model=model_name)
-        r["test_name"] = name
+            health_before = get_health(client, url)
 
-        health_after = get_health(client, url)
-        r["health_before"] = health_before
-        r["health_after"] = health_after
+            print(f"  Running inference... ", end="", flush=True)
+            r = streaming_chat(client, url, messages, args.max_tokens, model=model_name)
+            r["test_name"] = name
 
-        if r.get("error"):
-            print(f"ERROR: {r['error'][:60]}")
-        else:
-            print(
-                f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, "
-                f"{r['completion_tokens']} tokens"
-            )
+            health_after = get_health(client, url)
+            r["health_before"] = health_before
+            r["health_after"] = health_after
 
-        # Show cache delta
-        before_used = (health_before or {}).get("cache_stats", {}).get("used_blocks", 0)
-        after_used = (health_after or {}).get("cache_stats", {}).get("used_blocks", 0)
-        delta = after_used - before_used
-        after_util = (health_after or {}).get("utilization", 0)
-        print(f"  Blocks: {before_used} -> {after_used} (delta={delta}), utilization={after_util:.3f}")
+            if r.get("error"):
+                print(f"ERROR: {r['error'][:60]}")
+            else:
+                print(
+                    f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, "
+                    f"{r['completion_tokens']} tokens"
+                )
 
-        results.append(r)
+            # Show cache delta
+            before_used = (health_before or {}).get("cache_stats", {}).get("used_blocks", 0)
+            after_used = (health_after or {}).get("cache_stats", {}).get("used_blocks", 0)
+            delta = after_used - before_used
+            after_util = (health_after or {}).get("utilization", 0)
+            print(f"  Blocks: {before_used} -> {after_used} (delta={delta}), utilization={after_util:.3f}")
+
+            results.append(r)
+            _save_partial()
+    except Exception as e:
+        print(f"\nFATAL: {e}", file=sys.stderr)
+        _save_partial()
+        print(f"Partial results ({len(results)} tests) saved", file=sys.stderr)
+        raise
 
     # Final stats
     health_final = get_health(client, url)
@@ -239,7 +254,6 @@ def main():
     client.close()
 
     # Save
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     output = {
         "benchmark": "bench_memory",
         "label": args.label,
@@ -255,6 +269,10 @@ def main():
     outfile = RESULTS_DIR / f"bench_memory_{args.label}_{ts}.json"
     outfile.write_text(json.dumps(output, indent=2, default=str))
     print(f"\nResults saved to {outfile}")
+
+    partial_file = RESULTS_DIR / f"bench_memory_{args.label}_{ts}_partial.json"
+    if partial_file.exists():
+        partial_file.unlink()
 
     # Summary
     print(f"\n=== Memory Summary (label={args.label}) ===")

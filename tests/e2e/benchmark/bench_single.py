@@ -290,8 +290,17 @@ def main():
     url = args.server_url.rstrip("/")
     max_tokens = args.max_tokens
     results = []
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
-    client = httpx.Client()
+    def _save_partial():
+        """Write partial results so data isn't lost on crash."""
+        partial_file = RESULTS_DIR / f"bench_single_{ts}_partial.json"
+        partial_file.write_text(json.dumps(
+            {"benchmark": "bench_single", "results": results, "partial": True},
+            indent=2, default=str,
+        ))
+
+    client = httpx.Client(timeout=httpx.Timeout(600.0))
 
     # Check server is up
     health = get_health(client, url)
@@ -306,66 +315,75 @@ def main():
 
     prompt_keys = [args.prompt_key] if args.prompt_key else list(PROMPTS.keys())
 
-    for prompt_key in prompt_keys:
-        prompt = PROMPTS[prompt_key]
-        print(f"\n--- Prompt: {prompt_key} (max_tokens={max_tokens}) ---")
+    try:
+        for prompt_key in prompt_keys:
+            prompt = PROMPTS[prompt_key]
+            print(f"\n--- Prompt: {prompt_key} (max_tokens={max_tokens}) ---")
 
-        # Non-streaming chat
-        print("  [1/3] Non-streaming chat... ", end="", flush=True)
-        r = bench_non_streaming_chat(client, url, prompt, max_tokens, model=model_name)
-        r["test_name"] = f"non_streaming_chat_{prompt_key}"
-        r["prompt_key"] = prompt_key
-        r["max_tokens"] = max_tokens
-        results.append(r)
-        if r.get("error"):
-            print(f"ERROR: {r['error']}")
-        else:
-            print(f"{r['generation_tok_s']} tok/s, {r['total_time_s']}s total")
+            # Non-streaming chat
+            print("  [1/3] Non-streaming chat... ", end="", flush=True)
+            r = bench_non_streaming_chat(client, url, prompt, max_tokens, model=model_name)
+            r["test_name"] = f"non_streaming_chat_{prompt_key}"
+            r["prompt_key"] = prompt_key
+            r["max_tokens"] = max_tokens
+            results.append(r)
+            _save_partial()
+            if r.get("error"):
+                print(f"ERROR: {r['error']}")
+            else:
+                print(f"{r['generation_tok_s']} tok/s, {r['total_time_s']}s total")
 
-        # Streaming chat
-        print("  [2/3] Streaming chat... ", end="", flush=True)
-        r = bench_streaming_chat(client, url, prompt, max_tokens, model=model_name)
-        r["test_name"] = f"streaming_chat_{prompt_key}"
-        r["prompt_key"] = prompt_key
-        r["max_tokens"] = max_tokens
-        results.append(r)
-        if r.get("error"):
-            print(f"ERROR: {r['error']}")
-        else:
-            print(f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, {r['total_time_s']}s total")
+            # Streaming chat
+            print("  [2/3] Streaming chat... ", end="", flush=True)
+            r = bench_streaming_chat(client, url, prompt, max_tokens, model=model_name)
+            r["test_name"] = f"streaming_chat_{prompt_key}"
+            r["prompt_key"] = prompt_key
+            r["max_tokens"] = max_tokens
+            results.append(r)
+            _save_partial()
+            if r.get("error"):
+                print(f"ERROR: {r['error']}")
+            else:
+                print(f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, {r['total_time_s']}s total")
 
-        # Streaming completion
-        print("  [3/3] Streaming completion... ", end="", flush=True)
-        r = bench_streaming_completion(client, url, prompt, max_tokens, model=model_name)
-        r["test_name"] = f"streaming_completion_{prompt_key}"
-        r["prompt_key"] = prompt_key
-        r["max_tokens"] = max_tokens
-        results.append(r)
-        if r.get("error"):
-            print(f"ERROR: {r['error']}")
-        else:
-            print(f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, {r['total_time_s']}s total")
+            # Streaming completion
+            print("  [3/3] Streaming completion... ", end="", flush=True)
+            r = bench_streaming_completion(client, url, prompt, max_tokens, model=model_name)
+            r["test_name"] = f"streaming_completion_{prompt_key}"
+            r["prompt_key"] = prompt_key
+            r["max_tokens"] = max_tokens
+            results.append(r)
+            _save_partial()
+            if r.get("error"):
+                print(f"ERROR: {r['error']}")
+            else:
+                print(f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, {r['total_time_s']}s total")
 
-    # Throughput scaling: vary max_tokens
-    print("\n--- Throughput scaling (streaming chat, short prompt) ---")
-    for mt in [64, 128, 256, 512, 1024]:
-        print(f"  max_tokens={mt}... ", end="", flush=True)
-        r = bench_streaming_chat(client, url, SHORT_PROMPT, mt, model=model_name)
-        r["test_name"] = f"scaling_max_tokens_{mt}"
-        r["prompt_key"] = "short"
-        r["max_tokens"] = mt
-        results.append(r)
-        if r.get("error"):
-            print(f"ERROR: {r['error']}")
-        else:
-            print(f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, {r['completion_tokens']} tokens")
+        # Throughput scaling: vary max_tokens
+        print("\n--- Throughput scaling (streaming chat, short prompt) ---")
+        for mt in [64, 128, 256, 512, 1024]:
+            print(f"  max_tokens={mt}... ", end="", flush=True)
+            r = bench_streaming_chat(client, url, SHORT_PROMPT, mt, model=model_name)
+            r["test_name"] = f"scaling_max_tokens_{mt}"
+            r["prompt_key"] = "short"
+            r["max_tokens"] = mt
+            results.append(r)
+            _save_partial()
+            if r.get("error"):
+                print(f"ERROR: {r['error']}")
+            else:
+                print(f"TTFT={r['ttft_s']}s, {r['generation_tok_s']} tok/s, {r['completion_tokens']} tokens")
+    except Exception as e:
+        print(f"\nFATAL: {e}", file=sys.stderr)
+        _save_partial()
+        print(f"Partial results ({len(results)} tests) saved", file=sys.stderr)
+        raise
 
     # Final health
     health_after = get_health(client, url)
     client.close()
 
-    # Save results
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    # Save final results
     output = {
         "benchmark": "bench_single",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -376,6 +394,10 @@ def main():
     }
     outfile = RESULTS_DIR / f"bench_single_{ts}.json"
     outfile.write_text(json.dumps(output, indent=2, default=str))
+    # Clean up partial file
+    partial_file = RESULTS_DIR / f"bench_single_{ts}_partial.json"
+    if partial_file.exists():
+        partial_file.unlink()
     print(f"\nResults saved to {outfile}")
 
     # Summary

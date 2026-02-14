@@ -301,7 +301,7 @@ def main():
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     url = args.server_url.rstrip("/")
-    client = httpx.Client()
+    client = httpx.Client(timeout=httpx.Timeout(600.0))
 
     health = get_health(client, url)
     if health is None:
@@ -313,17 +313,35 @@ def main():
     model_name = get_model_name(url)
     print(f"Model: {model_name}")
 
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     all_results = []
-    all_results.extend(test_cold_vs_warm(client, url, args.max_tokens, model=model_name))
-    all_results.extend(test_shared_prefix(client, url, args.max_tokens, model=model_name))
-    all_results.extend(test_multi_turn(client, url, args.max_tokens, model=model_name))
-    stats = test_cache_stats(client, url)
-    all_results.append(stats)
+
+    def _save_partial():
+        pf = RESULTS_DIR / f"bench_cache_{ts}_partial.json"
+        pf.write_text(json.dumps(
+            {"benchmark": "bench_cache", "results": all_results, "partial": True},
+            indent=2, default=str,
+        ))
+
+    try:
+        all_results.extend(test_cold_vs_warm(client, url, args.max_tokens, model=model_name))
+        _save_partial()
+        all_results.extend(test_shared_prefix(client, url, args.max_tokens, model=model_name))
+        _save_partial()
+        all_results.extend(test_multi_turn(client, url, args.max_tokens, model=model_name))
+        _save_partial()
+        stats = test_cache_stats(client, url)
+        all_results.append(stats)
+        _save_partial()
+    except Exception as e:
+        print(f"\nFATAL: {e}", file=sys.stderr)
+        _save_partial()
+        print(f"Partial results ({len(all_results)} tests) saved", file=sys.stderr)
+        raise
 
     client.close()
 
     # Save
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     output = {
         "benchmark": "bench_cache",
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -335,6 +353,10 @@ def main():
     outfile = RESULTS_DIR / f"bench_cache_{ts}.json"
     outfile.write_text(json.dumps(output, indent=2, default=str))
     print(f"\nResults saved to {outfile}")
+
+    partial_file = RESULTS_DIR / f"bench_cache_{ts}_partial.json"
+    if partial_file.exists():
+        partial_file.unlink()
 
     # Summary
     print("\n=== Cache Benchmark Summary ===")

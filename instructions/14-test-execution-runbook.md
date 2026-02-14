@@ -4,6 +4,23 @@ Step-by-step runbook for executing the comprehensive test and benchmark plan. Ea
 
 ---
 
+> **⚠️ CRITICAL: 작업 기기 vs 목표 기기 구분**
+>
+> | 역할 | 호스트명 | 기기 | 접근 방법 |
+> |------|---------|------|----------|
+> | **작업 기기 (Operator)** | HWmacbookpro | MacBook Pro | 로컬 (Claude Code 실행 위치) |
+> | **목표 기기 1 (Rank 0)** | hwStudio1.local | Mac Studio M3 Ultra 512GB | `ssh hwStudio1.local` |
+> | **목표 기기 2 (Rank 1)** | hwStudio2.local | Mac Studio M3 Ultra 512GB | `ssh hwStudio2.local` |
+>
+> **모든 서버/RDMA/모델 관련 명령은 반드시 SSH를 통해 목표 기기에서 실행해야 한다.**
+> 작업 기기(MacBook Pro)에서 직접 `ifconfig`, `mlx.launch`, `vm_stat` 등을 실행하면 안 된다.
+> - 로컬 명령: `ssh hwStudio1.local "command"` 또는 `ssh hwStudio2.local "command"`
+> - RDMA 설정: 양쪽 Studio에서 각각 SSH로 실행
+> - 서버 런칭: hwStudio1에 SSH 접속 후 실행 (rank 0이 HTTP 서버)
+> - 모니터링: 양쪽 모두 SSH로 `vm_stat`, `ps` 등 확인
+
+---
+
 ## Prerequisites
 
 ```bash
