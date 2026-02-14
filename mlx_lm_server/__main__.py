@@ -23,6 +23,16 @@ from mlx_lm_server.server import create_app, parse_args
 
 logger = logging.getLogger(__name__)
 
+_exit_cause: str = "unknown"
+
+
+def _signal_handler(signame: str):
+    def handler(signum, frame):
+        global _exit_cause
+        _exit_cause = signame
+        sys.exit(0)
+    return handler
+
 
 def _maybe_relaunch_under_mlx_launch() -> None:
     """Auto-relaunch the server under ``mlx.launch`` when distributed mode is requested.
@@ -185,14 +195,13 @@ def _emergency_exit() -> None:
 
 
 def main() -> None:
+    global _exit_cause
     _maybe_relaunch_under_mlx_launch()
 
     _setup_metal_memory()
     atexit.register(_cleanup_metal)
-    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(0))
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(0))
-    if hasattr(signal, "SIGHUP"):
-        signal.signal(signal.SIGHUP, lambda s, f: sys.exit(0))
+    signal.signal(signal.SIGTERM, _signal_handler("SIGTERM"))
+    signal.signal(signal.SIGINT, _signal_handler("SIGINT"))
 
     config = parse_args()
 
@@ -210,6 +219,14 @@ def main() -> None:
 
     try:
         dist_ctx = init_distributed(config)
+
+        # SIGHUP: In distributed mode, ignore it (SSH disconnect shouldn't kill
+        # a rank and orphan its peer). In single-machine mode, exit cleanly.
+        if hasattr(signal, "SIGHUP"):
+            if dist_ctx.enabled:
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            else:
+                signal.signal(signal.SIGHUP, _signal_handler("SIGHUP"))
 
         # --- Load model and tokenizer ---
         if dist_ctx.enabled and dist_ctx.world_size > 1:
@@ -357,18 +374,40 @@ def main() -> None:
                 host=config.host,
                 port=config.port,
             )
+            _exit_cause = "uvicorn_shutdown"
         else:
             # Rank > 0: no HTTP server, wait for inference loop to finish
             logger.info(
                 "Rank %d: waiting for inference loop (no HTTP server)",
                 dist_ctx.rank,
             )
-            scheduler.join_worker_loop(timeout=None)
+            scheduler.join_worker_loop(timeout=3600)
+            if scheduler.worker_timed_out:
+                logger.critical(
+                    "Rank %d: worker loop timed out after 1h — forcing cleanup",
+                    dist_ctx.rank,
+                )
+                _exit_cause = "worker_loop_timeout"
+            else:
+                _exit_cause = "worker_loop_exit"
 
-    except RuntimeError as e:
-        logger.critical("Fatal error: %s", e)
+    except Exception as e:
+        _exit_cause = f"{type(e).__name__}: {e}"
+        logger.critical("Fatal error (rank %d): %s: %s", dist_ctx.rank, type(e).__name__, e)
         sys.exit(1)
     finally:
+        try:
+            import mlx.core as mx
+            active_gb = mx.get_active_memory() / (1024**3)
+            peak_gb = mx.get_peak_memory() / (1024**3)
+        except (ImportError, AttributeError):
+            active_gb = -1.0
+            peak_gb = -1.0
+        logger.info(
+            "EXIT AUDIT: rank=%d, cause=%s, active_mem=%.1f GB, peak_mem=%.1f GB",
+            dist_ctx.rank, _exit_cause, active_gb, peak_gb,
+        )
+
         # Guard cleanup with a 30-second timeout. If scheduler.stop() or
         # finalize_distributed() hangs (stuck collective, stuck thread join),
         # the daemon timer forces process exit.

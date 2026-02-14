@@ -12,6 +12,7 @@ import resource
 import sys
 import shutil
 import threading
+import time
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -44,27 +45,61 @@ from mlx.utils import tree_flatten, tree_map, tree_reduce, tree_unflatten
 logger = logging.getLogger(__name__)
 
 
-def eval_with_timeout(params, timeout_seconds=300.0, on_timeout=None):
-    """Evaluate params with a timeout watchdog (exo-style)."""
+class MemoryGuardError(RuntimeError):
+    """Raised when remaining memory drops below safety threshold during model loading.
+
+    This is a subclass of RuntimeError so existing ``except RuntimeError`` handlers
+    catch it. Replaces the previous ``sys.exit(1)`` so cleanup paths can run properly.
+    """
+
+    pass
+
+
+def eval_with_timeout(params, timeout_seconds=None, on_timeout=None):
+    """Evaluate params with a timeout watchdog.
+
+    If mx.eval does not complete within *timeout_seconds*, the watchdog thread
+    performs best-effort Metal cleanup and calls ``os._exit(1)``.
+
+    Thread-safety note:
+        The ``mx.set_wired_limit(0)`` call from the watchdog thread while
+        ``mx.eval`` runs on the main thread is **not thread-safe** (see MLX
+        issue #2133). However, since ``os._exit(1)`` follows immediately,
+        deadlock risk is bounded -- the process dies either way. The call is
+        kept as a best-effort measure that sometimes succeeds in releasing
+        wired Metal memory before the hard exit.
+
+    The real fix for eval timeouts is preventing them (per-layer diagnostics,
+    configurable timeout, memory guards) rather than fixing this cleanup race.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = float(os.environ.get("MLX_EVAL_TIMEOUT", "300"))
+
     completed = threading.Event()
 
     def watchdog():
         if not completed.wait(timeout=timeout_seconds):
-            logger.error(
-                f"mx.eval timed out after {timeout_seconds:.0f}s. "
-                "This may indicate a FAST_SYNCH or tensor parallel issue. "
-                "Terminating process."
+            try:
+                rank = mx.distributed.init().rank()
+            except Exception:
+                rank = 0
+            logger.critical(
+                "[rank %d] eval_with_timeout: TIMED OUT after %.0fs -- "
+                "calling os._exit(1). This may indicate a blocked collective "
+                "or tensor parallel issue.",
+                rank,
+                timeout_seconds,
             )
-            if on_timeout is not None:
-                on_timeout()
             # Best-effort Metal cleanup before hard exit.
-            # os._exit() skips atexit/finally, so we must clean up here.
+            # WARNING: Not thread-safe (MLX #2133) but os._exit follows.
             try:
                 mx.set_wired_limit(0)
                 mx.set_cache_limit(0)
                 mx.clear_cache()
             except Exception:
                 pass
+            if on_timeout is not None:
+                on_timeout()
             os._exit(1)
 
     t = threading.Thread(target=watchdog, daemon=True)
@@ -569,14 +604,18 @@ def _check_memory_guard(
     layer_idx: int,
     num_layers: int,
 ) -> None:
-    """Abort loading if remaining memory drops below threshold.
+    """Raise MemoryGuardError if remaining memory drops below threshold.
 
     This prevents macOS kernel panics (watchdog timeout) caused by memory
     compressor saturation when loading 600GB+ models in distributed TP.
-    Both nodes will shut down: the exiting node calls ``sys.exit``, and the
-    peer's ``mx.distributed.all_sum`` barrier will timeout, triggering its
-    own cleanup path in ``__main__.py``.
+    The exception bubbles up through the model loading path to __main__.py's
+    exception handler, which performs proper cleanup via the finally block.
     """
+    try:
+        rank = mx.distributed.init().rank()
+    except Exception:
+        rank = 0
+
     try:
         active = mx.get_active_memory()
         peak = mx.get_peak_memory()
@@ -589,12 +628,21 @@ def _check_memory_guard(
 
     remaining = total_ram - active
 
+    logger.info(
+        "[rank %d] Memory guard: layer %d/%d, remaining=%.1f GB, threshold=%.1f GB",
+        rank,
+        layer_idx + 1,
+        num_layers,
+        remaining / (1024**3),
+        threshold_bytes / (1024**3),
+    )
+
     if remaining < threshold_bytes:
         logger.critical(
             "MEMORY GUARD: aborting model load — remaining memory %.1f GB "
             "is below safety threshold %.1f GB "
             "(layer %d/%d, active=%.1f GB, peak=%.1f GB, total_ram=%.1f GB). "
-            "Exiting to prevent kernel panic.",
+            "Raising MemoryGuardError to trigger cleanup.",
             remaining / (1024**3),
             threshold_bytes / (1024**3),
             layer_idx + 1,
@@ -603,7 +651,12 @@ def _check_memory_guard(
             peak / (1024**3),
             total_ram / (1024**3),
         )
-        sys.exit(1)
+        raise MemoryGuardError(
+            f"MEMORY GUARD: remaining {remaining / (1024**3):.1f} GB < threshold "
+            f"{threshold_bytes / (1024**3):.1f} GB at layer {layer_idx + 1}/{num_layers} "
+            f"(active={active / (1024**3):.1f} GB, peak={peak / (1024**3):.1f} GB, "
+            f"total_ram={total_ram / (1024**3):.1f} GB)"
+        )
 
 
 def _extract_layer_index(param_name: str) -> int | None:
@@ -638,7 +691,7 @@ def _chunked_eval_params(model) -> None:
     allocator can reclaim that memory before the next layer is loaded.
 
     A memory guard (configurable via ``MLX_MEMORY_GUARD_GB``) monitors
-    remaining system memory after each layer and aborts with ``sys.exit(1)``
+    remaining system memory after each layer and raises ``MemoryGuardError``
     if it drops below the safety threshold, preventing macOS kernel panics.
     Set to ``0`` to disable.  Default: 10% of physical RAM (min 5 GB).
     """
@@ -761,9 +814,10 @@ class _EvalShardEvalIter:
     working.
     """
 
-    def __init__(self, layers: list, guard_bytes: int = 0):
+    def __init__(self, layers: list, guard_bytes: int = 0, eval_timeout: float | None = None):
         self._layers = layers
         self._guard_bytes = guard_bytes
+        self._eval_timeout = eval_timeout
         self._prev_layer = None
         self._prev_idx = -1
 
@@ -775,19 +829,61 @@ class _EvalShardEvalIter:
         return self._layers[idx]
 
     def __iter__(self):
+        try:
+            rank = mx.distributed.init().rank()
+        except Exception:
+            rank = 0
+
         num = len(self._layers)
+        timeout = self._eval_timeout
         for i, layer in enumerate(self._layers):
             # Flush the *previous* layer's sharded result so its original
             # (pre-shard) concrete weights become unreachable.
             if self._prev_layer is not None:
-                eval_with_timeout(self._prev_layer.parameters(), timeout_seconds=300.0)
+                t0 = time.monotonic()
+                try:
+                    active_gb = mx.get_active_memory() / (1024**3)
+                except AttributeError:
+                    active_gb = -1.0
+                logger.info(
+                    "[rank %d] Layer %d/%d: eval start (active=%.1f GB)",
+                    rank, self._prev_idx + 1, num, active_gb,
+                )
+                eval_with_timeout(self._prev_layer.parameters(), timeout_seconds=timeout)
+                elapsed = time.monotonic() - t0
+                try:
+                    active_gb = mx.get_active_memory() / (1024**3)
+                except AttributeError:
+                    active_gb = -1.0
+                logger.info(
+                    "[rank %d] Layer %d/%d: eval done in %.1fs (active=%.1f GB)",
+                    rank, self._prev_idx + 1, num, elapsed, active_gb,
+                )
                 gc.collect()
                 mx.clear_cache()
                 if self._guard_bytes > 0:
                     _check_memory_guard(self._guard_bytes, self._prev_idx, num)
 
             # Materialise this layer's original (lazy-mmap) weights.
-            eval_with_timeout(layer.parameters(), timeout_seconds=300.0)
+            t0 = time.monotonic()
+            try:
+                active_gb = mx.get_active_memory() / (1024**3)
+            except AttributeError:
+                active_gb = -1.0
+            logger.info(
+                "[rank %d] Layer %d/%d: eval start (active=%.1f GB)",
+                rank, i + 1, num, active_gb,
+            )
+            eval_with_timeout(layer.parameters(), timeout_seconds=timeout)
+            elapsed = time.monotonic() - t0
+            try:
+                active_gb = mx.get_active_memory() / (1024**3)
+            except AttributeError:
+                active_gb = -1.0
+            logger.info(
+                "[rank %d] Layer %d/%d: eval done in %.1fs (active=%.1f GB)",
+                rank, i + 1, num, elapsed, active_gb,
+            )
             gc.collect()
             mx.clear_cache()
 
@@ -797,7 +893,25 @@ class _EvalShardEvalIter:
 
         # Flush the last layer after the shard loop finishes.
         if self._prev_layer is not None:
-            eval_with_timeout(self._prev_layer.parameters(), timeout_seconds=300.0)
+            t0 = time.monotonic()
+            try:
+                active_gb = mx.get_active_memory() / (1024**3)
+            except AttributeError:
+                active_gb = -1.0
+            logger.info(
+                "[rank %d] Layer %d/%d: eval start (active=%.1f GB)",
+                rank, self._prev_idx + 1, num, active_gb,
+            )
+            eval_with_timeout(self._prev_layer.parameters(), timeout_seconds=timeout)
+            elapsed = time.monotonic() - t0
+            try:
+                active_gb = mx.get_active_memory() / (1024**3)
+            except AttributeError:
+                active_gb = -1.0
+            logger.info(
+                "[rank %d] Layer %d/%d: eval done in %.1fs (active=%.1f GB)",
+                rank, self._prev_idx + 1, num, elapsed, active_gb,
+            )
             gc.collect()
             mx.clear_cache()
             if self._guard_bytes > 0:
@@ -836,7 +950,8 @@ def _eval_shard_eval(model, group) -> None:
 
     original_layers = getattr(container, attr)
     num_layers = len(original_layers)
-    logger.info("eval-shard-eval: %d transformer layers", num_layers)
+    eval_timeout = float(os.environ.get("MLX_EVAL_TIMEOUT", "300"))
+    logger.info("eval-shard-eval: %d transformer layers (eval_timeout=%.0fs)", num_layers, eval_timeout)
 
     # --- memory guard threshold ---
     env_guard = os.environ.get("MLX_MEMORY_GUARD_GB")
@@ -867,7 +982,7 @@ def _eval_shard_eval(model, group) -> None:
     #    call model.shard().  The wrapper's __iter__ will eval each layer's
     #    original weights before yield and the previous layer's sharded
     #    weights at the start of the next iteration.
-    wrapper = _EvalShardEvalIter(original_layers, guard_bytes=guard_bytes)
+    wrapper = _EvalShardEvalIter(original_layers, guard_bytes=guard_bytes, eval_timeout=eval_timeout)
     setattr(container, attr, wrapper)
     try:
         model.shard(group)

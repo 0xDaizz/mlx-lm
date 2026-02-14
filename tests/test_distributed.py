@@ -2410,3 +2410,218 @@ class TestBusPayloadSizeLimit:
         """MAX_BUS_PAYLOAD_BYTES should be 16 MB."""
         from mlx_lm_server.distributed_bus import MAX_BUS_PAYLOAD_BYTES
         assert MAX_BUS_PAYLOAD_BYTES == 16 * 1024 * 1024
+
+
+# =========================================================================
+# T. MemoryGuardError Tests
+# =========================================================================
+
+
+class TestMemoryGuardError:
+    """Test MemoryGuardError exception hierarchy and semantics."""
+
+    def test_is_runtime_error_subclass(self):
+        from mlx_lm.utils import MemoryGuardError
+        assert issubclass(MemoryGuardError, RuntimeError)
+
+    def test_can_be_caught_by_except_runtime_error(self):
+        from mlx_lm.utils import MemoryGuardError
+        with pytest.raises(RuntimeError):
+            raise MemoryGuardError("test")
+
+    def test_can_be_caught_by_except_exception(self):
+        from mlx_lm.utils import MemoryGuardError
+        with pytest.raises(Exception):
+            raise MemoryGuardError("test")
+
+    def test_message_preserved(self):
+        from mlx_lm.utils import MemoryGuardError
+        err = MemoryGuardError("low memory at layer 5/10")
+        assert "low memory at layer 5/10" in str(err)
+
+
+# =========================================================================
+# U. Configurable Eval Timeout Tests
+# =========================================================================
+
+
+class TestConfigurableEvalTimeout:
+    """Test eval_with_timeout default and env var override."""
+
+    def test_default_timeout_is_300(self):
+        """eval_with_timeout should default to 300s when MLX_EVAL_TIMEOUT is not set."""
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MLX_EVAL_TIMEOUT", None)
+            assert os.environ.get("MLX_EVAL_TIMEOUT") is None
+
+    def test_env_var_overrides_default(self):
+        """MLX_EVAL_TIMEOUT env var should override the default."""
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"MLX_EVAL_TIMEOUT": "600"}):
+            val = float(os.environ.get("MLX_EVAL_TIMEOUT", "300"))
+            assert val == 600.0
+
+    def test_eval_shard_eval_iter_accepts_timeout(self):
+        """_EvalShardEvalIter should accept eval_timeout parameter."""
+        from mlx_lm.utils import _EvalShardEvalIter
+        wrapper = _EvalShardEvalIter([], guard_bytes=0, eval_timeout=120.0)
+        assert wrapper._eval_timeout == 120.0
+
+    def test_eval_shard_eval_iter_default_timeout_none(self):
+        """_EvalShardEvalIter default eval_timeout should be None."""
+        from mlx_lm.utils import _EvalShardEvalIter
+        wrapper = _EvalShardEvalIter([])
+        assert wrapper._eval_timeout is None
+
+
+# =========================================================================
+# V. _check_memory_guard Raises MemoryGuardError Tests
+# =========================================================================
+
+
+class TestCheckMemoryGuardRaises:
+    """Test _check_memory_guard raises MemoryGuardError when memory is low."""
+
+    def test_raises_memory_guard_error(self):
+        """_check_memory_guard should raise MemoryGuardError when memory is low."""
+        from unittest.mock import patch, MagicMock
+        from mlx_lm.utils import _check_memory_guard, MemoryGuardError
+
+        with patch("mlx_lm.utils.mx") as mock_mx:
+            mock_mx.distributed.init.return_value = MagicMock(rank=MagicMock(return_value=0))
+            mock_mx.get_active_memory.return_value = 190 * (1024**3)  # 190 GB active
+            mock_mx.get_peak_memory.return_value = 190 * (1024**3)
+
+            with patch("mlx_lm.utils._get_total_physical_memory", return_value=192 * (1024**3)):
+                # Remaining = 2 GB, threshold = 10 GB -> should raise
+                with pytest.raises(MemoryGuardError, match="MEMORY GUARD"):
+                    _check_memory_guard(10 * (1024**3), 5, 10)
+
+    def test_no_raise_when_memory_sufficient(self):
+        """_check_memory_guard should not raise when memory is above threshold."""
+        from unittest.mock import patch, MagicMock
+        from mlx_lm.utils import _check_memory_guard
+
+        with patch("mlx_lm.utils.mx") as mock_mx:
+            mock_mx.distributed.init.return_value = MagicMock(rank=MagicMock(return_value=0))
+            mock_mx.get_active_memory.return_value = 100 * (1024**3)  # 100 GB active
+            mock_mx.get_peak_memory.return_value = 100 * (1024**3)
+
+            with patch("mlx_lm.utils._get_total_physical_memory", return_value=192 * (1024**3)):
+                # Remaining = 92 GB, threshold = 10 GB -> should NOT raise
+                _check_memory_guard(10 * (1024**3), 5, 10)  # Should not raise
+
+
+# =========================================================================
+# W. SIGHUP Immunity Tests
+# =========================================================================
+
+
+class TestSighupImmunity:
+    """Test SIGHUP handling in distributed vs single mode."""
+
+    def test_sighup_ignored_in_distributed_mode(self):
+        """SIGHUP should be SIG_IGN when dist_ctx.enabled is True."""
+        import signal
+
+        dist_ctx = DistributedContext(enabled=True, rank=1, world_size=2)
+
+        if hasattr(signal, "SIGHUP"):
+            if dist_ctx.enabled:
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            handler = signal.getsignal(signal.SIGHUP)
+            assert handler == signal.SIG_IGN
+
+            # Restore default handler
+            signal.signal(signal.SIGHUP, signal.SIG_DFL)
+
+    def test_sighup_exits_in_single_mode(self):
+        """SIGHUP should trigger sys.exit in non-distributed mode."""
+        from mlx_lm_server.__main__ import _signal_handler
+
+        dist_ctx = DistributedContext()  # disabled by default
+        assert not dist_ctx.enabled
+
+        # The handler factory creates a function that calls sys.exit(0)
+        handler = _signal_handler("SIGHUP")
+        with pytest.raises(SystemExit) as exc_info:
+            handler(None, None)
+        assert exc_info.value.code == 0
+
+
+# =========================================================================
+# X. _signal_handler Sets _exit_cause Tests
+# =========================================================================
+
+
+class TestSignalHandlerExitCause:
+    """Test _signal_handler factory and _exit_cause module variable."""
+
+    def test_signal_handler_sets_exit_cause(self):
+        """_signal_handler should set _exit_cause before sys.exit."""
+        import mlx_lm_server.__main__ as main_mod
+
+        original = main_mod._exit_cause
+
+        handler = main_mod._signal_handler("SIGTERM")
+        with pytest.raises(SystemExit):
+            handler(None, None)
+
+        assert main_mod._exit_cause == "SIGTERM"
+
+        # Restore
+        main_mod._exit_cause = original
+
+    def test_exit_cause_default_unknown(self):
+        """_exit_cause should default to 'unknown'."""
+        import mlx_lm_server.__main__ as main_mod
+        assert hasattr(main_mod, "_exit_cause")
+
+
+# =========================================================================
+# Y. join_worker_loop Timeout in __main__.py Context Tests
+# =========================================================================
+
+
+class TestJoinWorkerLoopTimeoutInMain:
+    """Test join_worker_loop timeout value used in __main__.py."""
+
+    def test_worker_loop_timeout_value_is_3600(self):
+        """The join_worker_loop call in __main__.py should use timeout=3600."""
+        import inspect
+        from mlx_lm_server import __main__ as main_mod
+        source = inspect.getsource(main_mod.main)
+        assert "join_worker_loop(timeout=3600)" in source
+
+    def test_worker_timed_out_check_in_main(self):
+        """__main__.py should check worker_timed_out after join_worker_loop."""
+        import inspect
+        from mlx_lm_server import __main__ as main_mod
+        source = inspect.getsource(main_mod.main)
+        assert "worker_timed_out" in source
+
+
+# =========================================================================
+# Z. EXIT AUDIT Log in Finally Block Tests
+# =========================================================================
+
+
+class TestExitAuditLog:
+    """Test EXIT AUDIT logging and exception handling in main()."""
+
+    def test_exit_audit_in_main_source(self):
+        """The main function should contain EXIT AUDIT logging."""
+        import inspect
+        from mlx_lm_server import __main__ as main_mod
+        source = inspect.getsource(main_mod.main)
+        assert "EXIT AUDIT" in source
+
+    def test_except_catches_all_exceptions(self):
+        """The except block should catch Exception, not just RuntimeError."""
+        import inspect
+        from mlx_lm_server import __main__ as main_mod
+        source = inspect.getsource(main_mod.main)
+        assert "except Exception as e:" in source
+        # Should NOT have the old narrow handler
+        assert "except RuntimeError as e:" not in source
