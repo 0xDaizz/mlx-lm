@@ -346,6 +346,16 @@ def main() -> None:
                 dist_ctx.world_size,
             )
 
+        # --- Sync RNG seed across all ranks (upstream pattern: server.py:706) ---
+        if dist_ctx.enabled and dist_ctx.world_size > 1:
+            seed = mx.distributed.all_sum(mx.random.state[0]).view(mx.uint64).item()
+            mx.random.seed(seed)
+            logger.info(
+                "Rank %d: distributed RNG seed synchronized: %d",
+                dist_ctx.rank,
+                seed,
+            )
+
         # --- Create scheduler ---
         from mlx_lm_server.scheduler import Scheduler
 

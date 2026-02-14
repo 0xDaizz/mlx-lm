@@ -172,3 +172,35 @@ class DistributedControlBus:
                 raise RuntimeError(
                     f"Failed to deserialize control event ({size} bytes)"
                 ) from e
+
+    def share_object(self, obj):
+        """Synchronize an object from rank0 to all ranks (blocking collective).
+
+        Rank 0 sends obj, rank >0 ignores local obj and receives rank 0's version.
+        Always call on ALL ranks (1-2 all_sum calls). Even with empty list,
+        must be called unconditionally to avoid collective count divergence.
+        """
+        mx = self._mx
+        with mx.stream(self._stream):
+            if self.rank == 0:
+                if not obj:  # None, empty list, etc.
+                    size_arr = mx.array([0], dtype=mx.int32)
+                    mx.eval(mx.distributed.all_sum(size_arr, group=self.group))
+                    return obj if obj is not None else []
+                else:
+                    data = mx.array(list(pickle.dumps(obj)), dtype=mx.uint8)
+                    size_arr = mx.array([data.size], dtype=mx.int32)
+                    mx.eval(mx.distributed.all_sum(size_arr, group=self.group))
+                    mx.eval(mx.distributed.all_sum(data, group=self.group))
+                    return obj
+            else:
+                size_arr = mx.array([0], dtype=mx.int32)
+                size_arr = mx.distributed.all_sum(size_arr, group=self.group)
+                mx.eval(size_arr)
+                size = size_arr.item()
+                if size == 0:
+                    return []
+                data = mx.zeros(size, dtype=mx.uint8)
+                data = mx.distributed.all_sum(data, group=self.group)
+                mx.eval(data)
+                return restricted_loads(bytes(data))

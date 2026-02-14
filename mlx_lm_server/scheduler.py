@@ -1077,6 +1077,13 @@ class Scheduler:
         # 5. Emit token events
         self._emit_tokens(events)
 
+        # 5b. Sync uids_to_remove across ranks (ERR-07 fix)
+        # Rank 0's custom stop conditions are authoritative.
+        # Must be called unconditionally (even with empty list) to prevent
+        # collective count divergence. See upstream server.py:858.
+        if self._control_bus is not None and self._dist_ctx is not None:
+            uids_to_remove = self._control_bus.share_object(uids_to_remove)
+
         # 6. Remove early-stopped UIDs from BatchGenerator
         if uids_to_remove:
             try:
@@ -1562,7 +1569,12 @@ class Scheduler:
                 # Create sampler
                 sampler = None
                 if make_sampler is not None:
-                    sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
+                    effective_temp = req.temperature
+                    # Interim safety: force greedy in distributed mode (opt-in via env var)
+                    if (self._dist_ctx is not None and self._dist_ctx.world_size > 1
+                            and os.environ.get("MLX_DIST_FORCE_GREEDY", "") == "1"):
+                        effective_temp = 0.0
+                    sampler = make_sampler(temp=effective_temp, top_p=req.top_p)
 
                 # Handle max_tokens=0 gracefully
                 if req.max_tokens <= 0:
