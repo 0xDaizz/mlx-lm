@@ -3,12 +3,12 @@
     "envs": ["MLX_METAL_FAST_SYNCH=1"],
     "hosts": [
         {
-            "ssh": "hwStudio1.local",
+            "ssh": "hwStudio1",
             "ips": ["192.168.0.105"],
             "rdma": [null, ["rdma_en3", "rdma_en5"]]
         },
         {
-            "ssh": "hwStudio2.local",
+            "ssh": "hwStudio2",
             "ips": ["192.168.0.107"],
             "rdma": [["rdma_en3", "rdma_en5"], null]
         }

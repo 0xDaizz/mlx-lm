@@ -381,6 +381,7 @@ class Scheduler:
             prefill_batch_size=self.config.prefill_batch_size,
             prefill_step_size=self.config.prefill_step_size,
             max_kv_size=self.config.max_kv_size,
+            dist_group=self._dist_ctx.group if self._dist_ctx is not None and self._dist_ctx.world_size > 1 else None,
         )
 
     # --- Public API (called by server / tests) ---
@@ -1569,12 +1570,7 @@ class Scheduler:
                 # Create sampler
                 sampler = None
                 if make_sampler is not None:
-                    effective_temp = req.temperature
-                    # Interim safety: force greedy in distributed mode (opt-in via env var)
-                    if (self._dist_ctx is not None and self._dist_ctx.world_size > 1
-                            and os.environ.get("MLX_DIST_FORCE_GREEDY", "") == "1"):
-                        effective_temp = 0.0
-                    sampler = make_sampler(temp=effective_temp, top_p=req.top_p)
+                    sampler = make_sampler(temp=req.temperature, top_p=req.top_p)
 
                 # Handle max_tokens=0 gracefully
                 if req.max_tokens <= 0:

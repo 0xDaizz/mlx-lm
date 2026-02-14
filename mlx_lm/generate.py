@@ -955,6 +955,7 @@ class BatchGenerator:
             Callable[[List[Tuple[int, int, int]]], None]
         ] = None,
         max_kv_size: Optional[int] = None,
+        dist_group=None,
     ):
         self.model = model
         self.unprocessed_prompts = []
@@ -969,6 +970,8 @@ class BatchGenerator:
         self.prompt_progress_callback = prompt_progress_callback or (lambda *_: None)
         self._stats = BatchStats()
         self.max_kv_size = max_kv_size
+        self._dist_group = dist_group
+        self._dist_rank = dist_group.rank() if dist_group is not None else 0
 
         self.active_batch = None
 
@@ -1163,6 +1166,13 @@ class BatchGenerator:
             sampled = mx.concatenate(all_samples, axis=0)
         else:
             sampled = self.sampler(logprobs)
+
+        # Distributed: broadcast rank 0's sampled tokens to all ranks.
+        # Prevents EOS divergence → batch size mismatch → collective deadlock.
+        if self._dist_group is not None:
+            if self._dist_rank > 0:
+                sampled = mx.zeros_like(sampled)
+            sampled = mx.distributed.all_sum(sampled, group=self._dist_group)
 
         return sampled, list(logprobs)
 

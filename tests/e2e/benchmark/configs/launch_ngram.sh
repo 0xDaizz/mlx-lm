@@ -18,7 +18,7 @@ export PYTHONPATH="$PROJECT_ROOT"
 echo "[$CONFIG_NAME] Launching server on port $PORT ..."
 echo "[$CONFIG_NAME] Log: $LOGFILE"
 
-"$MLX_LAUNCH" --backend jaccl --hostfile "$HOSTFILE" --python "$PYTHON" -- \
+nohup "$MLX_LAUNCH" --backend jaccl --hostfile "$HOSTFILE" --python "$PYTHON" -- \
     "$SCRIPT_DIR/server_wrapper.py" \
     --distributed-mode jaccl \
     --model "$MODEL" \
@@ -32,7 +32,8 @@ echo "[$CONFIG_NAME] Log: $LOGFILE"
     > "$LOGFILE" 2>&1 &
 
 SERVER_PID=$!
-echo "[$CONFIG_NAME] Server PID: $SERVER_PID (backgrounded)"
+disown $SERVER_PID || true
+echo "[$CONFIG_NAME] Server PID: $SERVER_PID (backgrounded, disowned)"
 
 # Wait for health check
 MAX_WAIT=600
