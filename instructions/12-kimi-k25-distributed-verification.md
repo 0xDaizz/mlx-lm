@@ -81,13 +81,18 @@
 | 함수 | 설명 |
 |------|------|
 | `_chunked_eval_params(model)` | 레이어별 `mx.eval` + `gc.collect` |
-| `_check_memory_guard(label)` | 물리 메모리 대비 활성 메모리 체크 (기본: `max(10%, 5GB)`) |
+| `_check_memory_guard(threshold_bytes, layer_idx, num_layers)` | 물리 메모리 대비 활성 메모리 체크 (기본: `max(10%, 5GB)`). 임계값 이하 시 `MemoryGuardError` 발생 |
 | `_extract_layer_index(name)` | 파라미터 이름에서 레이어 인덱스 추출 |
 | `_get_total_physical_memory()` | `sysctl hw.memsize`로 물리 메모리 조회 |
+| `MemoryGuardError` | `RuntimeError` 서브클래스. 메모리 가드 임계값 초과 시 발생 (`sys.exit(1)` 대체) |
+| `eval_with_timeout(params, timeout_seconds, on_timeout)` | 타임아웃 watchdog으로 `mx.eval` 실행. `MLX_EVAL_TIMEOUT` 환경변수로 설정 (기본 300초) |
 
 동작 방식:
 - `sharded_load()`에서 `mx.eval(model.parameters())` 대신 `_chunked_eval_params(model)` 호출
 - 환경변수 `MLX_MEMORY_GUARD_GB`로 가드 임계값을 GB 단위로 설정 가능
+- 환경변수 `MLX_EVAL_TIMEOUT`로 eval 타임아웃을 초 단위로 설정 가능 (기본: 300초)
+- 레이어별 eval 시 rank, 타이밍, 메모리 사용량 로그 출력 (death point 식별용)
+- 분산 모드에서 SIGHUP 무시 (SSH 끊김으로 인한 rank 사망 방지)
 
 ### Exo-Style Eval-Shard-Eval (`mlx_lm/utils.py`)
 - `_eval_shard_eval(model, group)`: exo 프로젝트 방식의 레이어별 eval→shard→eval
@@ -104,6 +109,14 @@
 ### 메모리 로깅 (`mlx_lm_server/__main__.py`)
 
 - 분산 모델 로드 전/후 active + peak memory 로깅 (GB 단위)
+
+### Rank Death 방지 (`mlx_lm_server/__main__.py`)
+
+- `_check_memory_guard`가 `sys.exit(1)` 대신 `MemoryGuardError` 예외를 발생시킴 → `finally` 블록에서 Metal 정리 가능
+- `except Exception`으로 모든 예외 포착 (기존 `except RuntimeError`보다 넓음)
+- 분산 모드에서 SIGHUP 무시 (`signal.SIG_IGN`) — SSH 끊김이 rank를 죽이지 않음
+- Rank > 0의 `join_worker_loop(timeout=3600)` — 1시간 안전 타임아웃 (기존 무제한 대기 대체)
+- EXIT AUDIT 구조화 로그: rank, 종료 원인, active/peak 메모리 기록
 
 ### 테스트 (`tests/test_chunked_eval.py`)
 
@@ -311,6 +324,20 @@ cd /Users/hw/mlx-lm-server
 - 해결: `_eval_shard_eval()` 사용 (exo-style eval→shard→eval)
 - `mx.clear_cache()`만으로는 불충분 — lazy 참조가 살아있으면 Metal 버퍼 해제 불가
 
+### eval_with_timeout TIMED OUT (로그: "TIMED OUT after Xs — calling os._exit(1)")
+- 원인: `mx.eval` 중 `all_sum` collective가 peer 사망으로 무한 대기
+- 해결: `MLX_EVAL_TIMEOUT=600` 환경변수로 타임아웃 증가 (대형 모델), 또는 `MLX_EVAL_TIMEOUT=120`으로 빠른 실패 탐지
+- 로그에서 마지막 성공 레이어 번호 확인 — death point 식별 가능
+
+### MemoryGuardError 발생
+- 원인: 남은 메모리가 `MLX_MEMORY_GUARD_GB` 임계값 이하로 감소
+- 해결: `MLX_MEMORY_GUARD_GB=0`으로 가드 비활성화, 또는 임계값 조정
+- 서버가 Metal 정리를 정상 수행하므로 wired memory 누수 없음
+
+### SIGHUP로 인한 rank 사망 (v1.x 이전)
+- 원인: SSH 연결 끊김 시 SIGHUP이 rank를 즉시 종료 → peer의 `all_sum`이 무한 대기
+- 해결: 분산 모드에서 SIGHUP 자동 무시 (commit 50ab48d 이후)
+
 ### 토크나이저 에러 (Kimi K2.5)
 - 증상: `ValueError: type of None unknown: <class 'NoneType'>`
 - 원인: `generate()` → `stream_generate()`가 `tokenizer.encode(prompt, add_special_tokens=True)` 호출 시, `add_special_tokens`가 `**kwargs`로 전달되어 Kimi 토크나이저의 `super().encode()` 경로로 빠짐 (`tokenization_kimi.py:172-174`). parent의 `encode()`는 tiktoken vocab과 호환되지 않아 `input_ids=None` 반환
@@ -378,6 +405,9 @@ exo 프로젝트에서 참고한 핵심 패턴:
 - [x] `_probe` 영향 없음 확인 (격리 테스트 통과)
 - [x] 토크나이저 에러 원인 분석 및 우회 (kwargs 없이 encode 호출)
 - [x] 추론(generation) 테스트 성공 ("2+2 equals 4.", 23.9 tok/s)
+- [x] Rank death 방지: MemoryGuardError, SIGHUP 무시, join_worker_loop 타임아웃, EXIT AUDIT
+- [x] Per-layer 진단 로깅: rank, 타이밍, 메모리 사용량 (death point 식별)
+- [x] 설정 가능한 eval 타임아웃 (`MLX_EVAL_TIMEOUT` 환경변수)
 
 ### 미완료
 
@@ -394,5 +424,6 @@ exo 프로젝트에서 참고한 핵심 패턴:
 | `8662b1b` | chunked eval + memory guard 구현 |
 | `c69e897` | .gitignore 강화 + 예제 호스트 설정 정리 |
 | `c13642f` | feat(distributed): exo-style eval-shard-eval for memory-safe TP loading |
+| `50ab48d` | fix: prevent rank death cascade + reliable Metal cleanup in distributed mode |
 
 - 브랜치: `develop` (origin/develop에 push 완료)

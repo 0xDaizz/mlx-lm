@@ -35,6 +35,14 @@ ssh hwStudio2.local "vm_stat | grep 'Pages wired'"  # same
 mkdir -p /tmp/kimi-bench-results
 ```
 
+```bash
+# 5b. (Optional) Configure eval timeout for large models
+# Default is 300s. Increase for very large models (>500GB):
+export MLX_EVAL_TIMEOUT=600
+# Or decrease for faster failure detection during debugging:
+# export MLX_EVAL_TIMEOUT=120
+```
+
 ---
 
 ## Phase 1: Baseline (Full Lifecycle + Memory Check)
@@ -167,6 +175,12 @@ vm_stat | grep "Pages wired"
 ssh hwStudio2.local "vm_stat | grep 'Pages wired'"
 ```
 
+```bash
+# Check EXIT AUDIT logs for clean shutdown
+# Look for "EXIT AUDIT: rank=X, cause=Y" in server logs
+# Expected: cause=uvicorn_shutdown (rank 0) or cause=worker_loop_exit (rank >0)
+```
+
 ---
 
 ## Post-Run: Extract & Compare Results
@@ -213,6 +227,10 @@ The report includes:
 | TTFT > 300s | First-token-timeout too short | Use `--first-token-timeout-s 600` |
 | Wired memory not freed after stop | Old stop_server.sh bug (fixed in e4cc2d5) | Ensure latest code is deployed |
 | SSH unreachable during stop | TB interface instability during JACCL teardown | Wait 10s and retry |
+| eval_with_timeout TIMED OUT | Peer died during model loading, `all_sum` blocked | Increase `MLX_EVAL_TIMEOUT=600` or check per-layer logs for death point |
+| MemoryGuardError during load | Remaining memory below safety threshold | Adjust `MLX_MEMORY_GUARD_GB` or reduce model size |
+| Rank died from SIGHUP | SSH disconnect killed worker (pre-50ab48d) | Update to latest code; SIGHUP now ignored in distributed mode |
+| Worker loop timed out after 1h | Inference thread stuck in collective op | Check peer health; EXIT AUDIT log shows memory state at exit |
 
 ---
 
