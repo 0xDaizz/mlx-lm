@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import functools
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -220,6 +221,18 @@ def setup_arg_parser():
 
 # A stream on the default device just for generation
 generation_stream = mx.new_stream(mx.default_device())
+
+
+_DIST_DEBUG = bool(os.environ.get("MLX_DIST_DEBUG", ""))
+
+
+def _dist_log(msg: str, rank: int = 0) -> None:
+    """Write to rank-specific debug log file (only when MLX_DIST_DEBUG is set)."""
+    if not _DIST_DEBUG:
+        return
+    with open(f"/tmp/dist_debug_rank{rank}.log", "a") as f:
+        f.write(msg + "\n")
+        f.flush()
 
 
 @contextlib.contextmanager
@@ -1080,6 +1093,9 @@ class BatchGenerator:
                         for uid, length in zip(uids, lengths)
                     ]
                 )
+            if self._dist_group is not None:
+                _chunks = (processed_tokens + self.prefill_step_size - 1) // self.prefill_step_size if self.prefill_step_size > 0 else 0
+                _dist_log(f"DIST_DEBUG prefill_new rank={self._dist_rank} uids={list(uids)} total_tokens={sum(lengths)} processed={processed_tokens} chunks={_chunks}", self._dist_rank)
 
         # Further prompt processing so we need to
         #   1. Merge the KV caches and prepare for right padded prompts
@@ -1109,6 +1125,9 @@ class BatchGenerator:
                 )
                 mx.clear_cache()
 
+            if self._dist_group is not None:
+                _chunks = (processed_tokens + self.prefill_step_size - 1) // self.prefill_step_size if self.prefill_step_size > 0 else 0
+                _dist_log(f"DIST_DEBUG prefill_cached rank={self._dist_rank} uids={list(uids)} total_tokens={sum(lengths)} processed={processed_tokens} chunks={_chunks}", self._dist_rank)
             mx.eval([c.state for c in prompt_cache])
             inputs = last_inputs
 

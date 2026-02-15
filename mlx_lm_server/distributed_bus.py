@@ -183,16 +183,20 @@ class DistributedControlBus:
         mx = self._mx
         with mx.stream(self._stream):
             if self.rank == 0:
-                if not obj:  # None, empty list, etc.
+                # Keep size==0 sentinel only for None (backward compatible).
+                # IMPORTANT: falsy scalars like 0/False must be serialized;
+                # otherwise workers receive [] and type conversion diverges.
+                if obj is None:
                     size_arr = mx.array([0], dtype=mx.int32)
                     mx.eval(mx.distributed.all_sum(size_arr, group=self.group))
-                    return obj if obj is not None else []
-                else:
-                    data = mx.array(list(pickle.dumps(obj)), dtype=mx.uint8)
-                    size_arr = mx.array([data.size], dtype=mx.int32)
-                    mx.eval(mx.distributed.all_sum(size_arr, group=self.group))
-                    mx.eval(mx.distributed.all_sum(data, group=self.group))
-                    return obj
+                    return []
+
+                # Serialize all non-None objects (including 0, False, empty list).
+                data = mx.array(list(pickle.dumps(obj)), dtype=mx.uint8)
+                size_arr = mx.array([data.size], dtype=mx.int32)
+                mx.eval(mx.distributed.all_sum(size_arr, group=self.group))
+                mx.eval(mx.distributed.all_sum(data, group=self.group))
+                return obj
             else:
                 size_arr = mx.array([0], dtype=mx.int32)
                 size_arr = mx.distributed.all_sum(size_arr, group=self.group)

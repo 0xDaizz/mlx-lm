@@ -58,6 +58,18 @@ logger = logging.getLogger(__name__)
 
 BUS_ERROR_THRESHOLD = 10
 BUS_OUTBOX_MAXSIZE = 1024
+
+_DIST_DEBUG = bool(os.environ.get("MLX_DIST_DEBUG", ""))
+
+
+def _dist_log(msg: str, rank: int = 0) -> None:
+    """Write to rank-specific debug log file (only when MLX_DIST_DEBUG is set)."""
+    if not _DIST_DEBUG:
+        return
+    with open(f"/tmp/dist_debug_rank{rank}.log", "a") as f:
+        f.write(msg + "\n")
+        f.flush()
+
 BUS_OUTBOX_CONTROL_RESERVE = 64
 BUS_SHUTDOWN_ENQUEUE_TIMEOUT_S = 2.0
 
@@ -733,6 +745,8 @@ class Scheduler:
         if self._control_bus is not None and self._dist_ctx is not None:
             if self._dist_ctx.is_rank0:
                 self._drain_bus_outbox()
+                if not self._running:
+                    return  # shutdown broadcast complete
             else:
                 if not self._apply_bus_events():
                     return  # shutdown received
@@ -821,19 +835,42 @@ class Scheduler:
             # Single event (backward compat or noop fallback)
             events = [raw_event]
 
+        rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+        try:
+            _dist_log(
+                f"DIST_DEBUG bus_recv rank={rank} event_types={[ev.typ for ev in events]} qsize_before={self.request_queue.size}",
+                rank,
+            )
+        except Exception:
+            pass
+
         for event in events:
             if event.typ == "submit":
                 request = event.unpack_request()
                 if request is not None:
                     is_streaming = getattr(request, "stream", False)
+                    qsize_before = self.request_queue.size
                     try:
                         self.request_queue.add(request)
                     except Exception:
-                        logger.warning(
-                            "Failed to add request %s from bus event to queue",
-                            request.request_id, exc_info=True,
+                        # Fail-fast in distributed mode: continuing would diverge ranks
+                        logger.error(
+                            "FATAL: worker failed to add request %s from bus event to queue",
+                            request.request_id,
+                            exc_info=True,
                         )
-                        continue
+                        self._dist_fatal = True
+                        self._dist_fatal_reason = "worker_submit_apply_failed"
+                        self._running = False
+                        self._new_request_event.set()
+                        return False
+                    try:
+                        _dist_log(
+                            f"DIST_DEBUG bus_submit_applied rank={rank} rid={request.request_id} qsize_before={qsize_before} qsize_after={self.request_queue.size}",
+                            rank,
+                        )
+                    except Exception:
+                        pass
                     if not is_streaming:
                         is_worker = self._dist_ctx is not None and not self._dist_ctx.is_rank0
                         if not is_worker:
@@ -853,6 +890,13 @@ class Scheduler:
                     else:
                         with self._cancelled_lock:
                             self._cancelled.add(request_id)
+                    try:
+                        _dist_log(
+                            f"DIST_DEBUG bus_cancel_applied rank={rank} rid={request_id} qsize_now={self.request_queue.size}",
+                            rank,
+                        )
+                    except Exception:
+                        pass
 
             elif event.typ == "shutdown":
                 self._running = False
@@ -895,6 +939,27 @@ class Scheduler:
 
         if not events:
             events = [ControlEvent.noop()]
+
+        rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+        try:
+            submit_ids = []
+            for ev in events:
+                if ev.typ == "submit":
+                    req = ev.unpack_request()
+                    if req is not None:
+                        submit_ids.append(req.request_id)
+            cancel_ids = []
+            for ev in events:
+                if ev.typ == "cancel":
+                    rid = ev.unpack_request_id()
+                    if rid is not None:
+                        cancel_ids.append(rid)
+            _dist_log(
+                f"DIST_DEBUG bus_publish rank={rank} event_types={[ev.typ for ev in events]} submit_ids={submit_ids} cancel_ids={cancel_ids} outbox_qsize={self._bus_outbox.qsize()}",
+                rank,
+            )
+        except Exception:
+            pass
 
         # Broadcast the list of events as a single compound event
         compound = ControlEvent.batch(events)
@@ -1002,15 +1067,65 @@ class Scheduler:
             if self._dist_ctx.is_rank0:
                 # rank0: broadcast all queued events (or noop) atomically
                 self._drain_bus_outbox()
+                if not self._running:
+                    return  # shutdown broadcast complete
             else:
                 # rank>0: receive and apply compound event
                 if not self._apply_bus_events():
                     return  # shutdown received
 
-        # Wait for work if idle
+        # Distributed "has work" consensus guard after bus sync.
+        # Prevents one rank idling while another enters model collectives.
         with self._active_lock:
-            has_active = bool(self._uid_to_request_id)
-        if not has_active and self.request_queue.size == 0:
+            has_active_local = bool(self._uid_to_request_id)
+        queue_size_local = self.request_queue.size
+        local_has_work = has_active_local or queue_size_local > 0
+        has_work = local_has_work
+
+        if (
+            self._control_bus is not None
+            and self._dist_ctx is not None
+            and getattr(self._dist_ctx, "group", None) is not None
+            and getattr(self._dist_ctx, "world_size", 1) > 1
+        ):
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+
+            with mx.stream(generation_stream):
+                has_work_arr = mx.array([1 if local_has_work else 0], dtype=mx.int32)
+                has_work_min = mx.distributed.all_min(has_work_arr, group=self._dist_ctx.group)
+                has_work_max = mx.distributed.all_max(has_work_arr, group=self._dist_ctx.group)
+                mx.eval(has_work_min, has_work_max)
+
+            min_work = int(has_work_min.item())
+            max_work = int(has_work_max.item())
+            rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+            try:
+                _dist_log(
+                    f"DIST_DEBUG has_work rank={rank} local={int(local_has_work)} min={min_work} max={max_work} active_local={int(has_active_local)} qsize_local={queue_size_local}",
+                    rank,
+                )
+            except Exception:
+                pass
+            if min_work != max_work:
+                logger.critical(
+                    "FATAL: has_work divergence across ranks (rank=%d local=%d min=%d max=%d active_local=%d qsize_local=%d)",
+                    rank,
+                    int(local_has_work),
+                    min_work,
+                    max_work,
+                    int(has_active_local),
+                    queue_size_local,
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "has_work_divergence"
+                self._running = False
+                self._new_request_event.set()
+                return
+            has_work = bool(max_work)
+
+        # Wait for work if idle
+        if not has_work:
             self._last_inference_step_ts = time.monotonic()
             self._new_request_event.wait(timeout=0.1)
             self._new_request_event.clear()
@@ -1023,6 +1138,8 @@ class Scheduler:
 
         # 2. Insert new requests
         self._insert_new_requests_batch()
+        if self._dist_fatal or not self._running:
+            return
 
         # 3. Run one batch step if there are active sequences
         with self._active_lock:
@@ -1067,6 +1184,8 @@ class Scheduler:
             # Normal decode path (unchanged)
             try:
                 responses = self._batch_generator.next()
+                rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+                _dist_log(f"DIST_DEBUG step rank={rank} active={active_count} responses={len(responses) if responses else 0}", rank)
             except Exception as e:
                 logger.error("BatchGenerator.next() failed: %s", e, exc_info=True)
                 raise
@@ -1083,7 +1202,10 @@ class Scheduler:
         # Must be called unconditionally (even with empty list) to prevent
         # collective count divergence. See upstream server.py:858.
         if self._control_bus is not None and self._dist_ctx is not None:
+            rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+            _dist_log(f"DIST_DEBUG share_uids rank={rank} uids_to_remove={uids_to_remove}", rank)
             uids_to_remove = self._control_bus.share_object(uids_to_remove)
+            _dist_log(f"DIST_DEBUG share_uids_result rank={rank} uids_to_remove={uids_to_remove}", rank)
 
         # 6. Remove early-stopped UIDs from BatchGenerator
         if uids_to_remove:
@@ -1320,7 +1442,11 @@ class Scheduler:
                             # and will be pushed to eviction heap by free_blocks()
                             self.kv_cache_manager.free_blocks([block_id])
                 except Exception as e:
+                    rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+                    _dist_log(f"DIST_DEBUG store_cache_FAILED rank={rank} rid={rid}: {e}", rank)
                     logger.warning("Failed to decompose cache to blocks: %s", e)
+            rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+            _dist_log(f"DIST_DEBUG store_cache rank={rank} rid={rid} prompt_len={len(prompt_tokens)} num_generated={len(seq.output_tokens)}", rank)
 
     def _prune_ssd_if_needed(self) -> None:
         """Periodically prune expired SSD cache blocks (step-based or time-based)."""
@@ -1449,13 +1575,138 @@ class Scheduler:
         """Pop requests from queue and insert into BatchGenerator."""
         with self._active_lock:
             available = self.config.max_batch_size - len(self._active_sequences)
-        if available <= 0:
+
+        # Distributed pop/order symmetry guard.
+        is_distributed = (
+            self._control_bus is not None
+            and self._dist_ctx is not None
+            and getattr(self._dist_ctx, "group", None) is not None
+            and getattr(self._dist_ctx, "world_size", 1) > 1
+        )
+        rank = self._dist_ctx.rank if self._dist_ctx is not None else 0
+        new_requests = []
+
+        # Non-distributed fast path keeps old early return.
+        if not is_distributed and available <= 0:
             return
 
-        new_requests = self.request_queue.pop_batch(available)
+        if is_distributed:
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+
+            queue_before = self.request_queue.size
+            with mx.stream(generation_stream):
+                avail_arr = mx.array([available], dtype=mx.int32)
+                min_avail = mx.distributed.all_min(avail_arr, group=self._dist_ctx.group)
+                max_avail = mx.distributed.all_max(avail_arr, group=self._dist_ctx.group)
+                mx.eval(min_avail, max_avail)
+            min_avail_v = int(min_avail.item())
+            max_avail_v = int(max_avail.item())
+            if min_avail_v != max_avail_v:
+                logger.critical(
+                    "FATAL: available slots diverged across ranks (rank=%d local=%d min=%d max=%d)",
+                    rank,
+                    available,
+                    min_avail_v,
+                    max_avail_v,
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "insert_available_divergence"
+                self._running = False
+                self._new_request_event.set()
+                return
+
+            # Use globally-agreed value from collectives.
+            available = min_avail_v
+            if available <= 0:
+                return
+
+            rank0_pop_count = (
+                min(available, queue_before) if self._dist_ctx.is_rank0 else 0
+            )
+            pop_count_obj = self._control_bus.share_object(rank0_pop_count)
+            try:
+                pop_count = int(pop_count_obj)
+            except Exception:
+                logger.critical(
+                    "FATAL: invalid pop_count from rank0: %r",
+                    pop_count_obj,
+                    exc_info=True,
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "insert_invalid_pop_count"
+                self._running = False
+                self._new_request_event.set()
+                return
+
+            if pop_count < 0 or pop_count > available:
+                logger.critical(
+                    "FATAL: pop_count out of range (rank=%d pop_count=%d available=%d)",
+                    rank,
+                    pop_count,
+                    available,
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "insert_invalid_pop_count"
+                self._running = False
+                self._new_request_event.set()
+                return
+
+            if pop_count <= 0:
+                _dist_log(
+                    f"DIST_DEBUG insert_pop rank={rank} available={available} qsize_before={queue_before} pop_count={pop_count}",
+                    rank,
+                )
+                return
+
+            new_requests = self.request_queue.pop_batch(pop_count)
+            local_request_ids = [r.request_id for r in new_requests]
+            expected_request_ids_obj = self._control_bus.share_object(
+                local_request_ids if self._dist_ctx.is_rank0 else []
+            )
+            expected_request_ids = (
+                list(expected_request_ids_obj)
+                if isinstance(expected_request_ids_obj, list)
+                else []
+            )
+            local_ids_match = 1 if local_request_ids == expected_request_ids else 0
+
+            with mx.stream(generation_stream):
+                match_arr = mx.array([local_ids_match], dtype=mx.int32)
+                all_match = mx.distributed.all_min(match_arr, group=self._dist_ctx.group)
+                mx.eval(all_match)
+
+            _dist_log(
+                f"DIST_DEBUG insert_pop rank={rank} available={available} qsize_before={queue_before} qsize_after={self.request_queue.size} pop_count={pop_count} local_ids={local_request_ids} expected_ids={expected_request_ids}",
+                rank,
+            )
+
+            if int(all_match.item()) == 0:
+                if local_ids_match == 0:
+                    logger.critical(
+                        "FATAL: popped request IDs diverged (rank=%d local=%s expected=%s)",
+                        rank,
+                        local_request_ids,
+                        expected_request_ids,
+                    )
+                else:
+                    logger.critical(
+                        "FATAL: popped request ID mismatch detected on another rank (rank=%d)",
+                        rank,
+                    )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "insert_pop_id_divergence"
+                self._running = False
+                self._new_request_event.set()
+                return
+        else:
+            new_requests = self.request_queue.pop_batch(available)
+
         if not new_requests:
             return
 
+        # Phase 1: prepare request/cache candidates before any insert().
+        prepared: list[dict[str, Any]] = []
         for req in new_requests:
             seq = None
             try:
@@ -1473,9 +1724,10 @@ class Scheduler:
                 # a stuck sequence with no UID (Bug 3 / Issue 4 fix).
 
                 # Look up caches: block-level first (finer granularity),
-                # then sequence-level (faster, no reconstruction overhead)
+                # then sequence-level (faster, no reconstruction overhead).
                 cache = None
                 remaining_tokens = seq.token_ids
+                local_hit_type = "miss"
 
                 # Block-level cache lookup via KVCacheManager
                 if cache is None and self.kv_cache_manager is not None and self.model is not None:
@@ -1525,8 +1777,7 @@ class Scheduler:
                                     "Block cache hit for %s: %d tokens cached",
                                     req.request_id, num_cached,
                                 )
-                                self._inc_stat("cache_hits_block")
-                                self._inc_stat("total_cached_tokens", num_cached)
+                                local_hit_type = "block"
                                 remaining_tokens = seq.token_ids[num_cached:]
                             else:
                                 # Partial/incomplete blocks — fall back to uncached path
@@ -1555,18 +1806,261 @@ class Scheduler:
                         cache = cached
                         remaining_tokens = remaining
                         num_seq_cached = len(seq.token_ids) - len(remaining)
-                        self._inc_stat("cache_hits_sequence")
-                        self._inc_stat("total_cached_tokens", num_seq_cached)
+                        local_hit_type = "sequence"
                         logger.debug(
                             "Sequence cache hit for %s: %d tokens cached",
                             req.request_id,
                             num_seq_cached,
                         )
 
-                # Track cache miss (neither block nor sequence cache hit)
-                if cache is None:
-                    self._inc_stat("cache_misses")
+                local_num_cached = len(seq.token_ids) - len(remaining_tokens)
+                _dist_log(
+                    f"DIST_DEBUG insert_local rank={rank} rid={req.request_id} hit={local_hit_type} cached={local_num_cached} remaining={len(remaining_tokens)} total={len(seq.token_ids)}",
+                    rank,
+                )
+                prepared.append(
+                    {
+                        "req": req,
+                        "seq": seq,
+                        "cache": cache,
+                        "remaining_tokens": list(remaining_tokens),
+                        "local_hit_type": local_hit_type,
+                        "local_num_cached": int(local_num_cached),
+                        # Finalized values set after consensus.
+                        "final_hit_type": local_hit_type,
+                        "final_num_cached": int(local_num_cached),
+                    }
+                )
+            except Exception as e:
+                # Request was popped from queue but failed during setup —
+                # signal error to caller so they don't hang forever
+                request_id = req.request_id
+                logger.error("Failed to insert request %s: %s", request_id, e)
+                # Free KV blocks allocated during cache lookup to prevent leak
+                if seq is not None and self.kv_cache_manager is not None and seq.block_ids:
+                    self.kv_cache_manager.free_blocks(seq.block_ids)
+                    seq.block_ids = []
+                self._signal_finish(request_id, finish_reason="error")
+                # Clean up if sequence was partially added to active set
+                with self._active_lock:
+                    self._active_sequences.pop(request_id, None)
 
+        if not is_distributed and not prepared:
+            return
+
+        # Ensure all ranks have same number of prepared requests.
+        if is_distributed:
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+
+            with mx.stream(generation_stream):
+                prep_count_arr = mx.array([len(prepared)], dtype=mx.int32)
+                prep_min = mx.distributed.all_min(prep_count_arr, group=self._dist_ctx.group)
+                prep_max = mx.distributed.all_max(prep_count_arr, group=self._dist_ctx.group)
+                mx.eval(prep_min, prep_max)
+            prep_min_v = int(prep_min.item())
+            prep_max_v = int(prep_max.item())
+            if prep_min_v != prep_max_v:
+                logger.critical(
+                    "FATAL: prepared request count diverged (rank=%d local=%d min=%d max=%d)",
+                    rank,
+                    len(prepared),
+                    prep_min_v,
+                    prep_max_v,
+                )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "insert_prepared_count_divergence"
+                self._running = False
+                self._new_request_event.set()
+                return
+
+            # All ranks agree on zero prepared — nothing to do.
+            if prep_min_v == 0:
+                return
+
+            # Batched prefix consensus via all_min(local_num_cached).
+            local_cached_vec = [int(item["local_num_cached"]) for item in prepared]
+            with mx.stream(generation_stream):
+                local_cached_arr = mx.array(local_cached_vec, dtype=mx.int32)
+                agreed_cached_arr = mx.distributed.all_min(
+                    local_cached_arr, group=self._dist_ctx.group
+                )
+                mx.eval(agreed_cached_arr)
+            agreed_cached_vec = [int(x) for x in agreed_cached_arr.tolist()]
+
+            # If any rank cannot trim to agreed prefix, force agreed=0 globally.
+            trim_blockers_local = []
+            for item, agreed_cached in zip(prepared, agreed_cached_vec):
+                local_cached = int(item["local_num_cached"])
+                cache_obj = item["cache"]
+                needs_trim = local_cached > agreed_cached and agreed_cached > 0
+                can_trim = (
+                    cache_obj is not None
+                    and can_trim_prompt_cache is not None
+                    and trim_prompt_cache is not None
+                    and can_trim_prompt_cache(cache_obj)
+                )
+                trim_blockers_local.append(1 if (needs_trim and not can_trim) else 0)
+
+            # Collective must be unconditional to avoid branch divergence.
+            with mx.stream(generation_stream):
+                trim_blockers_arr = mx.array(trim_blockers_local, dtype=mx.int32)
+                trim_blockers_global_arr = mx.distributed.all_max(
+                    trim_blockers_arr, group=self._dist_ctx.group
+                )
+                mx.eval(trim_blockers_global_arr)
+            trim_blockers_global = [int(x) for x in trim_blockers_global_arr.tolist()]
+
+            for idx, item in enumerate(prepared):
+                req = item["req"]
+                seq = item["seq"]
+                cache_obj = item["cache"]
+                local_cached = int(item["local_num_cached"])
+                agreed_cached = int(agreed_cached_vec[idx])
+                if trim_blockers_global[idx] != 0:
+                    agreed_cached = 0
+
+                if agreed_cached < 0 or agreed_cached > len(seq.token_ids):
+                    logger.critical(
+                        "FATAL: invalid agreed_cached for %s (rank=%d agreed=%d total=%d)",
+                        req.request_id,
+                        rank,
+                        agreed_cached,
+                        len(seq.token_ids),
+                    )
+                    self._dist_fatal = True
+                    self._dist_fatal_reason = "insert_invalid_agreed_cached"
+                    self._running = False
+                    self._new_request_event.set()
+                    return
+
+                if local_cached != agreed_cached:
+                    _dist_log(
+                        f"DIST_DEBUG insert_consensus rank={rank} rid={req.request_id} local_cached={local_cached} agreed_cached={agreed_cached}",
+                        rank,
+                    )
+
+                if agreed_cached == 0:
+                    if self.kv_cache_manager is not None and seq.block_ids:
+                        self.kv_cache_manager.free_blocks(seq.block_ids)
+                        seq.block_ids = []
+                    cache_obj = None
+                    remaining_tokens = list(seq.token_ids)
+                    final_hit_type = "miss"
+                else:
+                    if cache_obj is None:
+                        # Defensive: should not happen with all_min if agreed_cached > 0.
+                        if self.kv_cache_manager is not None and seq.block_ids:
+                            self.kv_cache_manager.free_blocks(seq.block_ids)
+                            seq.block_ids = []
+                        remaining_tokens = list(seq.token_ids)
+                        final_hit_type = "miss"
+                        cache_obj = None
+                        agreed_cached = 0
+                    else:
+                        num_to_trim = local_cached - agreed_cached
+                        if num_to_trim > 0:
+                            if (
+                                can_trim_prompt_cache is not None
+                                and trim_prompt_cache is not None
+                                and can_trim_prompt_cache(cache_obj)
+                            ):
+                                trim_prompt_cache(cache_obj, num_to_trim)
+                            else:
+                                # Defensive fallback (trim_blockers_global should prevent this).
+                                if self.kv_cache_manager is not None and seq.block_ids:
+                                    self.kv_cache_manager.free_blocks(seq.block_ids)
+                                    seq.block_ids = []
+                                cache_obj = None
+                                remaining_tokens = list(seq.token_ids)
+                                final_hit_type = "miss"
+                                agreed_cached = 0
+                        if agreed_cached > 0:
+                            remaining_tokens = list(seq.token_ids[agreed_cached:])
+                            final_hit_type = item["local_hit_type"]
+                            # Release excess block refs if local block hit > agreed.
+                            if self.kv_cache_manager is not None and seq.block_ids:
+                                block_size = getattr(self.kv_cache_manager, "block_size", 0)
+                                if isinstance(block_size, int) and block_size > 0:
+                                    keep_blocks = agreed_cached // block_size
+                                    if keep_blocks < len(seq.block_ids):
+                                        drop_block_ids = seq.block_ids[keep_blocks:]
+                                        if drop_block_ids:
+                                            self.kv_cache_manager.free_blocks(drop_block_ids)
+                                        seq.block_ids = seq.block_ids[:keep_blocks]
+                        else:
+                            remaining_tokens = list(seq.token_ids)
+                            final_hit_type = "miss"
+
+                item["cache"] = cache_obj
+                item["remaining_tokens"] = remaining_tokens
+                item["final_hit_type"] = final_hit_type
+                item["final_num_cached"] = len(seq.token_ids) - len(remaining_tokens)
+
+            # Full-hit non-trimmable guard (global fallback to miss).
+            full_hit_nontrim_local = []
+            for item in prepared:
+                cache_obj = item["cache"]
+                rem = item["remaining_tokens"]
+                is_full_hit = cache_obj is not None and len(rem) == 0
+                can_trim = (
+                    cache_obj is not None
+                    and can_trim_prompt_cache is not None
+                    and trim_prompt_cache is not None
+                    and can_trim_prompt_cache(cache_obj)
+                )
+                full_hit_nontrim_local.append(1 if (is_full_hit and not can_trim) else 0)
+
+            # Collective must be unconditional to avoid branch divergence.
+            with mx.stream(generation_stream):
+                full_hit_nontrim_arr = mx.array(full_hit_nontrim_local, dtype=mx.int32)
+                full_hit_nontrim_global_arr = mx.distributed.all_max(
+                    full_hit_nontrim_arr, group=self._dist_ctx.group
+                )
+                mx.eval(full_hit_nontrim_global_arr)
+            full_hit_nontrim_global = [
+                int(x) for x in full_hit_nontrim_global_arr.tolist()
+            ]
+
+            for idx, force_miss in enumerate(full_hit_nontrim_global):
+                if force_miss == 0:
+                    continue
+                item = prepared[idx]
+                seq = item["seq"]
+                if self.kv_cache_manager is not None and seq.block_ids:
+                    self.kv_cache_manager.free_blocks(seq.block_ids)
+                    seq.block_ids = []
+                item["cache"] = None
+                item["remaining_tokens"] = list(seq.token_ids)
+                item["final_hit_type"] = "miss"
+                item["final_num_cached"] = 0
+                _dist_log(
+                    f"DIST_DEBUG insert_fullhit_fallback rank={rank} rid={item['req'].request_id}",
+                    rank,
+                )
+        else:
+            for item in prepared:
+                seq = item["seq"]
+                remaining_tokens = list(item["remaining_tokens"])
+                final_cached = len(seq.token_ids) - len(remaining_tokens)
+                if final_cached <= 0 or item["cache"] is None:
+                    item["final_hit_type"] = "miss"
+                    item["final_num_cached"] = 0
+                else:
+                    item["final_hit_type"] = item["local_hit_type"]
+                    item["final_num_cached"] = final_cached
+
+        # Phase 2: perform actual BatchGenerator.insert().
+        phase2_failed_local = 0
+        phase2_failed_request_id: str | None = None
+        for item in prepared:
+            req = item["req"]
+            seq = item["seq"]
+            cache_obj = item["cache"]
+            remaining_tokens = list(item["remaining_tokens"])
+            final_hit_type = item["final_hit_type"]
+
+            try:
                 # Create sampler
                 sampler = None
                 if make_sampler is not None:
@@ -1583,80 +2077,135 @@ class Scheduler:
                     self._signal_finish(req.request_id, finish_reason="length")
                     continue
 
-                # Track prefill tokens (tokens that need actual computation)
-                self._inc_stat("total_prefill_tokens", len(remaining_tokens))
-
-                # A3: Handle full cache hit — trim cache by 1 to avoid last-token duplication
+                # A3: Handle full cache hit — trim cache by 1 to avoid last-token duplication.
                 if not remaining_tokens:
                     remaining_tokens = [seq.token_ids[-1]]
-                    if cache is not None:
-                        if can_trim_prompt_cache is not None and can_trim_prompt_cache(cache):
-                            trim_prompt_cache(cache, 1)
+                    if cache_obj is not None:
+                        if (
+                            can_trim_prompt_cache is not None
+                            and trim_prompt_cache is not None
+                            and can_trim_prompt_cache(cache_obj)
+                        ):
+                            trim_prompt_cache(cache_obj, 1)
                         else:
-                            # Non-trimmable cache — fall back to uncached path
+                            # Non-trimmable cache — fall back to uncached path.
+                            # In distributed mode this should already be synchronized above.
                             logger.debug(
                                 "Full cache hit but non-trimmable — falling back to uncached path"
                             )
                             if self.kv_cache_manager is not None and seq.block_ids:
                                 self.kv_cache_manager.free_blocks(seq.block_ids)
                             seq.block_ids = []
-                            cache = None
-                            remaining_tokens = seq.token_ids
+                            cache_obj = None
+                            remaining_tokens = list(seq.token_ids)
+                            final_hit_type = "miss"
+
+                num_cached = len(seq.token_ids) - len(remaining_tokens)
+                if cache_obj is None or num_cached <= 0:
+                    self._inc_stat("cache_misses")
+                    final_hit_type = "miss"
+                    num_cached = 0
+                else:
+                    if final_hit_type == "block":
+                        self._inc_stat("cache_hits_block")
+                    elif final_hit_type == "sequence":
+                        self._inc_stat("cache_hits_sequence")
+                    else:
+                        # Defensive: unknown hit type should not happen.
+                        logger.warning(
+                            "Unknown final cache hit type for %s: %s",
+                            req.request_id,
+                            final_hit_type,
+                        )
+                        self._inc_stat("cache_misses")
+                        cache_obj = None
+                        remaining_tokens = list(seq.token_ids)
+                        final_hit_type = "miss"
+                        num_cached = 0
+                    if num_cached > 0:
+                        self._inc_stat("total_cached_tokens", num_cached)
+
+                # Track prefill tokens (tokens that need actual computation)
+                self._inc_stat("total_prefill_tokens", len(remaining_tokens))
+
+                _dist_log(
+                    f"DIST_DEBUG insert_final rank={rank} rid={req.request_id} hit={final_hit_type} cached={num_cached} remaining={len(remaining_tokens)} total={len(seq.token_ids)}",
+                    rank,
+                )
 
                 # Insert into BatchGenerator
-                try:
-                    insert_kwargs = {
-                        "prompts": [remaining_tokens],
-                        "max_tokens": [req.max_tokens],
-                    }
-                    if cache is not None:
-                        insert_kwargs["caches"] = [cache]
-                    if sampler is not None:
-                        insert_kwargs["samplers"] = [sampler]
+                insert_kwargs = {
+                    "prompts": [remaining_tokens],
+                    "max_tokens": [req.max_tokens],
+                }
+                if cache_obj is not None:
+                    insert_kwargs["caches"] = [cache_obj]
+                if sampler is not None:
+                    insert_kwargs["samplers"] = [sampler]
 
-                    uids = self._batch_generator.insert(**insert_kwargs)
-                    uid = uids[0]
-                    self._uid_to_request_id[uid] = req.request_id
-                    self._request_id_to_uid[req.request_id] = uid
-                    seq._batch_uid = uid
-                    # G2: Track cache-miss inserts for early prefill save
-                    if cache is None:
-                        if len(self._pending_cache_saves) < _PENDING_CACHE_SAVES_MAX:
-                            self._pending_cache_saves.add(uid)
-                        else:
-                            logger.warning(
-                                "Pending cache saves set at capacity (%d), skipping UID %d",
-                                _PENDING_CACHE_SAVES_MAX, uid,
-                            )
-                    # Register in _active_sequences AFTER insert() succeeds
-                    # and UID is assigned (Bug 3 / Issue 4 fix).
-                    with self._active_lock:
-                        self._active_sequences[req.request_id] = seq
-                    logger.debug(
-                        "Inserted request %s as UID %d", req.request_id, uid
-                    )
-                except Exception as e:
-                    logger.error("Failed to insert request %s: %s", req.request_id, e)
-                    seq.is_finished = True
-                    seq.finish_reason = "error"
-                    # Free KV cache blocks allocated during cache lookup
-                    if self.kv_cache_manager is not None and seq.block_ids:
-                        self.kv_cache_manager.free_blocks(seq.block_ids)
-                        seq.block_ids = []
-                    self._signal_finish(req.request_id, finish_reason="error")
+                uids = self._batch_generator.insert(**insert_kwargs)
+                uid = uids[0]
+                self._uid_to_request_id[uid] = req.request_id
+                self._request_id_to_uid[req.request_id] = uid
+                seq._batch_uid = uid
+                # G2: Track cache-miss inserts for early prefill save
+                if cache_obj is None:
+                    if len(self._pending_cache_saves) < _PENDING_CACHE_SAVES_MAX:
+                        self._pending_cache_saves.add(uid)
+                    else:
+                        logger.warning(
+                            "Pending cache saves set at capacity (%d), skipping UID %d",
+                            _PENDING_CACHE_SAVES_MAX, uid,
+                        )
+                # Register in _active_sequences AFTER insert() succeeds
+                # and UID is assigned (Bug 3 / Issue 4 fix).
+                with self._active_lock:
+                    self._active_sequences[req.request_id] = seq
+                logger.debug(
+                    "Inserted request %s as UID %d", req.request_id, uid
+                )
             except Exception as e:
-                # Request was popped from queue but failed during setup —
-                # signal error to caller so they don't hang forever
-                request_id = req.request_id
-                logger.error("Failed to insert request %s: %s", request_id, e)
-                # Free KV blocks allocated during cache lookup to prevent leak
-                if seq is not None and self.kv_cache_manager is not None and seq.block_ids:
+                logger.error("Failed to insert request %s: %s", req.request_id, e)
+                seq.is_finished = True
+                seq.finish_reason = "error"
+                # Free KV cache blocks allocated during cache lookup
+                if self.kv_cache_manager is not None and seq.block_ids:
                     self.kv_cache_manager.free_blocks(seq.block_ids)
                     seq.block_ids = []
-                self._signal_finish(request_id, finish_reason="error")
-                # Clean up if sequence was partially added to active set
-                with self._active_lock:
-                    self._active_sequences.pop(request_id, None)
+                self._signal_finish(req.request_id, finish_reason="error")
+                phase2_failed_local = 1
+                phase2_failed_request_id = req.request_id
+                break
+
+        # Distributed fail-fast: if ANY rank failed phase-2 insert, all ranks stop.
+        if is_distributed:
+            import mlx.core as mx
+            from mlx_lm.generate import generation_stream
+
+            with mx.stream(generation_stream):
+                insert_fail_arr = mx.array([phase2_failed_local], dtype=mx.int32)
+                insert_fail_global = mx.distributed.all_max(
+                    insert_fail_arr, group=self._dist_ctx.group
+                )
+                mx.eval(insert_fail_global)
+
+            if int(insert_fail_global.item()) != 0:
+                if phase2_failed_local:
+                    logger.critical(
+                        "FATAL: phase-2 insert failed locally (rank=%d request_id=%s)",
+                        rank,
+                        phase2_failed_request_id,
+                    )
+                else:
+                    logger.critical(
+                        "FATAL: phase-2 insert failed on another rank (rank=%d)",
+                        rank,
+                    )
+                self._dist_fatal = True
+                self._dist_fatal_reason = "insert_phase2_failed"
+                self._running = False
+                self._new_request_event.set()
+                return
 
     def _cleanup_finished_batch(self) -> None:
         """Clean up finished sequences from the batch path."""
